@@ -2,6 +2,9 @@ import { useEffect, useState } from 'react';
 import { useExtensionStore } from '../lib/store';
 import { runtimeBridge } from '../lib/bridge';
 import { WorkflowStorage } from '../lib/storage';
+import { CorrectionMemory } from '../lib/correction-memory';
+import { VariableDetector } from '../lib/variable-detector';
+import { VariableInputForm } from './VariableInputForm';
 import type { ExtensionState } from '../types/state';
 import type { WorkflowStep, SavedWorkflow } from '../types/workflow';
 import type { 
@@ -9,8 +12,11 @@ import type {
   UpdateStepMessage,
   AIValidationStartedMessage,
   AIValidationCompletedMessage,
-  StepEnhancedMessage
+  StepEnhancedMessage,
+  CorrectionSavedMessage,
+  ElementFindFailedMessage
 } from '../types/messages';
+import type { CorrectionEntry } from '../types/visual';
 
 function App() {
   const { 
@@ -45,6 +51,21 @@ function App() {
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [workflowName, setWorkflowName] = useState('');
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
+  // Correction learning state
+  const [showCorrections, setShowCorrections] = useState(false);
+  const [storedCorrections, setStoredCorrections] = useState<CorrectionEntry[]>([]);
+  const [correctionModeStep, setCorrectionModeStep] = useState<string | null>(null);
+  const [learningFeedback, setLearningFeedback] = useState<string | null>(null);
+  // Variable detection state
+  const [isDetectingVariables, setIsDetectingVariables] = useState(false);
+  const [currentWorkflowVariables, setCurrentWorkflowVariables] = useState<import('../lib/variable-detector').WorkflowVariables | null>(null);
+  // Variable form modal state
+  const [showVariableForm, setShowVariableForm] = useState(false);
+  const [pendingExecution, setPendingExecution] = useState<{
+    workflow: SavedWorkflow | null;
+    steps: WorkflowStep[];
+  }>({ workflow: null, steps: [] });
+  const [isExecuting, setIsExecuting] = useState(false);
 
   // Ping content script on mount
   useEffect(() => {
@@ -109,10 +130,15 @@ function App() {
     loadSavedWorkflows();
   }, [setSavedWorkflows]);
 
+  // Debug: Log when currentWorkflowVariables changes
+  useEffect(() => {
+    console.log('[App] currentWorkflowVariables changed:', currentWorkflowVariables);
+  }, [currentWorkflowVariables]);
+
   // Listen for RECORDED_STEP, UPDATE_STEP, and AI validation messages from content script
   useEffect(() => {
     const handleMessage = (
-      message: RecordedStepMessage | UpdateStepMessage | AIValidationStartedMessage | AIValidationCompletedMessage | StepEnhancedMessage,
+      message: RecordedStepMessage | UpdateStepMessage | AIValidationStartedMessage | AIValidationCompletedMessage | StepEnhancedMessage | CorrectionSavedMessage | ElementFindFailedMessage,
       _sender: chrome.runtime.MessageSender,
       _sendResponse: (response?: any) => void
     ) => {
@@ -134,6 +160,15 @@ function App() {
       } else if (message.type === 'STEP_ENHANCED' && message.payload?.stepId) {
         setAIValuationPending(message.payload.stepId, false);
         setStepEnhanced(message.payload.stepId);
+      } else if (message.type === 'CORRECTION_SAVED') {
+        setCorrectionModeStep(null);
+        setLearningFeedback('✓ Correction saved! The extension will learn from this.');
+        setTimeout(() => setLearningFeedback(null), 3000);
+        // Refresh corrections list
+        CorrectionMemory.getAllCorrections().then(setStoredCorrections);
+      } else if (message.type === 'ELEMENT_FIND_FAILED' && message.payload?.stepId) {
+        // Show correction option when element finding fails
+        setCorrectionModeStep(message.payload.stepId);
       }
       return false;
     };
@@ -151,6 +186,7 @@ function App() {
     try {
       clearWorkflowSteps();
       setCurrentWorkflowName(null);
+      setCurrentWorkflowVariables(null); // Clear variables when starting new recording
       setIsRecording(true);
       setState('RECORDING');
       
@@ -211,12 +247,22 @@ function App() {
     }
 
     try {
+      // Start variable detection
+      setIsDetectingVariables(true);
+      
+      // Detect variables using AI vision analysis
+      console.log('[SaveWorkflow] Starting variable detection for', workflowSteps.length, 'steps');
+      const variables = await VariableDetector.detectVariables(workflowSteps);
+      console.log('[SaveWorkflow] Detected variables:', variables);
+
       const workflow: SavedWorkflow = {
         id: `workflow-${Date.now()}`,
         name: workflowName.trim(),
         createdAt: Date.now(),
         updatedAt: Date.now(),
         steps: workflowSteps,
+        // Include detected variables if any were found
+        variables: variables.variables.length > 0 ? variables : undefined,
       };
 
       await WorkflowStorage.saveWorkflow(workflow);
@@ -224,14 +270,118 @@ function App() {
       setCurrentWorkflowName(workflow.name);
       setShowSaveDialog(false);
       setWorkflowName('');
+      
+      // Store variables for display
+      console.log('[SaveWorkflow] Setting currentWorkflowVariables:', workflow.variables);
+      setCurrentWorkflowVariables(workflow.variables || null);
+      
+      // Show feedback if variables were detected
+      if (variables.variables.length > 0) {
+        setLearningFeedback(`✨ Detected ${variables.variables.length} variable${variables.variables.length > 1 ? 's' : ''} for parameterized execution`);
+        setTimeout(() => setLearningFeedback(null), 4000);
+      } else {
+        console.log('[SaveWorkflow] No variables detected');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save workflow');
+    } finally {
+      setIsDetectingVariables(false);
     }
   };
 
   const handleLoadWorkflow = (workflow: SavedWorkflow) => {
     loadWorkflow(workflow);
     setState('IDLE');
+    // Store variables for display
+    console.log('[LoadWorkflow] Loading workflow with variables:', workflow.variables);
+    setCurrentWorkflowVariables(workflow.variables || null);
+  };
+
+  /**
+   * Execute a workflow - shows variable form if workflow has variables
+   */
+  const handleExecuteWorkflow = async (workflow: SavedWorkflow) => {
+    // Check if workflow has variables
+    if (workflow.variables && workflow.variables.variables.length > 0) {
+      // Show variable input form
+      setPendingExecution({ workflow, steps: workflow.steps });
+      setShowVariableForm(true);
+    } else {
+      // No variables - execute directly
+      await executeWorkflowWithVariables(workflow.steps, workflow);
+    }
+  };
+
+  /**
+   * Handle variable form confirmation - execute workflow with provided values
+   */
+  const handleVariableFormConfirm = async (values: Record<string, string>) => {
+    setShowVariableForm(false);
+    
+    if (pendingExecution.workflow) {
+      await executeWorkflowWithVariables(
+        pendingExecution.steps,
+        pendingExecution.workflow,
+        values
+      );
+    }
+    
+    setPendingExecution({ workflow: null, steps: [] });
+  };
+
+  /**
+   * Handle variable form cancellation
+   */
+  const handleVariableFormCancel = () => {
+    setShowVariableForm(false);
+    setPendingExecution({ workflow: null, steps: [] });
+  };
+
+  /**
+   * Execute workflow with optional variable values
+   */
+  const executeWorkflowWithVariables = async (
+    steps: WorkflowStep[],
+    workflow: SavedWorkflow,
+    variableValues?: Record<string, string>
+  ) => {
+    setIsExecuting(true);
+    setState('EXECUTING');
+    
+    try {
+      // Get the active tab to send message to its content script
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id) {
+        throw new Error('No active tab found');
+      }
+      
+      // Send execution message with variable values
+      const response = await runtimeBridge.sendMessage(
+        {
+          type: 'EXECUTE_WORKFLOW_ADAPTIVE',
+          payload: {
+            steps,
+            intent: workflow.analyzedIntent,
+            variableValues,
+            workflowVariables: workflow.variables,
+          },
+        },
+        tab.id
+      );
+      
+      if (!response.success) {
+        throw new Error(response.error || 'Failed to execute workflow');
+      }
+      
+      setLearningFeedback(`✓ Workflow executed successfully${variableValues ? ' with custom variable values' : ''}`);
+      setTimeout(() => setLearningFeedback(null), 3000);
+    } catch (err) {
+      console.error('Execute workflow error:', err);
+      setError(err instanceof Error ? err.message : 'Failed to execute workflow');
+    } finally {
+      setIsExecuting(false);
+      setState('IDLE');
+    }
   };
 
   const handleDeleteWorkflow = async (id: string) => {
@@ -359,6 +509,15 @@ function App() {
               <span>{enhancedSteps.size} step{enhancedSteps.size > 1 ? 's' : ''} enhanced with AI</span>
             </div>
           )}
+          {currentWorkflowVariables && currentWorkflowVariables.variables.length > 0 && (
+            <div className="mt-2 flex items-center gap-2 text-sm text-purple-600">
+              <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 20 20">
+                <path d="M9 2a1 1 0 000 2h2a1 1 0 100-2H9z" />
+                <path fillRule="evenodd" d="M4 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v11a2 2 0 01-2 2H6a2 2 0 01-2-2V5zm3 4a1 1 0 000 2h.01a1 1 0 100-2H7zm3 0a1 1 0 000 2h3a1 1 0 100-2h-3zm-3 4a1 1 0 100 2h.01a1 1 0 100-2H7zm3 0a1 1 0 100 2h3a1 1 0 100-2h-3z" clipRule="evenodd" />
+              </svg>
+              <span>{currentWorkflowVariables.variables.length} variable{currentWorkflowVariables.variables.length !== 1 ? 's' : ''} detected by AI</span>
+            </div>
+          )}
         </div>
 
         {/* Actions */}
@@ -382,9 +541,9 @@ function App() {
             <button
               onClick={() => setShowSaveDialog(true)}
               className="w-full px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
-              disabled={workflowSteps.length === 0 || isRecording}
+              disabled={workflowSteps.length === 0 || isRecording || isDetectingVariables}
             >
-              Save Workflow
+              {isDetectingVariables ? 'Analyzing Variables...' : 'Save Workflow'}
             </button>
             <button
               onClick={() => handleExportJSON()}
@@ -418,10 +577,17 @@ function App() {
                   !s.includes('nth-of-type') && !s.includes('ng-star-inserted')
                 ).length || 0;
                 
+                // Check if this step is a detected variable
+                const variableDef = currentWorkflowVariables?.variables.find(
+                  v => String(v.stepId) === stepId
+                );
+                const isVariable = !!variableDef;
+                
                 return (
                   <div 
                     key={index} 
                     className={`p-3 bg-muted rounded-md text-sm border-l-4 ${
+                      isVariable ? 'border-purple-500' :
                       isEnhanced ? 'border-blue-500' : 
                       isPending ? 'border-yellow-500 animate-pulse' : 
                       'border-transparent'
@@ -429,8 +595,24 @@ function App() {
                   >
                     <div className="flex items-center justify-between">
                       <div className="flex-1">
-                        <div className="font-medium text-foreground">
+                        <div className="font-medium text-foreground flex items-center gap-2">
                           {index + 1}. {step.type}
+                          {isVariable && (
+                            <span 
+                              className="px-2 py-0.5 text-xs bg-purple-100 text-purple-700 rounded-full font-medium"
+                              title={`Variable: ${variableDef.fieldName} (${variableDef.variableName}) - Confidence: ${Math.round(variableDef.confidence * 100)}%`}
+                            >
+                              ✨ {variableDef.variableName}
+                            </span>
+                          )}
+                          {!isVariable && step.type === 'INPUT' && step.payload.value && !currentWorkflowVariables && (
+                            <span 
+                              className="px-1.5 py-0.5 text-xs bg-gray-100 text-gray-500 rounded"
+                              title="May be detected as a variable when workflow is saved"
+                            >
+                              ?var
+                            </span>
+                          )}
                         </div>
                         {step.description && (
                           <div className="text-sm text-blue-600 mt-1 font-medium">
@@ -462,11 +644,27 @@ function App() {
                       <div className="text-muted-foreground">Label: {step.payload.label}</div>
                     )}
                     {step.payload.value && (
-                      <div className="text-muted-foreground">Value: {step.payload.value}</div>
+                      <div className="text-muted-foreground">
+                        Value: {step.payload.value}
+                        {isVariable && variableDef && (
+                          <span className="ml-2 text-xs text-purple-600">
+                            (Variable: {variableDef.fieldName})
+                          </span>
+                        )}
+                      </div>
                     )}
                     <div className="text-muted-foreground text-xs mt-1">
                       Selector: {step.payload.selector}
                     </div>
+                    {isVariable && variableDef && (
+                      <div className="text-purple-600 text-xs mt-1 flex items-center gap-1">
+                        <svg className="h-3 w-3" fill="currentColor" viewBox="0 0 20 20">
+                          <path d="M9 2a1 1 0 000 2h2a1 1 0 100-2H9z" />
+                          <path fillRule="evenodd" d="M4 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v11a2 2 0 01-2 2H6a2 2 0 01-2-2V5zm3 4a1 1 0 000 2h.01a1 1 0 100-2H7zm3 0a1 1 0 000 2h3a1 1 0 100-2h-3zm-3 4a1 1 0 100 2h.01a1 1 0 100-2H7zm3 0a1 1 0 100 2h3a1 1 0 100-2h-3z" clipRule="evenodd" />
+                        </svg>
+                        <span>AI detected as variable ({Math.round(variableDef.confidence * 100)}% confidence)</span>
+                      </div>
+                    )}
                     {isEnhanced && aiFallbackCount > 0 && (
                       <div className="text-blue-600 text-xs mt-1">
                         ✨ {aiFallbackCount} AI-enhanced fallback selector{aiFallbackCount > 1 ? 's' : ''} added
@@ -476,6 +674,115 @@ function App() {
                 );
               })}
             </div>
+          </div>
+        )}
+
+        {/* Detected Variables */}
+        {(currentWorkflowVariables || (workflowSteps.length > 0 && currentWorkflowName)) && (
+          <div className="mb-6 p-4 bg-card rounded-lg border border-border border-purple-200">
+            <h2 className="text-lg font-semibold mb-4 text-card-foreground flex items-center gap-2">
+              <svg className="h-5 w-5 text-purple-600" fill="currentColor" viewBox="0 0 20 20">
+                <path d="M9 2a1 1 0 000 2h2a1 1 0 100-2H9z" />
+                <path fillRule="evenodd" d="M4 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v11a2 2 0 01-2 2H6a2 2 0 01-2-2V5zm3 4a1 1 0 000 2h.01a1 1 0 100-2H7zm3 0a1 1 0 000 2h3a1 1 0 100-2h-3zm-3 4a1 1 0 100 2h.01a1 1 0 100-2H7zm3 0a1 1 0 100 2h3a1 1 0 100-2h-3z" clipRule="evenodd" />
+              </svg>
+              Detected Variables ({currentWorkflowVariables?.variables?.length || 0})
+            </h2>
+            {currentWorkflowVariables && currentWorkflowVariables.variables && currentWorkflowVariables.variables.length > 0 ? (
+              <div className="space-y-3">
+                {currentWorkflowVariables.variables.map((variable) => (
+                <div 
+                  key={variable.variableName}
+                  className="p-3 bg-purple-50 rounded-md border border-purple-200"
+                >
+                  <div className="flex items-start justify-between mb-2">
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="font-semibold text-foreground">
+                          {variable.fieldName}
+                        </span>
+                        <span className="px-2 py-0.5 text-xs bg-purple-100 text-purple-700 rounded-full font-mono">
+                          {variable.variableName}
+                        </span>
+                        {variable.isDropdown && (
+                          <span className="px-2 py-0.5 text-xs bg-blue-100 text-blue-700 rounded">
+                            📋 Dropdown
+                          </span>
+                        )}
+                        {variable.confidence >= 0.8 && (
+                          <span className="px-2 py-0.5 text-xs bg-green-100 text-green-700 rounded">
+                            ✓ High confidence
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-sm text-muted-foreground">
+                        <div className="flex items-center gap-2">
+                          <span>Default:</span>
+                          <span className="font-mono bg-white px-2 py-0.5 rounded border">
+                            {variable.defaultValue || '(empty)'}
+                          </span>
+                        </div>
+                        {variable.isDropdown && variable.options && variable.options.length > 0 && (
+                          <div className="mt-2">
+                            <div className="text-xs font-medium text-muted-foreground mb-1">
+                              Available Options ({variable.options.length}):
+                            </div>
+                            <div className="flex flex-wrap gap-1">
+                              {variable.options.map((option, idx) => (
+                                <span
+                                  key={idx}
+                                  className={`px-2 py-0.5 text-xs rounded border ${
+                                    option === variable.defaultValue
+                                      ? 'bg-purple-200 border-purple-400 font-medium text-purple-800'
+                                      : 'bg-white border-gray-300 text-gray-700'
+                                  }`}
+                                >
+                                  {option}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {variable.inputType && (
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            Type: <span className="font-mono">{variable.inputType}</span>
+                          </div>
+                        )}
+                        <div className="mt-1 flex items-center gap-2">
+                          <span className="text-xs text-muted-foreground">
+                            Confidence: {Math.round(variable.confidence * 100)}%
+                          </span>
+                          <div className="flex-1 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                            <div 
+                              className="h-full bg-purple-500 rounded-full"
+                              style={{ width: `${variable.confidence * 100}%` }}
+                            />
+                          </div>
+                        </div>
+                        {variable.reasoning && (
+                          <div className="mt-2 text-xs text-muted-foreground italic border-l-2 border-purple-300 pl-2">
+                            {variable.reasoning}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+              </div>
+            ) : (
+              <div className="text-sm text-muted-foreground py-4 text-center">
+                {currentWorkflowVariables ? (
+                  <>No variables detected. Variables are detected when you save the workflow.</>
+                ) : (
+                  <>Variables will be detected when you save the workflow.</>
+                )}
+              </div>
+            )}
+            {currentWorkflowVariables && currentWorkflowVariables.variables && currentWorkflowVariables.variables.length > 0 && (
+              <div className="mt-3 pt-3 border-t border-purple-200 text-xs text-muted-foreground">
+                💡 These variables can be customized when executing the workflow
+              </div>
+            )}
           </div>
         )}
 
@@ -492,7 +799,17 @@ function App() {
                 <div key={workflow.id} className="p-3 bg-muted rounded-md">
                   <div className="flex items-start justify-between mb-2">
                     <div>
-                      <div className="font-medium text-foreground">{workflow.name}</div>
+                      <div className="font-medium text-foreground flex items-center gap-2">
+                        {workflow.name}
+                        {workflow.variables && workflow.variables.variables.length > 0 && (
+                          <span 
+                            className="px-2 py-0.5 text-xs bg-purple-100 text-purple-700 rounded-full"
+                            title={`${workflow.variables.variables.length} variable${workflow.variables.variables.length !== 1 ? 's' : ''} detected`}
+                          >
+                            {workflow.variables.variables.length} var{workflow.variables.variables.length !== 1 ? 's' : ''}
+                          </span>
+                        )}
+                      </div>
                       <div className="text-xs text-muted-foreground mt-1">
                         {formatDate(workflow.updatedAt)} • {workflow.steps.length} steps
                       </div>
@@ -502,9 +819,16 @@ function App() {
                     <button
                       onClick={() => handleLoadWorkflow(workflow)}
                       className="px-3 py-1 bg-blue-600 text-white text-sm rounded hover:bg-blue-700"
-                      disabled={isRecording}
+                      disabled={isRecording || isExecuting}
                     >
                       Load
+                    </button>
+                    <button
+                      onClick={() => handleExecuteWorkflow(workflow)}
+                      className="px-3 py-1 bg-purple-600 text-white text-sm rounded hover:bg-purple-700 disabled:opacity-50"
+                      disabled={isRecording || isExecuting}
+                    >
+                      {isExecuting ? 'Running...' : 'Execute'}
                     </button>
                     <button
                       onClick={() => handleExportJSON(workflow.steps)}
@@ -515,7 +839,7 @@ function App() {
                     <button
                       onClick={() => setShowDeleteConfirm(workflow.id)}
                       className="px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700"
-                      disabled={isRecording}
+                      disabled={isRecording || isExecuting}
                     >
                       Delete
                     </button>
@@ -545,6 +869,110 @@ function App() {
           )}
         </div>
 
+        {/* Learning & Corrections */}
+        <div className="mb-6 p-4 bg-card rounded-lg border border-border">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold text-card-foreground">
+              Learning Memory
+            </h2>
+            <button
+              onClick={async () => {
+                const corrections = await CorrectionMemory.getAllCorrections();
+                setStoredCorrections(corrections);
+                setShowCorrections(!showCorrections);
+              }}
+              className="px-3 py-1 text-sm bg-purple-600 text-white rounded hover:bg-purple-700"
+            >
+              {showCorrections ? 'Hide' : 'Show'} ({storedCorrections.length})
+            </button>
+          </div>
+          
+          {learningFeedback && (
+            <div className="mb-3 p-2 bg-green-50 border border-green-200 rounded text-sm text-green-700">
+              {learningFeedback}
+            </div>
+          )}
+          
+          {correctionModeStep && (
+            <div className="mb-3 p-3 bg-yellow-50 border border-yellow-200 rounded">
+              <p className="text-sm text-yellow-800 font-medium mb-2">
+                🔧 Correction Mode Active
+              </p>
+              <p className="text-xs text-yellow-700 mb-2">
+                Click on the correct element in the page. The extension will learn from your correction.
+              </p>
+              <button
+                onClick={() => {
+                  setCorrectionModeStep(null);
+                  // Send message to cancel correction mode
+                  chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+                    if (tab?.id) {
+                      chrome.tabs.sendMessage(tab.id, { type: 'CANCEL_CORRECTION' });
+                    }
+                  });
+                }}
+                className="px-3 py-1 text-sm bg-gray-600 text-white rounded hover:bg-gray-700"
+              >
+                Cancel Correction
+              </button>
+            </div>
+          )}
+          
+          {showCorrections && (
+            <div className="space-y-2 max-h-48 overflow-y-auto">
+              {storedCorrections.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  No corrections yet. The extension will learn from your corrections when element finding fails.
+                </p>
+              ) : (
+                storedCorrections.map((correction) => (
+                  <div key={correction.id} className="p-2 bg-muted rounded text-sm">
+                    <div className="flex items-start justify-between">
+                      <div className="flex-1">
+                        <div className="font-medium text-foreground">
+                          {correction.originalDescription || 'Element correction'}
+                        </div>
+                        <div className="text-xs text-muted-foreground mt-1">
+                          Page: {correction.pageType?.type || 'unknown'}
+                        </div>
+                        <div className="text-xs text-green-600 mt-1">
+                          ✓ {correction.successCount} successful • ✗ {correction.failureCount} failed
+                        </div>
+                      </div>
+                      <button
+                        onClick={async () => {
+                          await CorrectionMemory.deleteCorrection(correction.id);
+                          const updated = await CorrectionMemory.getAllCorrections();
+                          setStoredCorrections(updated);
+                        }}
+                        className="p-1 text-red-500 hover:text-red-700"
+                        title="Delete correction"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+              {storedCorrections.length > 0 && (
+                <button
+                  onClick={async () => {
+                    if (confirm('Clear all learned corrections?')) {
+                      await CorrectionMemory.clearAll();
+                      setStoredCorrections([]);
+                    }
+                  }}
+                  className="w-full px-3 py-1 text-sm bg-red-600 text-white rounded hover:bg-red-700"
+                >
+                  Clear All Corrections
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
         {/* Save Dialog */}
         {showSaveDialog && (
           <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -569,9 +997,17 @@ function App() {
                 <button
                   onClick={handleSaveWorkflow}
                   className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 disabled:opacity-50"
-                  disabled={!workflowName.trim()}
+                  disabled={!workflowName.trim() || isDetectingVariables}
                 >
-                  Save
+                  {isDetectingVariables ? (
+                    <span className="flex items-center justify-center gap-2">
+                      <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      Analyzing...
+                    </span>
+                  ) : 'Save'}
                 </button>
                 <button
                   onClick={() => {
@@ -579,12 +1015,23 @@ function App() {
                     setWorkflowName('');
                   }}
                   className="flex-1 px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700"
+                  disabled={isDetectingVariables}
                 >
                   Cancel
                 </button>
               </div>
             </div>
           </div>
+        )}
+
+        {/* Variable Input Form Modal */}
+        {showVariableForm && pendingExecution.workflow?.variables && (
+          <VariableInputForm
+            variables={pendingExecution.workflow.variables}
+            workflowName={pendingExecution.workflow.name}
+            onConfirm={handleVariableFormConfirm}
+            onCancel={handleVariableFormCancel}
+          />
         )}
       </div>
     </div>

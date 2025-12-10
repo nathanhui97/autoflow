@@ -130,6 +130,25 @@ export interface AIAnalysisPayload {
     elementSnippet?: string; // Base64 data URL of element + context (cropped)
   };
   
+  // Phase 4: Human-like Visual Understanding
+  // Page type classification
+  pageType?: {
+    type: string; // 'form', 'dashboard', 'data_table', etc.
+    confidence: number;
+    subType?: string;
+  };
+  
+  // Visual importance (simplified - only overall score)
+  visualImportance?: {
+    overallImportance: number; // 0-1 score
+  };
+  
+  // Visual context (simplified)
+  visualContext?: {
+    visualPattern?: string; // 'form_layout', 'card_grid', 'data_table', etc.
+    regionType?: string; // 'header', 'sidebar', 'main_content', etc.
+  };
+  
   // NOTE: CSS selectors, ancestors, eventDetails, elementBounds, timing, html are
   // intentionally excluded. AI should rely on semantic anchors (gridCoordinates, label, visualSnapshot) instead.
 }

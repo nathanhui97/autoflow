@@ -100,6 +100,36 @@ export class AIDataBuilder {
       };
     }
 
+    // PRIORITY 5: Human-like Visual Understanding (Phase 4)
+    // These provide AI with page context and visual prominence information
+    
+    // Page type classification
+    if (step.payload.pageType) {
+      payload.pageType = {
+        type: step.payload.pageType.type,
+        confidence: step.payload.pageType.confidence,
+        subType: step.payload.pageType.subType,
+      };
+    }
+    
+    // Visual importance scores (helps AI understand element prominence)
+    if (step.payload.visualImportance) {
+      payload.visualImportance = {
+        overallImportance: step.payload.visualImportance.overallImportance,
+        // Only include overall score to minimize tokens
+        // Full scores available in original payload if needed
+      };
+    }
+    
+    // Visual context (nearby elements for spatial understanding)
+    if (step.payload.visualContext) {
+      payload.visualContext = {
+        visualPattern: step.payload.visualContext.visualPattern,
+        regionType: step.payload.visualContext.regionType,
+        // Nearby elements and landmarks available in original payload
+      };
+    }
+
     // EXPLICITLY EXCLUDED FROM AI PAYLOAD (to prevent token explosion):
     // - step.payload.fallbackSelectors: CSS selectors are noise for LLMs
     // - step.payload.context?.ancestors: Full DOM tree burns tokens

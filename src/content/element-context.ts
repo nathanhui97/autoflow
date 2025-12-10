@@ -264,10 +264,46 @@ export class ElementContext {
 
     if (!container) return null;
 
-    const selector = SelectorEngine.generateSelectors(container).primary;
-    const text = this.getContainerText(container);
-    const type = this.getContainerType(container);
-    const index = this.getContainerIndex(container);
+    // SPECIAL CASE: If container is the element itself (e.g., gs-report-widget-element),
+    // look for a parent container with text (e.g., div containing "How To Guide")
+    let finalContainer = container;
+    let containerText = this.getContainerText(container);
+    
+    // If we found a container but it has no text, check parent containers
+    // This is especially important for Gainsight where gs-report-widget-element
+    // might be the container, but the actual title is in a parent div
+    if (!containerText || containerText.length === 0) {
+      let parent: Element | null = container.parentElement;
+      let levelsChecked = 0;
+      const maxLevels = 5; // Check up to 5 levels up
+      
+      while (parent && parent !== document.body && levelsChecked < maxLevels) {
+        const parentText = this.getContainerText(parent);
+        if (parentText && parentText.length > 0 && parentText.length <= 80) {
+          // Found a parent with meaningful text - use it instead
+          finalContainer = parent;
+          containerText = parentText;
+          console.log('GhostWriter: Found container text in parent:', parentText, 'from element:', parent.tagName);
+          break;
+        }
+        parent = parent.parentElement;
+        levelsChecked++;
+      }
+    }
+
+    const selector = SelectorEngine.generateSelectors(finalContainer).primary;
+    const text = containerText || this.getContainerText(finalContainer);
+    const type = this.getContainerType(finalContainer);
+    const index = this.getContainerIndex(finalContainer);
+
+    // Debug logging for Gainsight widgets
+    if (element.tagName?.toLowerCase() === 'gs-report-widget-element' || 
+        finalContainer.tagName?.toLowerCase() === 'gs-report-widget-element') {
+      console.log('🔍 GhostWriter: Gainsight widget detected');
+      console.log('  - Container element:', finalContainer.tagName);
+      console.log('  - Container text:', text || 'NONE');
+      console.log('  - Original container:', container.tagName);
+    }
 
     return {
       selector,
@@ -279,6 +315,7 @@ export class ElementContext {
 
   /**
    * Find parent container matching patterns
+   * NOTE: This may return the element itself if it matches a pattern
    */
   static findParentContainer(
     element: Element,
@@ -340,15 +377,23 @@ export class ElementContext {
 
   /**
    * Get container text (title, label, etc.)
+   * Returns concise text (max 50 chars) - prefers title/header over full text
    */
   private static getContainerText(container: Element): string | undefined {
-    // Look for common title/label selectors
+    // Look for common title/label selectors (PRIORITY: prefer these over full text)
     const titleSelectors = [
       'h1', 'h2', 'h3', 'h4',
       '[class*="title"]',
+      '[class*="widget-title"]',
+      '[class*="dashboard-title"]',
+      '[class*="report-title"]',
       '[class*="header"]',
       '[class*="label"]',
       'title',
+      '[data-title]',
+      '[data-label]',
+      '[aria-label*="title"]',
+      '[aria-label*="label"]',
       'aria-label',
     ];
 
@@ -356,22 +401,72 @@ export class ElementContext {
       if (selector.startsWith('[')) {
         const attr = selector.match(/\[([^\]]+)\]/)?.[1];
         if (attr && container.hasAttribute(attr)) {
-          return container.getAttribute(attr) || undefined;
+          const attrValue = container.getAttribute(attr)?.trim();
+          if (attrValue && attrValue.length > 0) {
+            // Limit to 50 chars for descriptions
+            return attrValue.length > 50 ? attrValue.substring(0, 50) + '...' : attrValue;
+          }
         }
       } else {
         const titleEl = container.querySelector(selector);
         if (titleEl) {
           const text = titleEl.textContent?.trim();
-          if (text && text.length < 200) {
-            return text;
+          if (text && text.length > 0) {
+            // Limit to 50 chars for descriptions
+            return text.length > 50 ? text.substring(0, 50) + '...' : text;
           }
         }
       }
     }
 
-    // Fallback to container's own text (first 200 chars)
+    // Enhanced: Check direct children for title-like text (e.g., "STORE LIST - PORTFOLIO")
+    // This catches dashboard/widget names that might not use standard selectors
+    const titleWords = ['dashboard', 'widget', 'report', 'list', 'portfolio', 'view'];
+    for (const child of Array.from(container.children)) {
+      const childText = child.textContent?.trim();
+      if (childText && childText.length > 0 && childText.length <= 80) {
+        // Check if it looks like a title (short, uppercase, or contains title words)
+        const isUppercase = childText === childText.toUpperCase() && childText.length > 3;
+        const hasTitleWord = titleWords.some(word => childText.toLowerCase().includes(word));
+        const isShort = childText.length <= 50;
+        
+        if ((isUppercase || hasTitleWord) && isShort) {
+          return childText.length > 50 ? childText.substring(0, 50) + '...' : childText;
+        }
+      }
+    }
+
+    // Fallback: Extract first meaningful line from container text (not full textContent)
+    // This prevents capturing huge amounts of concatenated text
     const text = container.textContent?.trim();
-    return text && text.length < 200 ? text : undefined;
+    if (!text || text.length === 0) {
+      return undefined;
+    }
+    
+    // For Gainsight widgets: Look for quoted text patterns like "How To Guide"
+    // These are often in the container's text content
+    const quotedPattern = /"([^"]{3,50})"/;
+    const quotedMatch = text.match(quotedPattern);
+    if (quotedMatch && quotedMatch[1]) {
+      const quotedText = quotedMatch[1].trim();
+      if (quotedText.length >= 3 && quotedText.length <= 50) {
+        return quotedText;
+      }
+    }
+    
+    // Get first line or first 50 chars (whichever is shorter)
+    const firstLine = text.split(/\n+/)[0]?.trim() || text;
+    if (firstLine.length > 50) {
+      // Try to truncate at word boundary
+      const truncated = firstLine.substring(0, 50);
+      const lastSpace = truncated.lastIndexOf(' ');
+      if (lastSpace > 30) {
+        return truncated.substring(0, lastSpace) + '...';
+      }
+      return truncated + '...';
+    }
+    
+    return firstLine;
   }
 
   /**

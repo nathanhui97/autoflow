@@ -2,14 +2,45 @@
  * Visual Snapshot Service - Captures viewport and element snippets using Chrome API
  * Uses native Chrome captureVisibleTab API + Canvas cropping to avoid html2canvas limitations
  * (html2canvas fails on Google Sheets canvas elements and cross-origin iframes)
+ * 
+ * Enhanced with full page capture and region extraction for human-like visual understanding
  */
 
+import type { PageRegions, BoundingBox } from '../types/visual';
+
+export interface CaptureResult {
+  viewport: string;
+  elementSnippet: string;
+}
+
+export interface FullPageResult {
+  screenshot: string; // Base64 full page screenshot
+  dimensions: {
+    width: number;
+    height: number;
+  };
+  timestamp: number;
+}
+
+export interface RegionCapture {
+  region: BoundingBox;
+  screenshot: string; // Base64 cropped region
+  name: string; // Region name (header, sidebar, etc.)
+}
+
 export class VisualSnapshotService {
+  // Cache for full page screenshot to avoid redundant captures
+  private static lastFullPageCapture: {
+    screenshot: string;
+    timestamp: number;
+  } | null = null;
+  private static readonly CACHE_TTL = 500; // 500ms cache for rapid captures
+
   /**
    * Capture viewport and element snippet using Chrome API + Canvas crop
    * This avoids html2canvas limitations with Google Sheets canvas elements
    */
-  static async capture(element: Element): Promise<{ viewport: string; elementSnippet: string } | null> {
+  static async capture(element: Element): Promise<CaptureResult | null> {
     try {
       // Step A: Get Coordinates BEFORE the async call (in case DOM shifts)
       const rect = element.getBoundingClientRect();
@@ -31,7 +62,7 @@ export class VisualSnapshotService {
       console.log('📸 GhostWriter: Viewport screenshot captured, size:', fullScreenshot.length, 'chars');
 
       // Step C: Crop it (Handling Retina Displays)
-      const snippet = await this.cropImage(fullScreenshot, rect);
+      const snippet = await this.cropImage(fullScreenshot, rect, 200);
       console.log('📸 GhostWriter: Element snippet cropped, size:', snippet.length, 'chars');
 
       return {
@@ -44,7 +75,377 @@ export class VisualSnapshotService {
     }
   }
 
-  private static cropImage(base64: string, rect: DOMRect): Promise<string> {
+  /**
+   * Capture full page screenshot (optimized for AI analysis)
+   * Uses compression to keep size manageable while preserving visual clarity
+   */
+  static async captureFullPage(quality: number = 0.7): Promise<FullPageResult | null> {
+    try {
+      // Check cache first
+      const now = Date.now();
+      if (this.lastFullPageCapture && 
+          (now - this.lastFullPageCapture.timestamp) < this.CACHE_TTL) {
+        console.log('📸 GhostWriter: Using cached full page screenshot');
+        return {
+          screenshot: this.lastFullPageCapture.screenshot,
+          dimensions: {
+            width: window.innerWidth,
+            height: window.innerHeight,
+          },
+          timestamp: this.lastFullPageCapture.timestamp,
+        };
+      }
+
+      console.log('📸 GhostWriter: Capturing full page screenshot...');
+      
+      const response = await chrome.runtime.sendMessage({ type: 'CAPTURE_VIEWPORT' });
+      if (!response || !response.data?.snapshot) {
+        console.warn('📸 GhostWriter: No snapshot received from service worker');
+        return null;
+      }
+
+      const fullScreenshot = response.data.snapshot;
+      
+      // Compress full page screenshot for AI efficiency
+      const compressed = await this.compressImage(fullScreenshot, quality);
+      
+      console.log('📸 GhostWriter: Full page captured, original:', fullScreenshot.length, 
+                  'chars, compressed:', compressed.length, 'chars');
+
+      // Update cache
+      this.lastFullPageCapture = {
+        screenshot: compressed,
+        timestamp: now,
+      };
+
+      return {
+        screenshot: compressed,
+        dimensions: {
+          width: window.innerWidth,
+          height: window.innerHeight,
+        },
+        timestamp: now,
+      };
+    } catch (err) {
+      console.warn('📸 GhostWriter: Full page capture failed:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Capture multiple page regions (header, sidebar, main content, etc.)
+   * Uses heuristics to identify common page regions
+   */
+  static async capturePageRegions(): Promise<{
+    regions: PageRegions;
+    captures: RegionCapture[];
+  } | null> {
+    try {
+      // First capture full page
+      const fullPage = await this.captureFullPage(0.8);
+      if (!fullPage) {
+        return null;
+      }
+
+      // Detect page regions using DOM heuristics
+      const regions = this.detectPageRegions();
+      
+      // Capture each detected region
+      const captures: RegionCapture[] = [];
+      
+      for (const [name, box] of Object.entries(regions)) {
+        if (box) {
+          try {
+            const regionScreenshot = await this.cropImageFromBox(
+              fullPage.screenshot,
+              box,
+              0
+            );
+            captures.push({
+              region: box,
+              screenshot: regionScreenshot,
+              name,
+            });
+          } catch (err) {
+            console.warn(`📸 GhostWriter: Failed to capture region ${name}:`, err);
+          }
+        }
+      }
+
+      console.log('📸 GhostWriter: Captured', captures.length, 'page regions');
+
+      return {
+        regions,
+        captures,
+      };
+    } catch (err) {
+      console.warn('📸 GhostWriter: Page regions capture failed:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Capture a specific bounding box region
+   */
+  static async captureRegion(box: BoundingBox, padding: number = 20): Promise<string | null> {
+    try {
+      const fullPage = await this.captureFullPage();
+      if (!fullPage) {
+        return null;
+      }
+
+      return await this.cropImageFromBox(fullPage.screenshot, box, padding);
+    } catch (err) {
+      console.warn('📸 GhostWriter: Region capture failed:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Capture multiple elements at once (batch operation)
+   */
+  static async captureElements(elements: Element[]): Promise<Map<Element, string>> {
+    const results = new Map<Element, string>();
+    
+    try {
+      // Get single full page screenshot
+      const fullPage = await this.captureFullPage();
+      if (!fullPage) {
+        return results;
+      }
+
+      // Crop each element from the same screenshot
+      for (const element of elements) {
+        try {
+          const rect = element.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            const snippet = await this.cropImage(fullPage.screenshot, rect, 50);
+            results.set(element, snippet);
+          }
+        } catch (err) {
+          // Skip failed elements
+        }
+      }
+
+      console.log('📸 GhostWriter: Batch captured', results.size, 'of', elements.length, 'elements');
+    } catch (err) {
+      console.warn('📸 GhostWriter: Batch capture failed:', err);
+    }
+
+    return results;
+  }
+
+  /**
+   * Compare two screenshots for similarity (basic pixel comparison)
+   * Returns 0-1 similarity score
+   */
+  static async compareScreenshots(screenshot1: string, screenshot2: string): Promise<number> {
+    return new Promise((resolve) => {
+      const img1 = new Image();
+      const img2 = new Image();
+      let loaded = 0;
+
+      const checkBoth = () => {
+        loaded++;
+        if (loaded < 2) return;
+
+        try {
+          // Resize to common dimensions for comparison
+          const size = 100; // Small size for fast comparison
+          const canvas1 = document.createElement('canvas');
+          const canvas2 = document.createElement('canvas');
+          canvas1.width = canvas2.width = size;
+          canvas1.height = canvas2.height = size;
+
+          const ctx1 = canvas1.getContext('2d');
+          const ctx2 = canvas2.getContext('2d');
+
+          if (!ctx1 || !ctx2) {
+            resolve(0);
+            return;
+          }
+
+          ctx1.drawImage(img1, 0, 0, size, size);
+          ctx2.drawImage(img2, 0, 0, size, size);
+
+          const data1 = ctx1.getImageData(0, 0, size, size).data;
+          const data2 = ctx2.getImageData(0, 0, size, size).data;
+
+          // Calculate pixel-wise similarity
+          let diff = 0;
+          for (let i = 0; i < data1.length; i += 4) {
+            // Compare RGB (skip alpha)
+            diff += Math.abs(data1[i] - data2[i]);     // R
+            diff += Math.abs(data1[i + 1] - data2[i + 1]); // G
+            diff += Math.abs(data1[i + 2] - data2[i + 2]); // B
+          }
+
+          const maxDiff = size * size * 3 * 255;
+          const similarity = 1 - (diff / maxDiff);
+          resolve(similarity);
+        } catch (err) {
+          resolve(0);
+        }
+      };
+
+      img1.onload = checkBoth;
+      img2.onload = checkBoth;
+      img1.onerror = () => resolve(0);
+      img2.onerror = () => resolve(0);
+      img1.src = screenshot1;
+      img2.src = screenshot2;
+    });
+  }
+
+  /**
+   * Detect page regions using DOM heuristics
+   */
+  private static detectPageRegions(): PageRegions {
+    const regions: PageRegions = {};
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+
+    // Detect header - typically at top, full width
+    const headerCandidates = document.querySelectorAll(
+      'header, [role="banner"], nav:first-of-type, .header, #header, .navbar, .top-bar'
+    );
+    for (const el of headerCandidates) {
+      const rect = el.getBoundingClientRect();
+      if (rect.top < 100 && rect.width > viewportWidth * 0.8) {
+        regions.header = {
+          x: rect.left,
+          y: rect.top,
+          width: rect.width,
+          height: rect.height,
+        };
+        break;
+      }
+    }
+
+    // Detect sidebar - typically on left or right, tall
+    const sidebarCandidates = document.querySelectorAll(
+      'aside, [role="complementary"], .sidebar, #sidebar, .side-nav, .left-panel, .right-panel'
+    );
+    for (const el of sidebarCandidates) {
+      const rect = el.getBoundingClientRect();
+      if (rect.height > viewportHeight * 0.5 && rect.width < viewportWidth * 0.3) {
+        regions.sidebar = {
+          x: rect.left,
+          y: rect.top,
+          width: rect.width,
+          height: rect.height,
+        };
+        break;
+      }
+    }
+
+    // Detect main content - typically the largest central area
+    const mainCandidates = document.querySelectorAll(
+      'main, [role="main"], .main-content, #main, .content, #content, article'
+    );
+    for (const el of mainCandidates) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > viewportWidth * 0.4 && rect.height > viewportHeight * 0.4) {
+        regions.mainContent = {
+          x: rect.left,
+          y: rect.top,
+          width: rect.width,
+          height: rect.height,
+        };
+        break;
+      }
+    }
+
+    // Detect footer - typically at bottom, full width
+    const footerCandidates = document.querySelectorAll(
+      'footer, [role="contentinfo"], .footer, #footer'
+    );
+    for (const el of footerCandidates) {
+      const rect = el.getBoundingClientRect();
+      if (rect.bottom > viewportHeight * 0.8 && rect.width > viewportWidth * 0.8) {
+        regions.footer = {
+          x: rect.left,
+          y: rect.top,
+          width: rect.width,
+          height: rect.height,
+        };
+        break;
+      }
+    }
+
+    // Detect navigation
+    const navCandidates = document.querySelectorAll(
+      'nav, [role="navigation"], .nav, .navigation'
+    );
+    for (const el of navCandidates) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 100 && rect.height > 30) {
+        regions.navigation = {
+          x: rect.left,
+          y: rect.top,
+          width: rect.width,
+          height: rect.height,
+        };
+        break;
+      }
+    }
+
+    // Detect action bar / toolbar
+    const toolbarCandidates = document.querySelectorAll(
+      '[role="toolbar"], .toolbar, .action-bar, .button-bar, .actions'
+    );
+    for (const el of toolbarCandidates) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 100) {
+        regions.actionBar = {
+          x: rect.left,
+          y: rect.top,
+          width: rect.width,
+          height: rect.height,
+        };
+        break;
+      }
+    }
+
+    // Detect form area
+    const formCandidates = document.querySelectorAll('form, .form, [role="form"]');
+    for (const el of formCandidates) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 200 && rect.height > 100) {
+        regions.formArea = {
+          x: rect.left,
+          y: rect.top,
+          width: rect.width,
+          height: rect.height,
+        };
+        break;
+      }
+    }
+
+    // Detect table area
+    const tableCandidates = document.querySelectorAll(
+      'table, [role="grid"], .data-table, .table-container'
+    );
+    for (const el of tableCandidates) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 200 && rect.height > 100) {
+        regions.tableArea = {
+          x: rect.left,
+          y: rect.top,
+          width: rect.width,
+          height: rect.height,
+        };
+        break;
+      }
+    }
+
+    return regions;
+  }
+
+  /**
+   * Crop image from base64 string using DOMRect
+   */
+  private static cropImage(base64: string, rect: DOMRect, padding: number = 200): Promise<string> {
     return new Promise((resolve) => {
       const image = new Image();
       image.onload = () => {
@@ -58,7 +459,6 @@ export class VisualSnapshotService {
         
         // CRITICAL: Handle Device Pixel Ratio (MacBooks/High-DPI)
         const dpr = window.devicePixelRatio || 1;
-        const padding = 50; // Context padding for AI
 
         // Calculate Crop Dimensions (clamp to image bounds)
         const sourceX = Math.max(0, (rect.left - padding) * dpr);
@@ -97,5 +497,97 @@ export class VisualSnapshotService {
       image.src = base64;
     });
   }
-}
 
+  /**
+   * Crop image using BoundingBox (for regions)
+   */
+  private static cropImageFromBox(base64: string, box: BoundingBox, padding: number = 0): Promise<string> {
+    return new Promise((resolve) => {
+      const image = new Image();
+      image.onload = () => {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        if (!ctx) {
+          resolve(base64);
+          return;
+        }
+        
+        const dpr = window.devicePixelRatio || 1;
+
+        const sourceX = Math.max(0, (box.x - padding) * dpr);
+        const sourceY = Math.max(0, (box.y - padding) * dpr);
+        const sourceWidth = Math.min(
+          (box.width + (padding * 2)) * dpr,
+          image.width - sourceX
+        );
+        const sourceHeight = Math.min(
+          (box.height + (padding * 2)) * dpr,
+          image.height - sourceY
+        );
+
+        if (sourceWidth <= 0 || sourceHeight <= 0) {
+          resolve(base64);
+          return;
+        }
+
+        canvas.width = sourceWidth;
+        canvas.height = sourceHeight;
+
+        ctx.drawImage(
+          image,
+          sourceX, sourceY, sourceWidth, sourceHeight,
+          0, 0, sourceWidth, sourceHeight
+        );
+
+        resolve(canvas.toDataURL('image/jpeg', 0.7));
+      };
+      image.onerror = () => resolve(base64);
+      image.src = base64;
+    });
+  }
+
+  /**
+   * Compress an image to reduce size
+   */
+  private static compressImage(base64: string, quality: number = 0.7): Promise<string> {
+    return new Promise((resolve) => {
+      const image = new Image();
+      image.onload = () => {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        if (!ctx) {
+          resolve(base64);
+          return;
+        }
+
+        // For very large images, scale down
+        let width = image.width;
+        let height = image.height;
+        const maxDimension = 2000; // Max dimension for AI efficiency
+
+        if (width > maxDimension || height > maxDimension) {
+          const scale = maxDimension / Math.max(width, height);
+          width = Math.round(width * scale);
+          height = Math.round(height * scale);
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        ctx.drawImage(image, 0, 0, width, height);
+
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      image.onerror = () => resolve(base64);
+      image.src = base64;
+    });
+  }
+
+  /**
+   * Clear the screenshot cache
+   */
+  static clearCache(): void {
+    this.lastFullPageCapture = null;
+  }
+}

@@ -6,12 +6,27 @@
 export interface AIConfig {
   supabaseUrl: string;
   supabaseAnonKey: string;
+  // Element recovery
   edgeFunctionName: string;
+  // Selector validation
   validateSelectorEdgeFunctionName: string;
+  validateSelectorTimeout: number;
+  // Step description generation
+  generateDescriptionEdgeFunctionName: string;
+  // Visual analysis functions
+  classifyPageTypeEdgeFunctionName: string;
+  visualSimilarityEdgeFunctionName: string;
+  visualAnalysisEdgeFunctionName: string;
+  analyzeIntentEdgeFunctionName: string;
+  detectVariablesEdgeFunctionName: string;
+  visualAnalysisTimeout: number;
+  // Feature flags
   enabled: boolean;
-  timeout: number; // Timeout for Edge Function calls (ms)
-  validateSelectorTimeout: number; // Timeout for selector validation (ms)
-  localCacheTTL: number; // Local cache TTL (ms)
+  visualAnalysisEnabled: boolean;
+  correctionLearningEnabled: boolean;
+  // Timeouts
+  timeout: number;
+  localCacheTTL: number;
 }
 
 class AIConfigManager {
@@ -23,11 +38,32 @@ class AIConfigManager {
     this.config = {
       supabaseUrl: 'https://jfboagngbpzollcipewh.supabase.co',
       supabaseAnonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpmYm9hZ25nYnB6b2xsY2lwZXdoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ5OTIyMzMsImV4cCI6MjA4MDU2ODIzM30.CHHB1kvhiq4i063unS6_UdBLwLd8uXVi71id6hdelUI',
+      
+      // Element recovery
       edgeFunctionName: 'recover_element',
+      
+      // Selector validation
       validateSelectorEdgeFunctionName: 'validate_selector',
-      enabled: true, // Feature flag
-      timeout: 10000, // 10 seconds for Edge Function call
-      validateSelectorTimeout: 15000, // 15 seconds for selector validation (increased for testing)
+      validateSelectorTimeout: 15000, // 15 seconds for selector validation
+      
+      // Step description generation
+      generateDescriptionEdgeFunctionName: 'generate_step_description',
+      
+      // Visual analysis functions (human-like understanding)
+      classifyPageTypeEdgeFunctionName: 'classify_page_type',
+      visualSimilarityEdgeFunctionName: 'visual_similarity',
+      visualAnalysisEdgeFunctionName: 'visual_analysis',
+      analyzeIntentEdgeFunctionName: 'analyze_intent',
+      detectVariablesEdgeFunctionName: 'detect_variables',
+      visualAnalysisTimeout: 20000, // 20 seconds for visual analysis (images are larger)
+      
+      // Feature flags
+      enabled: true, // Master feature flag for AI
+      visualAnalysisEnabled: true, // Enable visual analysis features
+      correctionLearningEnabled: true, // Enable learning from user corrections
+      
+      // Timeouts
+      timeout: 10000, // 10 seconds for standard Edge Function calls
       localCacheTTL: 3600000, // 1 hour for local cache
     };
   }
@@ -51,6 +87,20 @@ class AIConfigManager {
    */
   isEnabled(): boolean {
     return this.config.enabled;
+  }
+
+  /**
+   * Check if visual analysis is enabled
+   */
+  isVisualAnalysisEnabled(): boolean {
+    return this.config.enabled && this.config.visualAnalysisEnabled;
+  }
+
+  /**
+   * Check if correction learning is enabled
+   */
+  isCorrectionLearningEnabled(): boolean {
+    return this.config.enabled && this.config.correctionLearningEnabled;
   }
 
   /**
@@ -82,10 +132,24 @@ class AIConfigManager {
   }
 
   /**
+   * Get visual analysis timeout
+   */
+  getVisualAnalysisTimeout(): number {
+    return this.config.visualAnalysisTimeout;
+  }
+
+  /**
    * Get local cache TTL
    */
   getLocalCacheTTL(): number {
     return this.config.localCacheTTL;
+  }
+
+  /**
+   * Get Edge Function URL
+   */
+  getEdgeFunctionUrl(functionName: string): string {
+    return `${this.config.supabaseUrl}/functions/v1/${functionName}`;
   }
 }
 

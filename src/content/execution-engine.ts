@@ -1,27 +1,55 @@
 /**
  * ExecutionEngine - Executes recorded workflow steps
  * Phase 3: Workflow execution with robust element finding
+ * Phase 4: Enhanced with visual wait conditions and visual strategies
  */
 
 import { ElementFinder } from './element-finder';
 import { ElementStateCapture } from './element-state';
 import { ExecutionTools } from './execution-tools';
+import { VisualWait } from '../lib/visual-wait';
+import { visualFlowTracker } from '../lib/visual-flow';
+import { aiConfig } from '../lib/ai-config';
 import type { WorkflowStep, WorkflowIntent } from '../types/workflow';
+import type { WorkflowVariables } from '../lib/variable-detector';
 
 export class ExecutionEngine {
+  // Store variable values for the current execution
+  private variableValues: Record<string, string> | undefined;
+  private workflowVariables: WorkflowVariables | undefined;
+
   /**
    * Execute a workflow (backward compatible - defaults to exact replay)
+   * @param steps - The workflow steps to execute
+   * @param intent - Optional workflow intent for adaptive execution
+   * @param variableValues - Optional variable values to substitute during execution
+   * @param workflowVariables - Optional workflow variables metadata for step matching
    */
-  async executeWorkflow(steps: WorkflowStep[], intent?: WorkflowIntent): Promise<void> {
-    // Determine execution mode
-    const mode = intent ? this.determineExecutionMode(intent) : 'exact';
+  async executeWorkflow(
+    steps: WorkflowStep[], 
+    intent?: WorkflowIntent,
+    variableValues?: Record<string, string>,
+    workflowVariables?: WorkflowVariables
+  ): Promise<void> {
+    // Store variable values for use in executeInput
+    this.variableValues = variableValues;
+    this.workflowVariables = workflowVariables;
 
-    if (mode === 'adaptive' && intent?.policy) {
-      // Use adaptive execution with Policy Object
-      await this.adaptiveExecute(steps, intent);
-    } else {
-      // Use exact replay (backward compatible)
-      await this.exactReplay(steps);
+    try {
+      // Determine execution mode
+      const mode = intent ? this.determineExecutionMode(intent) : 'exact';
+
+      if (mode === 'adaptive' && intent?.policy) {
+        // Use adaptive execution with Policy Object
+        await this.adaptiveExecute(steps, intent);
+      } else {
+        // Use exact replay (backward compatible)
+        await this.exactReplay(steps);
+      }
+    } finally {
+      // Clear variable values after execution
+      this.variableValues = undefined;
+      this.workflowVariables = undefined;
     }
   }
 
@@ -333,6 +361,11 @@ export class ExecutionEngine {
     // Wait for conditions
     await this.waitForConditions(step);
 
+    // Phase 4: Capture visual state before action (if visual analysis enabled)
+    if (aiConfig.isVisualAnalysisEnabled()) {
+      await visualFlowTracker.captureBeforeState();
+    }
+
     switch (step.type) {
       case 'CLICK':
         await this.executeClick(step);
@@ -348,6 +381,31 @@ export class ExecutionEngine {
         break;
       default:
         console.warn(`GhostWriter: Unknown step type: ${(step as any).type}`);
+    }
+
+    // Phase 4: Wait for visual stability after action
+    if (aiConfig.isVisualAnalysisEnabled()) {
+      await this.waitForVisualStability(step);
+      await visualFlowTracker.captureAfterState();
+    }
+  }
+
+  /**
+   * Wait for visual stability after an action
+   */
+  private async waitForVisualStability(step: WorkflowStep): Promise<void> {
+    // For navigation or clicks that might trigger page changes, wait for stability
+    if (step.type === 'NAVIGATION' || step.type === 'CLICK') {
+      const waitResult = await VisualWait.waitForStability(300, 3000, 100);
+      if (!waitResult.success) {
+        console.log('🔄 GhostWriter: Visual stability timeout, continuing anyway');
+      }
+    }
+    
+    // For clicks on buttons that might trigger modals/dropdowns, wait briefly
+    if (step.type === 'CLICK' && 
+        (step.payload.elementRole === 'button' || step.payload.context?.buttonContext)) {
+      await VisualWait.waitForAnimationComplete(1000, 100, 50);
     }
   }
 
@@ -441,6 +499,29 @@ export class ExecutionEngine {
   }
 
   /**
+   * Get variable value for a step if it exists
+   * Matches by step timestamp (stepId)
+   */
+  private getVariableValueForStep(step: WorkflowStep): string | undefined {
+    if (!this.variableValues || !this.workflowVariables) {
+      return undefined;
+    }
+
+    // Find variable definition for this step by matching timestamp
+    const stepId = String(step.payload.timestamp);
+    const variableDef = this.workflowVariables.variables.find(
+      v => String(v.stepId) === stepId
+    );
+
+    if (!variableDef) {
+      return undefined;
+    }
+
+    // Return the user-provided value for this variable
+    return this.variableValues[variableDef.variableName];
+  }
+
+  /**
    * Execute an INPUT step
    */
   private async executeInput(step: WorkflowStep): Promise<void> {
@@ -466,6 +547,15 @@ export class ExecutionEngine {
       throw new Error(`GhostWriter: Element is not an input element: ${step.payload.selector}`);
     }
 
+    // Get the value to use - either from variables or from the recorded step
+    const variableValue = this.getVariableValueForStep(step);
+    const valueToUse = variableValue !== undefined ? variableValue : (step.payload.value || '');
+
+    // Log variable substitution for debugging
+    if (variableValue !== undefined) {
+      console.log(`[ExecutionEngine] Using variable value for step: "${variableValue}" (original: "${step.payload.value}")`);
+    }
+
     // Scroll element into view
     element.scrollIntoView({ behavior: 'smooth', block: 'center' });
     await this.delay(100);
@@ -483,7 +573,7 @@ export class ExecutionEngine {
       htmlElement.innerText = '';
       
       // Set the value
-      htmlElement.textContent = step.payload.value || '';
+      htmlElement.textContent = valueToUse;
       
       // Dispatch InputEvent (crucial for modern editors like Google Sheets)
       // This triggers formula calculations and data validation
@@ -491,7 +581,7 @@ export class ExecutionEngine {
         bubbles: true,
         cancelable: true,
         inputType: 'insertText',
-        data: step.payload.value || ''
+        data: valueToUse
       });
       htmlElement.dispatchEvent(inputEvent);
       
@@ -523,11 +613,11 @@ export class ExecutionEngine {
       // Clear existing value
       if (element instanceof HTMLSelectElement) {
         // For selects, set value directly
-        element.value = step.payload.value || '';
+        element.value = valueToUse;
       } else {
         // For inputs and textareas, clear and set value
         element.value = '';
-        element.value = step.payload.value || '';
+        element.value = valueToUse;
       }
 
       // Dispatch input and change events

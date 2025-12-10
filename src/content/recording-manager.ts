@@ -13,9 +13,12 @@ import { IframeUtils } from './iframe-utils';
 import { ContextScanner } from './context-scanner';
 import { VisualSnapshotService } from './visual-snapshot';
 import { AIService } from '../lib/ai-service';
+import { VisualAnalysisService } from '../lib/visual-analysis';
 import { DOMDistiller } from '../lib/dom-distiller';
 import { PIIScrubber } from '../lib/pii-scrubber';
+import { aiConfig } from '../lib/ai-config';
 import type { WorkflowStep } from '../types/workflow';
+import type { PageAnalysis, PageType } from '../types/visual';
 
 export class RecordingManager {
   private isRecording: boolean = false;
@@ -26,9 +29,13 @@ export class RecordingManager {
   private keyboardHandler: ((event: KeyboardEvent) => void) | null = null;
   private focusHandler: ((event: FocusEvent) => void) | null = null;
   private mousedownHandler: ((event: MouseEvent) => void) | null = null;
+  private scrollHandler: ((event: Event) => void) | null = null;
+  private scrollDebounceTimer: number | null = null;
+  private lastScrollStep: { scrollX: number; scrollY: number; timestamp: number } | null = null;
   private currentUrl: string = window.location.href;
   private readonly DEBOUNCE_DELAY = 500; // 500ms debounce for input events
-  private readonly CLICK_DEDUP_WINDOW = 2000; // 2 seconds - ignore duplicate clicks on same element within this window
+  private readonly SCROLL_DEBOUNCE_DELAY = 300; // 300ms debounce for scroll events
+  private readonly CLICK_DEDUP_WINDOW = 500; // 500ms - ignore duplicate clicks on same element within this window (reduced from 2s to allow rapid different clicks)
   private lastInputStep: { selector: string; value: string } | null = null; // Track last input to prevent duplicates
   private lastClickStep: { selector: string; timestamp: number } | null = null; // Track last click to prevent duplicates
   private lastStep: WorkflowStep | null = null; // Track last step for wait condition determination
@@ -39,6 +46,9 @@ export class RecordingManager {
   private pendingSnapshot: Promise<{ viewport: string; elementSnippet: string } | null> | null = null;
   // AI Validation: Track pending validations to wait before saving
   private pendingValidations: Promise<void>[] = [];
+  // Phase 4: Human-like visual understanding
+  private currentPageAnalysis: PageAnalysis | null = null;
+  private pageAnalysisPending: boolean = false;
 
   /**
    * Start recording - attach event listeners
@@ -57,6 +67,11 @@ export class RecordingManager {
       document.body.setAttribute('data-ghostwriter-recording', 'true');
     }
 
+    // Phase 4: Analyze page type for human-like understanding
+    this.analyzeCurrentPage().catch((error) => {
+      console.warn('🎨 GhostWriter: Page analysis failed:', error);
+    });
+
     // Setup click handler - use CAPTURE phase to catch events before React/Base UI stops propagation
     // This is critical for dropdown options that might have stopPropagation() called
     this.clickHandler = this.handleClick.bind(this);
@@ -67,11 +82,21 @@ export class RecordingManager {
     document.addEventListener('input', this.inputHandler, false);
 
     // Setup change handler (for select, checkbox, radio) - use bubble phase
-    this.changeHandler = this.handleChange.bind(this);
+    // Wrap change handler in async callback since it's now async
+    this.changeHandler = ((event: Event) => {
+      this.handleChange(event).catch((error) => {
+        console.error('Error in change handler:', error);
+      });
+    }).bind(this);
     document.addEventListener('change', this.changeHandler, false);
 
     // Setup keyboard handler - only capture important keys (Enter, Tab, Escape)
-    this.keyboardHandler = this.handleKeyboard.bind(this);
+    // Wrap in async handler since handleKeyboard is now async
+    this.keyboardHandler = ((event: KeyboardEvent) => {
+      this.handleKeyboard(event).catch((error) => {
+        console.error('Error in keyboard handler:', error);
+      });
+    }) as (event: KeyboardEvent) => void;
     document.addEventListener('keydown', this.keyboardHandler, false);
 
     // Setup focus handler to clear cache when focusing on a new element
@@ -81,6 +106,10 @@ export class RecordingManager {
     // Setup mousedown handler to cache snapshots (Guardrail 3: Prevent race condition)
     this.mousedownHandler = this.handleMousedown.bind(this);
     document.addEventListener('mousedown', this.mousedownHandler, true); // Capture phase
+
+    // Setup scroll handler - debounced to avoid too many events
+    this.scrollHandler = this.handleScroll.bind(this);
+    window.addEventListener('scroll', this.scrollHandler, true); // Capture phase for all scroll events
 
     console.log('Recording started');
   }
@@ -132,10 +161,20 @@ export class RecordingManager {
       this.mousedownHandler = null;
     }
 
-    // Clear any pending debounce timer
+    if (this.scrollHandler) {
+      window.removeEventListener('scroll', this.scrollHandler, true);
+      this.scrollHandler = null;
+    }
+
+    // Clear any pending debounce timers
     if (this.inputDebounceTimer !== null) {
       clearTimeout(this.inputDebounceTimer);
       this.inputDebounceTimer = null;
+    }
+
+    if (this.scrollDebounceTimer !== null) {
+      clearTimeout(this.scrollDebounceTimer);
+      this.scrollDebounceTimer = null;
     }
 
     // Clear last input step tracking
@@ -469,7 +508,12 @@ export class RecordingManager {
    * This is critical for dropdown options that might have stopPropagation() called
    */
   private handleClick(event: MouseEvent): void {
-    if (!this.isRecording) return;
+    if (!this.isRecording) {
+      console.log('GhostWriter: Click received but recording is not active');
+      return;
+    }
+
+    console.log('GhostWriter: Click event received, processing...');
 
     // Process asynchronously to avoid blocking the click event
     // Use requestIdleCallback or setTimeout(0) to ensure event can propagate
@@ -478,11 +522,32 @@ export class RecordingManager {
       try {
         // Get actual element (handles Shadow DOM)
         const actualElement = this.getActualElement(event);
-        if (!actualElement) return;
+        if (!actualElement) {
+          console.warn('GhostWriter: No actual element found for click event');
+          return;
+        }
+        
+        console.log('GhostWriter: Processing click on element:', actualElement.tagName, 'Classes:', actualElement.className?.toString()?.substring(0, 50));
 
         // Check if this is a list item/option FIRST (before filtering)
         // This is critical for dropdown options in portals
-        const isListItemOrOption = this.isListItemOrOption(actualElement);
+        let isListItemOrOption = this.isListItemOrOption(actualElement);
+        
+        // CRITICAL: Check if the last step was a dropdown trigger - if so, this click is likely a dropdown item
+        const wasDropdownTrigger = this.lastStep?.payload?.waitConditions?.some(
+          wc => wc.type === 'element' && 
+          (wc.selector?.includes('[role="listbox"]') || 
+           wc.selector?.includes('[role="menu"]') ||
+           wc.selector?.includes('listbox') ||
+           wc.selector?.includes('menu'))
+        ) || false;
+        
+        // If last step was a dropdown trigger and this click is within 2 seconds, treat it as a dropdown item
+        const timeSinceLastStep = this.lastStep ? (Date.now() - this.lastStep.payload.timestamp) : Infinity;
+        if (wasDropdownTrigger && timeSinceLastStep < 2000) {
+          console.log('GhostWriter: Last step was dropdown trigger - treating this click as dropdown item');
+          isListItemOrOption = true; // Force treat as dropdown item
+        }
         
         // Find the actual clickable element (handles overlay clicks)
         // BUT: For list items/options, be more permissive - they might be in portals
@@ -506,16 +571,24 @@ export class RecordingManager {
           return;
         }
         
+        console.log('GhostWriter: Clickable element found:', clickableElement.tagName, 'Text:', (clickableElement as HTMLElement).textContent?.trim()?.substring(0, 50));
+        
+        // RE-CHECK: Verify the final clickable element is also a list item/option
+        // This is important because findActualClickableElement might have found a different element
+        const finalIsListItemOrOption = isListItemOrOption || this.isListItemOrOption(clickableElement);
+        
         // For list items/options, be more lenient with visibility checks
         // They might be in portals with different visibility contexts
         const isVisible = ElementStateCapture.isElementVisible(clickableElement);
-        if (!isVisible && !isListItemOrOption) {
-          console.warn('GhostWriter: Skipping click on invisible element. Original element:', actualElement.tagName);
+        if (!isVisible && !finalIsListItemOrOption) {
+          console.warn('GhostWriter: Skipping click on invisible element. Original element:', actualElement.tagName, 'Clickable element:', clickableElement.tagName);
           return; // Don't record invisible elements (unless it's a list item/option)
         }
         
+        console.log('GhostWriter: Element is visible, proceeding with recording...');
+        
         // Log if we're recording a list item/option (for debugging)
-        if (isListItemOrOption) {
+        if (finalIsListItemOrOption) {
           console.log('GhostWriter: Recording list item/option click:', clickableElement.tagName, 'Text:', (clickableElement as HTMLElement).textContent?.trim()?.substring(0, 50));
         }
         
@@ -527,7 +600,7 @@ export class RecordingManager {
         }
 
         // CRITICAL: For list items/options, log the element details for debugging
-        if (isListItemOrOption) {
+        if (finalIsListItemOrOption) {
           const role = target.getAttribute('role');
           const className = target.className?.toString() || '';
           const text = target.textContent?.trim()?.substring(0, 100) || '';
@@ -541,6 +614,14 @@ export class RecordingManager {
         }
 
         const url = window.location.href;
+        
+        // Capture element text EARLY (needed for improved deduplication)
+        let elementText: string | undefined = undefined;
+        try {
+          elementText = ElementTextCapture.captureElementText(target);
+        } catch (textError) {
+          console.warn('GhostWriter: Error capturing element text:', textError);
+        }
         
         // Capture context and similarity information first (needed for container-scoped selectors)
         let context: import('./element-context').ElementContextData | null = null;
@@ -575,33 +656,49 @@ export class RecordingManager {
         }
 
         // Deduplicate: Skip if this is the same click on the same element within the dedup window
+        // IMPROVED: Check both selector AND element text to avoid false positives
         // BUT: NEVER skip list items/options - they are critical for dropdown interactions
         const currentTimestamp = Date.now();
         
-        // Check if the last step was a dropdown trigger (has wait condition for listbox/menu)
-        const wasDropdownTrigger = this.lastStep?.payload?.waitConditions?.some(
-          wc => wc.type === 'element' && 
-          (wc.selector?.includes('[role="listbox"]') || 
-           wc.selector?.includes('[role="menu"]') ||
-           wc.selector?.includes('listbox') ||
-           wc.selector?.includes('menu'))
-        ) || false;
-        
         // CRITICAL: Always allow list items/options to be recorded, even if within dedup window
         // This ensures dropdown option clicks are never filtered out
-        if (isListItemOrOption) {
+        if (finalIsListItemOrOption) {
           console.log('GhostWriter: List item/option click - ALWAYS recording (bypassing deduplication)');
           // Continue - always record list items/options
-        } else if (this.lastClickStep && 
-            this.lastClickStep.selector === selectors.primary &&
-            (currentTimestamp - this.lastClickStep.timestamp) < this.CLICK_DEDUP_WINDOW) {
-          console.log('GhostWriter: Skipping duplicate click on same element within', this.CLICK_DEDUP_WINDOW, 'ms');
-          return; // Skip duplicate click (same selector, not a list item/option)
+        } else {
+          // IMPROVED: Check both selector AND element text to avoid false positives
+          // Different elements might have similar selectors, so we need to check element text too
+          const lastElementText = this.lastStep?.payload?.elementText;
+          
+          console.log('GhostWriter: Checking deduplication - Last click selector:', this.lastClickStep?.selector, 'Current selector:', selectors.primary);
+          console.log('GhostWriter: Last element text:', lastElementText, 'Current element text:', elementText);
+          console.log('GhostWriter: Time since last click:', this.lastClickStep ? (currentTimestamp - this.lastClickStep.timestamp) : 'N/A', 'ms');
+          
+          // Only skip if BOTH selector AND element text match (within dedup window)
+          if (this.lastClickStep && 
+              this.lastClickStep.selector === selectors.primary &&
+              elementText === lastElementText &&
+              (currentTimestamp - this.lastClickStep.timestamp) < this.CLICK_DEDUP_WINDOW) {
+            console.log('GhostWriter: ⚠️ SKIPPING duplicate click on same element (selector + text match) within', this.CLICK_DEDUP_WINDOW, 'ms');
+            return; // Skip duplicate click (same selector AND text, not a list item/option)
+          }
+          
+          // If selector matches but text is different, it's likely a different element - allow it
+          if (this.lastClickStep && 
+              this.lastClickStep.selector === selectors.primary &&
+              elementText !== lastElementText) {
+            console.log('GhostWriter: ✅ Same selector but different element text - allowing click (different element)');
+            // Continue - different element, record it
+          }
+          
+          if (!this.lastClickStep || this.lastClickStep.selector !== selectors.primary) {
+            console.log('GhostWriter: ✅ Different selector - allowing click');
+          }
         }
         
         // Special case: If this is a list item/option and the last click was on a different selector,
         // allow it even if within the dedup window (dropdown trigger -> option is a valid sequence)
-        if (isListItemOrOption && this.lastClickStep && 
+        if (finalIsListItemOrOption && this.lastClickStep && 
             this.lastClickStep.selector !== selectors.primary &&
             (currentTimestamp - this.lastClickStep.timestamp) < this.CLICK_DEDUP_WINDOW) {
           console.log('GhostWriter: Allowing list item/option click after different selector (dropdown sequence)');
@@ -625,13 +722,12 @@ export class RecordingManager {
         };
 
         let elementState: import('../types/workflow').ElementState | null = null;
-        let elementText: string | undefined = undefined;
 
         try {
           elementState = ElementStateCapture.captureElementState(target);
-          elementText = ElementTextCapture.captureElementText(target);
+          // elementText already captured earlier for deduplication
         } catch (stateError) {
-          console.warn('GhostWriter: Error capturing element state/text:', stateError);
+          console.warn('GhostWriter: Error capturing element state:', stateError);
         }
 
         // Capture event details (Phase 1: Critical)
@@ -742,21 +838,29 @@ export class RecordingManager {
           if (!this.isRecording) return;
 
           // Double-check deduplication here (in case another click happened during the delay)
+          // IMPROVED: Be more permissive - check both selector AND element text
           const checkTimestamp = Date.now();
           // Check for duplicate, but ALWAYS allow list items/options
           // CRITICAL: Never skip list items/options - they are essential for dropdown interactions
-          const isListItemOrOptionCheck = this.isListItemOrOption(target);
-          if (this.lastClickStep && 
+          // Re-check on the final target element
+          const isListItemOrOptionCheck = finalIsListItemOrOption || this.isListItemOrOption(target);
+          if (!isListItemOrOptionCheck && this.lastClickStep && 
               this.lastClickStep.selector === selectors.primary &&
               this.lastClickStep.timestamp !== currentTimestamp && // Different click
               (checkTimestamp - this.lastClickStep.timestamp) < this.CLICK_DEDUP_WINDOW) {
-            // Only skip if it's NOT a list item/option (dropdown options should always be recorded)
-            if (!isListItemOrOptionCheck) {
-              console.log('GhostWriter: Skipping duplicate click detected during async processing');
+            // IMPROVED: Also check element text to avoid false positives
+            const currentElementText = elementText;
+            const lastElementText = this.lastStep?.payload?.elementText;
+            
+            // Only skip if BOTH selector AND element text match
+            if (currentElementText === lastElementText) {
+              console.log('GhostWriter: Skipping duplicate click detected during async processing (selector + text match)');
               return; // Skip duplicate click
             } else {
-              console.log('GhostWriter: Allowing list item/option click even if within dedup window (async check)');
+              console.log('GhostWriter: Same selector but different element text - allowing click (async check)');
             }
+          } else if (isListItemOrOptionCheck) {
+            console.log('GhostWriter: Allowing list item/option click even if within dedup window (async check)');
           }
 
           const newUrl = window.location.href;
@@ -811,8 +915,76 @@ export class RecordingManager {
           }
 
           // Resolve the snapshot started on mousedown (Guardrail 3: Prevent race condition)
+          // CRITICAL: For dropdown items, capture a FRESH snapshot on click to ensure we capture the dropdown item,
+          // not the three-dot button that was clicked on mousedown
           let visualSnapshot: WorkflowStep['payload']['visualSnapshot'] | undefined;
-          if (this.pendingSnapshot) {
+          
+          // RE-CHECK: Verify if this is a dropdown item (check again in async context)
+          // Also check if previous step was a dropdown trigger
+          const wasDropdownTrigger = this.lastStep?.payload?.waitConditions?.some(
+            wc => wc.type === 'element' && 
+            (wc.selector?.includes('[role="listbox"]') || 
+             wc.selector?.includes('[role="menu"]') ||
+             wc.selector?.includes('listbox') ||
+             wc.selector?.includes('menu'))
+          ) || false;
+          
+          const timeSinceLastStep = this.lastStep ? (Date.now() - this.lastStep.payload.timestamp) : Infinity;
+          const shouldTreatAsDropdownItem = finalIsListItemOrOption || 
+            (wasDropdownTrigger && timeSinceLastStep < 2000);
+          
+          if (shouldTreatAsDropdownItem) {
+            // For dropdown items, capture a fresh snapshot to ensure we get the actual dropdown item
+            try {
+              console.log('📸 GhostWriter: Capturing fresh snapshot for dropdown item');
+              console.log('📸 GhostWriter: Dropdown detection - finalIsListItemOrOption:', finalIsListItemOrOption, 'wasDropdownTrigger:', wasDropdownTrigger);
+              console.log('📸 GhostWriter: Target element:', target.tagName, 'Text:', target.textContent?.trim()?.substring(0, 50));
+              const visuals = await VisualSnapshotService.capture(target);
+              if (visuals) {
+                visualSnapshot = {
+                  viewport: visuals.viewport,
+                  elementSnippet: visuals.elementSnippet,
+                  timestamp: Date.now(),
+                  viewportSize: {
+                    width: window.innerWidth,
+                    height: window.innerHeight
+                  },
+                  elementBounds: elementBounds
+                };
+                console.log('📸 GhostWriter: Fresh snapshot captured for dropdown item, size:', visuals.elementSnippet?.length || 0, 'chars');
+              } else {
+                console.warn('📸 GhostWriter: Visual snapshot service returned null for dropdown item');
+              }
+              // Clear the pending snapshot since we're not using it
+              this.pendingSnapshot = null;
+            } catch (err) {
+              console.warn('📸 GhostWriter: Failed to capture fresh snapshot for dropdown item:', err);
+              // Fallback to mousedown snapshot if available
+              if (this.pendingSnapshot) {
+                try {
+                  const visuals = await this.pendingSnapshot;
+                  if (visuals) {
+                    visualSnapshot = {
+                      viewport: visuals.viewport,
+                      elementSnippet: visuals.elementSnippet,
+                      timestamp: Date.now(),
+                      viewportSize: {
+                        width: window.innerWidth,
+                        height: window.innerHeight
+                      },
+                      elementBounds: elementBounds
+                    };
+                    console.warn('📸 GhostWriter: Using fallback mousedown snapshot for dropdown item (may show wrong element)');
+                  }
+                } catch (fallbackErr) {
+                  console.warn('📸 GhostWriter: Fallback to mousedown snapshot also failed:', fallbackErr);
+                } finally {
+                  this.pendingSnapshot = null;
+                }
+              }
+            }
+          } else if (this.pendingSnapshot) {
+            // For non-dropdown items, use the mousedown snapshot
             try {
               console.log('📸 GhostWriter: Awaiting snapshot from mousedown...');
               const visuals = await this.pendingSnapshot;
@@ -909,6 +1081,7 @@ export class RecordingManager {
             console.warn('📸 GhostWriter: Step does NOT include visualSnapshot');
           }
 
+          console.log('GhostWriter: ✅ Sending step to side panel - Type:', step.type, 'Selector:', selectors.primary.substring(0, 100));
           this.sendStep(step);
           this.lastStep = step;
           // Update last click timestamp (already set earlier, but update with actual step timestamp)
@@ -916,6 +1089,7 @@ export class RecordingManager {
             selector: selectors.primary,
             timestamp: stepPayload.timestamp,
           };
+          console.log('GhostWriter: Step recorded successfully. Total steps:', this.lastStep ? '1+' : '1');
 
           // Trigger AI validation if selector is fragile (non-blocking, background)
           // TEST MODE: Set to true to force AI validation on all selectors for testing
@@ -1010,7 +1184,7 @@ export class RecordingManager {
   /**
    * Handle change events (for select, checkbox, radio)
    */
-  private handleChange(event: Event): void {
+  private async handleChange(event: Event): Promise<void> {
     if (!this.isRecording) return;
 
     try {
@@ -1021,8 +1195,21 @@ export class RecordingManager {
       const target = actualElement as HTMLSelectElement | HTMLInputElement;
       if (!target) return;
 
+      // Capture snapshot for change events (for AI context)
+      try {
+        console.log('📸 GhostWriter: Capturing snapshot for change event');
+        const visuals = await VisualSnapshotService.capture(actualElement);
+        if (visuals) {
+          // Store snapshot temporarily so captureInputValue can use it
+          this.pendingSnapshot = Promise.resolve(visuals);
+          console.log('📸 GhostWriter: Snapshot captured for change event');
+        }
+      } catch (snapshotError) {
+        console.warn('📸 GhostWriter: Failed to capture snapshot for change event:', snapshotError);
+      }
+
       // Capture immediately (no debounce for change events)
-      this.captureInputValue(target);
+      await this.captureInputValue(target);
     } catch (error) {
       console.error('Error handling change:', error);
     }
@@ -1075,7 +1262,7 @@ export class RecordingManager {
    * Handle keyboard events (Phase 2: Important)
    * Only captures important keys: Enter, Tab, Escape
    */
-  private handleKeyboard(event: KeyboardEvent): void {
+  private async handleKeyboard(event: KeyboardEvent): Promise<void> {
     if (!this.isRecording) return;
 
     // Only capture specific important keys
@@ -1195,6 +1382,34 @@ export class RecordingManager {
         enhancedFallbacks = [...semanticSelectors, ...enhancedFallbacks];
       }
 
+      // Capture visual snapshot for keyboard events (for AI description generation)
+      let visualSnapshot: WorkflowStep['payload']['visualSnapshot'] | undefined;
+      try {
+        console.log('📸 GhostWriter: Capturing snapshot for keyboard event');
+        const visuals = await VisualSnapshotService.capture(actualElement);
+        if (visuals) {
+          const rect = actualElement.getBoundingClientRect();
+          visualSnapshot = {
+            viewport: visuals.viewport,
+            elementSnippet: visuals.elementSnippet,
+            timestamp: Date.now(),
+            viewportSize: {
+              width: window.innerWidth,
+              height: window.innerHeight
+            },
+            elementBounds: {
+              x: rect.x,
+              y: rect.y,
+              width: rect.width,
+              height: rect.height,
+            }
+          };
+          console.log('📸 GhostWriter: Snapshot captured for keyboard event');
+        }
+      } catch (snapshotError) {
+        console.warn('📸 GhostWriter: Failed to capture snapshot for keyboard event:', snapshotError);
+      }
+
       const stepPayload: WorkflowStep['payload'] = {
         selector: selectors.primary,
         fallbackSelectors: enhancedFallbacks.length > 0 ? enhancedFallbacks : [selectors.primary],
@@ -1206,6 +1421,7 @@ export class RecordingManager {
         keyboardDetails,
         viewport,
         timing,
+        visualSnapshot, // Visual snapshot for AI description generation
         // Phase 3: Minor enhancements
         pageState,
       };
@@ -1228,6 +1444,124 @@ export class RecordingManager {
     } catch (error) {
       console.error('Error handling keyboard event:', error);
     }
+  }
+
+  /**
+   * Handle scroll events (debounced)
+   * Captures meaningful scroll actions with visual snapshots
+   */
+  private handleScroll(_event: Event): void {
+    if (!this.isRecording) return;
+
+    // Clear previous timer
+    if (this.scrollDebounceTimer !== null) {
+      clearTimeout(this.scrollDebounceTimer);
+    }
+
+    // Set new timer - only record after scroll stops
+    this.scrollDebounceTimer = window.setTimeout(async () => {
+      // Don't capture if recording was stopped
+      if (!this.isRecording) return;
+
+      try {
+        const scrollX = window.scrollX || window.pageXOffset;
+        const scrollY = window.scrollY || window.pageYOffset;
+        const currentTimestamp = Date.now();
+
+        // Skip if scroll position hasn't changed significantly (less than 50px)
+        if (this.lastScrollStep) {
+          const deltaX = Math.abs(scrollX - this.lastScrollStep.scrollX);
+          const deltaY = Math.abs(scrollY - this.lastScrollStep.scrollY);
+          
+          if (deltaX < 50 && deltaY < 50) {
+            return; // Not a meaningful scroll
+          }
+
+          // Skip if same scroll position within 1 second (debounce)
+          if ((currentTimestamp - this.lastScrollStep.timestamp) < 1000 &&
+              Math.abs(scrollX - this.lastScrollStep.scrollX) < 10 &&
+              Math.abs(scrollY - this.lastScrollStep.scrollY) < 10) {
+            return; // Duplicate scroll
+          }
+        }
+
+        const url = window.location.href;
+
+        // Capture viewport snapshot for scroll (shows what's visible after scrolling)
+        let visualSnapshot: WorkflowStep['payload']['visualSnapshot'] | undefined;
+        try {
+          console.log('📸 GhostWriter: Capturing snapshot for scroll event');
+          // Capture viewport snapshot (no specific element, just the viewport)
+          const response = await chrome.runtime.sendMessage({ type: 'CAPTURE_VIEWPORT' });
+          if (response && response.data?.snapshot) {
+            const viewportSnapshot = response.data.snapshot;
+            visualSnapshot = {
+              viewport: viewportSnapshot,
+              elementSnippet: viewportSnapshot, // Use viewport as element snippet for scroll
+              timestamp: Date.now(),
+              viewportSize: {
+                width: window.innerWidth,
+                height: window.innerHeight
+              },
+            };
+            console.log('📸 GhostWriter: Snapshot captured for scroll event');
+          }
+        } catch (snapshotError) {
+          console.warn('📸 GhostWriter: Failed to capture snapshot for scroll event:', snapshotError);
+        }
+
+        // Capture viewport information
+        const viewport: import('../types/workflow').ViewportInfo = {
+          width: window.innerWidth,
+          height: window.innerHeight,
+          scrollX,
+          scrollY,
+        };
+
+        // Capture timing information
+        const stepTimestamp = Date.now();
+        const delayAfter = this.lastStep ? (stepTimestamp - this.lastStep.payload.timestamp) : undefined;
+        const timing: import('../types/workflow').TimingInfo | undefined = delayAfter ? {
+          delayAfter,
+        } : undefined;
+
+        const stepPayload: WorkflowStep['payload'] = {
+          selector: 'body', // Scroll affects the entire page
+          fallbackSelectors: ['body', 'html'],
+          xpath: '/html/body',
+          timestamp: stepTimestamp,
+          url: url,
+          viewport,
+          timing,
+          visualSnapshot, // Visual snapshot for AI description generation
+        };
+
+        // Determine wait conditions
+        const tempStep: WorkflowStep = {
+          type: 'SCROLL',
+          payload: stepPayload,
+        };
+        const waitConditions = WaitConditionDeterminer.determineWaitConditions(tempStep, this.lastStep || undefined);
+        stepPayload.waitConditions = waitConditions.length > 0 ? waitConditions : undefined;
+
+        const step: WorkflowStep = {
+          type: 'SCROLL',
+          payload: stepPayload,
+        };
+
+        // Update last scroll step
+        this.lastScrollStep = {
+          scrollX,
+          scrollY,
+          timestamp: currentTimestamp,
+        };
+
+        this.sendStep(step);
+        this.lastStep = step;
+      } catch (error) {
+        console.error('Error handling scroll event:', error);
+      }
+    }, this.SCROLL_DEBOUNCE_DELAY);
   }
 
   /**
@@ -1415,7 +1749,8 @@ export class RecordingManager {
       // Currently always false, so omit entirely
       const networkConditions: import('../types/workflow').NetworkConditions | undefined = undefined;
 
-      // Resolve snapshot if available (from mousedown when user clicked to focus input)
+      // ALWAYS capture snapshot for input events (for AI context)
+      // Try pending snapshot first (from mousedown), but capture fresh if not available
       let visualSnapshot: WorkflowStep['payload']['visualSnapshot'] | undefined;
       if (this.pendingSnapshot) {
         try {
@@ -1431,11 +1766,35 @@ export class RecordingManager {
               },
               elementBounds: elementBounds
             };
+            console.log('📸 GhostWriter: Using pending snapshot for input');
           }
         } catch (err) {
           console.warn('GhostWriter: Failed to get cached snapshot for input:', err);
         } finally {
           this.pendingSnapshot = null;
+        }
+      }
+      
+      // If no pending snapshot, capture a fresh one
+      if (!visualSnapshot) {
+        try {
+          console.log('📸 GhostWriter: Capturing fresh snapshot for input event');
+          const visuals = await VisualSnapshotService.capture(element);
+          if (visuals) {
+            visualSnapshot = {
+              viewport: visuals.viewport,
+              elementSnippet: visuals.elementSnippet,
+              timestamp: Date.now(),
+              viewportSize: {
+                width: window.innerWidth,
+                height: window.innerHeight
+              },
+              elementBounds: elementBounds
+            };
+            console.log('📸 GhostWriter: Fresh snapshot captured for input event');
+          }
+        } catch (snapshotError) {
+          console.warn('📸 GhostWriter: Failed to capture snapshot for input event:', snapshotError);
         }
       }
 
@@ -1539,6 +1898,11 @@ export class RecordingManager {
         console.warn('📸 GhostWriter: Sending step WITHOUT visualSnapshot');
       }
 
+      // Phase 4: Add page type to step if available
+      if (this.currentPageAnalysis?.pageType) {
+        step.payload.pageType = this.currentPageAnalysis.pageType;
+      }
+
       chrome.runtime.sendMessage({
         type: 'RECORDED_STEP',
         payload: { step },
@@ -1551,6 +1915,43 @@ export class RecordingManager {
     } catch (error) {
       console.error('Error sending step:', error);
     }
+  }
+
+  /**
+   * Analyze current page for human-like understanding (async, non-blocking)
+   */
+  private async analyzeCurrentPage(): Promise<void> {
+    if (this.pageAnalysisPending) {
+      return; // Avoid duplicate analysis
+    }
+
+    if (!aiConfig.isVisualAnalysisEnabled()) {
+      return;
+    }
+
+    this.pageAnalysisPending = true;
+
+    try {
+      console.log('🎨 GhostWriter: Analyzing page type...');
+      const analysis = await VisualAnalysisService.analyzePageType();
+      
+      if (analysis) {
+        this.currentPageAnalysis = analysis;
+        console.log('🎨 GhostWriter: Page type:', analysis.pageType?.type, 
+                   'confidence:', analysis.pageType?.confidence?.toFixed(2));
+      }
+    } catch (error) {
+      console.warn('🎨 GhostWriter: Page analysis failed:', error);
+    } finally {
+      this.pageAnalysisPending = false;
+    }
+  }
+
+  /**
+   * Get current page type (for steps that need it)
+   */
+  getCurrentPageType(): PageType | undefined {
+    return this.currentPageAnalysis?.pageType;
   }
 
   /**

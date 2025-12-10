@@ -3,8 +3,16 @@
  */
 
 import type { ShadowPath } from '../content/shadow-dom-utils';
+import type { 
+  PageType, 
+  VisualImportance, 
+  VisualFlow, 
+  VisualContext as VisualCtx,
+  WorkflowIntent as VisualWorkflowIntent 
+} from './visual';
+import type { WorkflowVariables } from '../lib/variable-detector';
 
-export type WorkflowStepType = 'CLICK' | 'INPUT' | 'NAVIGATION' | 'KEYBOARD';
+export type WorkflowStepType = 'CLICK' | 'INPUT' | 'NAVIGATION' | 'KEYBOARD' | 'SCROLL';
 
 export interface ElementState {
   visible: boolean;
@@ -138,6 +146,11 @@ export interface WorkflowStepPayload {
     viewportSize: { width: number; height: number }; // Viewport dimensions
     elementBounds?: ElementBounds; // Element position in viewport
   };
+  // Phase 4: Human-like visual understanding
+  pageType?: PageType; // Page classification (form, dashboard, table, etc.)
+  visualImportance?: VisualImportance; // Visual prominence scores
+  visualFlow?: VisualFlow; // Before/after state tracking
+  visualContext?: VisualCtx; // Nearby elements and landmarks
   // Phase 3: Minor enhancements
   elementRole?: string; // Element's own role attribute
   retryStrategy?: RetryStrategy; // Retry configuration
@@ -256,5 +269,10 @@ export interface SavedWorkflow {
   createdAt: number; // Timestamp
   updatedAt: number; // Timestamp
   steps: WorkflowStep[]; // Array of recorded steps
+  // Phase 4: Human-like visual understanding
+  analyzedIntent?: VisualWorkflowIntent; // AI-inferred workflow intent
+  pageTypeHistory?: PageType[]; // Page types encountered during recording
+  // Phase 5: Variable detection and parameterization
+  variables?: WorkflowVariables; // Detected variables for parameterized execution
 }
 

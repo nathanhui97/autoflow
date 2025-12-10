@@ -23,6 +23,12 @@ interface StepDescriptionPayload {
         elementSnippet?: string; // Base64 data URL
         viewport?: string; // Base64 data URL
       };
+      viewport?: {
+        width?: number;
+        height?: number;
+        scrollX?: number;
+        scrollY?: number;
+      };
       context?: {
         container?: { text?: string; type?: string };
         parent?: { text?: string };
@@ -30,8 +36,8 @@ interface StepDescriptionPayload {
         decisionSpace?: {
           type: string;
           options: string[];
-          selectedIndex: number;
-          selectedText: string;
+          selectedIndex?: number;
+          selectedText?: string;
         };
       };
     };
@@ -90,6 +96,8 @@ serve(async (req) => {
     console.log('Has decisionSpace:', !!payload.step.payload.context?.decisionSpace);
     console.log('Element text:', payload.step.payload.elementText);
     console.log('Label:', payload.step.payload.label);
+    console.log('Container context:', payload.step.payload.context?.container?.text || 'NONE');
+    console.log('Container type:', payload.step.payload.context?.container?.type || 'NONE');
     
     // Build prompt from step
     const prompt = buildPrompt(payload);
@@ -180,8 +188,12 @@ function generateCacheKey(payload: StepDescriptionPayload): string {
     elementText: payload.step.payload.elementText,
     // Include decisionSpace to differentiate dropdown selections
     selectedText: payload.step.payload.context?.decisionSpace?.selectedText,
-    // Include snapshot hash (first 100 chars) to differentiate visually different elements
-    snapshotHash: payload.step.payload.visualSnapshot?.elementSnippet?.substring(0, 100),
+    selectedIndex: payload.step.payload.context?.decisionSpace?.selectedIndex,
+    // Include container context to differentiate same element in different widgets
+    containerText: payload.step.payload.context?.container?.text,
+    // Include snapshot hash (first 200 chars) to differentiate visually different elements
+    // Increased from 100 to 200 for better differentiation of dropdown items
+    snapshotHash: payload.step.payload.visualSnapshot?.elementSnippet?.substring(0, 200),
   };
   
   const str = JSON.stringify(keyData);
@@ -247,18 +259,67 @@ async function saveToCache(supabase: any, cacheKey: string, result: StepDescript
  */
 function buildPrompt(payload: StepDescriptionPayload): string {
   const step = payload.step;
-  let prompt = `Generate a clear, concise natural language description for this workflow step.\n\n`;
+  const hasVisualSnapshot = !!step.payload.visualSnapshot?.elementSnippet;
+  
+  // PRIORITY 1: Visual snapshot is PRIMARY source of truth
+  let prompt = hasVisualSnapshot ? 
+    `🎯 PRIMARY INSTRUCTION: A visual snapshot of the element is provided as an image above. THIS IS YOUR PRIMARY SOURCE OF INFORMATION.\n\n` +
+    `CRITICAL: Use the visual snapshot to:\n` +
+    `1. Identify the EXACT UI element type (button, icon, input field, dropdown, menu item, etc.)\n` +
+    `2. Read any visible text, labels, or icons directly from the image\n` +
+    `3. Understand the visual context (is it in a menu? toolbar? form? table?)\n` +
+    `4. Determine the specific action being performed\n` +
+    `5. Note visual style (color, size, position) to distinguish from similar elements\n\n` +
+    `⚠️ DO NOT rely solely on text context if the visual snapshot shows something different.\n` +
+    `⚠️ DO NOT use generic descriptions like "click on widget" or "click on element".\n` +
+    `✅ DO use the visual snapshot to create SPECIFIC, ACTIONABLE descriptions.\n` +
+    `✅ DO describe what you actually SEE in the image, not what the text context suggests.\n\n` :
+    `⚠️ WARNING: No visual snapshot available. Descriptions may be less accurate.\n` +
+    `Use the text context information below, but be aware descriptions may be generic.\n\n`;
+  
+  // LOCATION CONTEXT: Always include widget/dashboard context (works WITH visual snapshot)
+  if (step.payload.context?.container?.text) {
+    prompt += `\n📍 LOCATION CONTEXT (ALWAYS USE THIS): The action is within "${step.payload.context.container.text}" (${step.payload.context.container.type || 'container'})\n`;
+    prompt += `This is the widget/dashboard context. ALWAYS include this in your description to provide location-aware context.\n`;
+    prompt += `Example: If clicking a button, say "Click [button name] in ${step.payload.context.container.text}" instead of just "Click [button name]"\n\n`;
+  }
   
   prompt += `Step Type: ${step.type}\n\n`;
   
+  // Text context is SECONDARY (supplementary information)
+  prompt += `Supplementary Text Context (use only if visual snapshot is unclear):\n`;
+  
   if (step.type === 'CLICK') {
-    prompt += `Context:\n`;
+    // PRIORITY 0: Check for dropdown/menu selection FIRST - this is THE MOST IMPORTANT context
+    // If decisionSpace exists, this is a dropdown item click, NOT the three-dot button
+    if (step.payload.context?.decisionSpace) {
+      const ds = step.payload.context.decisionSpace;
+      prompt += `\n🎯🎯🎯 CRITICAL: This is a DROPDOWN/MENU ITEM selection! 🎯🎯🎯\n\n`;
+      prompt += `The user clicked on a SPECIFIC ITEM within a dropdown menu that was opened by a previous click.\n`;
+      prompt += `\nMANDATORY: Your description MUST include the selected item name: "${ds.selectedText}"\n`;
+      prompt += `\nDropdown Context:\n`;
+      prompt += `  - Selected Item: "${ds.selectedText}" ← THIS IS WHAT WAS CLICKED\n`;
+      prompt += `  - Position: Option ${(ds.selectedIndex || 0) + 1} of ${ds.options.length}\n`;
+      prompt += `  - Available options: ${ds.options.slice(0, 10).join(', ')}${ds.options.length > 10 ? '...' : ''}\n`;
+      prompt += `\n✅ CORRECT format examples:\n`;
+      prompt += `   - "Click '${ds.selectedText}' from the options menu"\n`;
+      prompt += `   - "Select '${ds.selectedText}' from the menu"\n`;
+      prompt += `   - "Click '${ds.selectedText}'"\n`;
+      prompt += `\n❌ WRONG format (DO NOT USE):\n`;
+      prompt += `   - "Click the three-dot menu button" ← This was the PREVIOUS step, not this one\n`;
+      prompt += `   - "Click on element" or "Click on widget" ← Too generic\n`;
+      prompt += `   - "Open the options menu" ← This describes opening, not selecting an item\n`;
+      prompt += `\nThe visual snapshot should show the dropdown menu with "${ds.selectedText}" visible.\n`;
+      prompt += `Use the selectedText "${ds.selectedText}" in your description - this is the actual item clicked.\n`;
+      prompt += `\nIMPORTANT: The previous step was clicking the three-dot button to OPEN the menu.\n`;
+      prompt += `This step is clicking the ITEM "${ds.selectedText}" WITHIN the opened menu.\n\n`;
+    }
+    
+    // Supplementary context (less important than decisionSpace)
     if (step.payload.label) prompt += `- Label: "${step.payload.label}"\n`;
     if (step.payload.elementText) prompt += `- Element Text: "${step.payload.elementText}"\n`;
     if (step.payload.elementRole) prompt += `- Role: "${step.payload.elementRole}"\n`;
-    if (step.payload.context?.container?.text) {
-      prompt += `- Container: "${step.payload.context.container.text}" (${step.payload.context.container.type || 'container'})\n`;
-    }
+    // Note: Container context is already shown above in PRIMARY section
     if (step.payload.context?.buttonContext?.section) {
       prompt += `- Section: "${step.payload.context.buttonContext.section}"\n`;
     }
@@ -266,51 +327,91 @@ function buildPrompt(payload: StepDescriptionPayload): string {
       prompt += `- Button Label: "${step.payload.context.buttonContext.label}"\n`;
     }
     
-    // Check for dropdown/menu selection
+    prompt += `\nGenerate a SPECIFIC, DISTINCTIVE description (5-15 words, MAX 50 characters):\n`;
+    prompt += `\n❌ NEVER return just "CLICK" or "Click" - always include WHAT is being clicked and WHERE (if container context is available).\n`;
+    prompt += `✅ GOOD examples: "Click button in How To Guide", "Click three dots in STORE LIST - PORTFOLIO", "Click download icon"\n`;
+    prompt += `❌ BAD examples: "CLICK", "Click", "Click element", "Click on widget"\n`;
+    
+    // If decisionSpace exists, prioritize it heavily
     if (step.payload.context?.decisionSpace) {
       const ds = step.payload.context.decisionSpace;
-      prompt += `- Dropdown/Menu Selection:\n`;
-      prompt += `  - Selected: "${ds.selectedText}" (option ${ds.selectedIndex + 1} of ${ds.options.length})\n`;
-      prompt += `  - Available options: ${ds.options.slice(0, 5).join(', ')}${ds.options.length > 5 ? '...' : ''}\n`;
-    }
-    
-    // Mention visual snapshot if available
-    if (step.payload.visualSnapshot?.elementSnippet) {
-      prompt += `\nIMPORTANT: A visual snapshot of the clicked element is provided as an image above. Carefully examine it to:\n`;
-      prompt += `1. Identify the EXACT UI element type (three-dot menu button, download icon, dropdown item, etc.)\n`;
-      prompt += `2. Read any visible text or labels on the element\n`;
-      prompt += `3. Understand the visual context (is it in a menu? toolbar? dropdown?)\n`;
-      prompt += `4. Determine the specific action (download, export, settings, etc.)\n`;
-      prompt += `\nDO NOT use generic descriptions. Use the visual snapshot to be SPECIFIC.\n`;
+      const containerText = step.payload.context?.container?.text;
+      prompt += `\n🎯 PRIMARY RULE: Since decisionSpace.selectedText="${ds.selectedText}" exists, your description MUST be:\n`;
+      if (containerText) {
+        prompt += `"Click '${ds.selectedText}' from the options menu in ${containerText}" or "Select '${ds.selectedText}' in ${containerText}"\n`;
+      } else {
+        prompt += `"Click '${ds.selectedText}' from the options menu" or "Select '${ds.selectedText}'"\n`;
+      }
+      prompt += `DO NOT describe it as clicking the three-dot button - that was the previous step.\n`;
+      prompt += `The current step is clicking the ITEM "${ds.selectedText}" WITHIN the dropdown.\n`;
+      prompt += `\nREPEAT: Use "${ds.selectedText}" in your description. This is not optional.\n\n`;
     } else {
-      prompt += `\nNOTE: No visual snapshot available. Use the context information above to generate the description.\n`;
+      // Include container context in descriptions when available
+      const containerText = step.payload.context?.container?.text;
+      if (containerText) {
+        prompt += `- IMPORTANT: Include the widget/dashboard context "${containerText}" in your description when relevant.\n`;
+        prompt += `  Examples: "Click three dots in ${containerText}", "Click download button in ${containerText}"\n`;
+      }
+      prompt += `- For three-dot menus: "Click the three-dot menu button" or "Open the options menu"\n`;
+      prompt += `- For dropdown items: "Click '[item name]' from the [menu name]" (e.g., "Click 'Download' from the export menu")\n`;
+      prompt += `- For icons: "Click the [icon name] icon" (e.g., "Click the download icon", "Click the settings icon")\n`;
+      prompt += `- For buttons: "Click the [button name] button" (e.g., "Click the download button")\n`;
     }
     
-    prompt += `\nGenerate a SPECIFIC, DISTINCTIVE description (5-15 words) that clearly identifies this action:\n`;
-    prompt += `- For three-dot menus: "Click the three-dot menu button" or "Open the options menu"\n`;
-    prompt += `- For dropdown items: "Click '[item name]' from the [menu name]" (e.g., "Click 'Download' from the export menu")\n`;
-    prompt += `- For icons: "Click the [icon name] icon" (e.g., "Click the download icon", "Click the settings icon")\n`;
-    prompt += `- For buttons: "Click the [button name] button" (e.g., "Click the download button")\n`;
-    prompt += `- AVOID generic descriptions like "click on widget" or "click on element"\n`;
+    prompt += `- AVOID generic descriptions like "click on widget" or "click on element" or just "CLICK"\n`;
+    prompt += `- ALWAYS include the widget/dashboard name from LOCATION CONTEXT if available (e.g., "Click button in How To Guide")\n`;
+    prompt += `- AVOID long concatenated text from containers - use only what you see in the image\n`;
     prompt += `- Make it clear what specific action is being performed\n`;
+    prompt += `- Keep descriptions under 50 characters when possible, but prioritize clarity and context over brevity\n`;
+    
+    prompt += `\n📋 OUTPUT FORMAT: Return your response as JSON with this exact structure:\n`;
+    prompt += `{\n`;
+    prompt += `  "description": "Your description here (MUST include container context if available)",\n`;
+    prompt += `  "confidence": 0.9\n`;
+    prompt += `}\n`;
+    prompt += `\nCRITICAL: The description field MUST NOT be just "CLICK" or "Click". It MUST include WHAT is being clicked and WHERE (if container context is available).\n`;
   } else if (step.type === 'INPUT') {
-    prompt += `Context:\n`;
     if (step.payload.label) prompt += `- Field Label: "${step.payload.label}"\n`;
     if (step.payload.value) prompt += `- Value Entered: "${step.payload.value.substring(0, 100)}"\n`;
     if (step.payload.context?.formCoordinates?.label) {
       prompt += `- Form Field: "${step.payload.context.formCoordinates.label}"\n`;
     }
-    prompt += `\nGenerate a description like: "Enter [value] in [field name]" or "Type [value] into the [field] field"\n`;
+    
+    if (hasVisualSnapshot) {
+      prompt += `\n🎯 Use the visual snapshot to identify the field type and label. Generate: "Enter [value] in [field name]" or "Type [value] into the [field] field"\n`;
+    } else {
+      prompt += `\nGenerate a description like: "Enter [value] in [field name]" or "Type [value] into the [field] field"\n`;
+    }
   } else if (step.type === 'NAVIGATION') {
-    prompt += `Context:\n`;
     if (step.payload.url) prompt += `- URL: ${step.payload.url}\n`;
     prompt += `\nGenerate a description like: "Navigate to [page name]" or "Go to [page/URL]"\n`;
   } else if (step.type === 'KEYBOARD') {
-    prompt += `Context:\n`;
     if (step.payload.keyboardDetails?.key) {
       prompt += `- Key: ${step.payload.keyboardDetails.key}\n`;
     }
-    prompt += `\nGenerate a description like: "Press [key]" or "Press [key] to [action]"\n`;
+    
+    if (hasVisualSnapshot) {
+      prompt += `\n🎯 Use the visual snapshot to understand the context. Generate: "Press [key]" or "Press [key] to [action]"\n`;
+    } else {
+      prompt += `\nGenerate a description like: "Press [key]" or "Press [key] to [action]"\n`;
+    }
+  } else if (step.type === 'SCROLL') {
+    if (step.payload.viewport) {
+      const scrollX = step.payload.viewport.scrollX || 0;
+      const scrollY = step.payload.viewport.scrollY || 0;
+      if (scrollY > 0) {
+        prompt += `- Scrolled down to Y position: ${Math.round(scrollY)}px\n`;
+      } else if (scrollX > 0) {
+        prompt += `- Scrolled right to X position: ${Math.round(scrollX)}px\n`;
+      }
+    }
+    
+    if (hasVisualSnapshot) {
+      prompt += `\n🎯 Use the visual snapshot to see what content is visible after scrolling. Generate: "Scroll to [visible content]" or "Scroll down/up to [element]"\n`;
+      prompt += `Example: "Scroll down to the 'Submit' button" or "Scroll to the form section"\n`;
+    } else {
+      prompt += `\nGenerate a description like: "Scroll to [location]" or "Scroll down/up"\n`;
+    }
   }
   
   prompt += `\nReturn JSON with this exact structure:\n`;
@@ -338,17 +439,61 @@ function parseGeminiResponse(geminiData: any, payload: StepDescriptionPayload): 
 
     const parsed = JSON.parse(jsonMatch[0]);
     
+    let description = typeof parsed.description === 'string' ? parsed.description.trim() : 'Action performed';
+    
+    // VALIDATION: Reject generic "CLICK" responses and generate better fallback
+    const genericPatterns = /^(CLICK|Click|click|Click element|Click on element|Click on widget)$/i;
+    if (genericPatterns.test(description) && payload.step.type === 'CLICK') {
+      console.warn('⚠️ AI returned generic "CLICK" description, generating fallback with context');
+      
+      // Generate better description using available context
+      const containerText = payload.step.payload.context?.container?.text;
+      const elementText = payload.step.payload.elementText;
+      const label = payload.step.payload.label;
+      const selectedText = payload.step.payload.context?.decisionSpace?.selectedText;
+      
+      if (selectedText) {
+        description = containerText 
+          ? `Click '${selectedText}' in ${containerText}`
+          : `Click '${selectedText}'`;
+      } else if (elementText && elementText.length <= 30) {
+        description = containerText
+          ? `Click "${elementText}" in ${containerText}`
+          : `Click "${elementText}"`;
+      } else if (label && label.length <= 30) {
+        description = containerText
+          ? `Click "${label}" in ${containerText}`
+          : `Click "${label}"`;
+      } else if (containerText && containerText.length <= 40) {
+        description = `Click in "${containerText}"`;
+      } else {
+        description = 'Click element';
+      }
+      
+      console.log('✅ Generated fallback description:', description);
+    }
+    
     const result: StepDescriptionResult = {
-      description: typeof parsed.description === 'string' ? parsed.description.trim() : 'Action performed',
+      description,
       confidence: typeof parsed.confidence === 'number' ? Math.max(0, Math.min(1, parsed.confidence)) : 0.5,
     };
 
     return result;
   } catch (error) {
     console.error('Error parsing Gemini response:', error);
-    // Return fallback result
+    // Return fallback result with context
+    const containerText = payload.step.payload.context?.container?.text;
+    const elementText = payload.step.payload.elementText;
+    let fallbackDescription = 'Action performed';
+    
+    if (payload.step.type === 'CLICK' && containerText) {
+      fallbackDescription = elementText && elementText.length <= 30
+        ? `Click "${elementText}" in ${containerText}`
+        : `Click in "${containerText}"`;
+    }
+    
     return {
-      description: 'Action performed',
+      description: fallbackDescription,
       confidence: 0,
     };
   }

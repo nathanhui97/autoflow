@@ -14,7 +14,10 @@ export type MessageType =
   | 'STEP_ENHANCED'
   | 'ANALYZE_WORKFLOW'
   | 'EXECUTE_WORKFLOW_ADAPTIVE'
-  | 'CAPTURE_VIEWPORT';
+  | 'CAPTURE_VIEWPORT'
+  | 'CORRECTION_SAVED'
+  | 'ELEMENT_FIND_FAILED'
+  | 'CANCEL_CORRECTION';
 
 /**
  * Base message interface for all extension messages
@@ -155,6 +158,37 @@ export interface ExecuteWorkflowAdaptiveMessage extends ExtensionMessage {
   payload: {
     steps: import('./workflow').WorkflowStep[];
     intent?: import('./workflow').WorkflowIntent;
+    // Variable substitution support
+    variableValues?: Record<string, string>;
+    workflowVariables?: import('../lib/variable-detector').WorkflowVariables;
   };
+}
+
+/**
+ * CORRECTION_SAVED message - sent when a user correction is saved
+ */
+export interface CorrectionSavedMessage extends ExtensionMessage {
+  type: 'CORRECTION_SAVED';
+  payload?: {
+    correctionId?: string;
+  };
+}
+
+/**
+ * ELEMENT_FIND_FAILED message - sent when element finding fails
+ */
+export interface ElementFindFailedMessage extends ExtensionMessage {
+  type: 'ELEMENT_FIND_FAILED';
+  payload: {
+    stepId: string;
+  };
+}
+
+/**
+ * CANCEL_CORRECTION message - sent to cancel correction mode
+ */
+export interface CancelCorrectionMessage extends ExtensionMessage {
+  type: 'CANCEL_CORRECTION';
+  payload?: {};
 }
 

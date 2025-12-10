@@ -161,9 +161,17 @@ function handleFullMessage(
           try {
             const steps = message.payload.steps as WorkflowStep[];
             const intent = message.payload.intent as WorkflowIntent | undefined;
+            // Extract variable values for parameterized execution
+            const variableValues = message.payload.variableValues as Record<string, string> | undefined;
+            const workflowVariables = message.payload.workflowVariables;
+            
+            // Log variable substitution info
+            if (variableValues && Object.keys(variableValues).length > 0) {
+              console.log('GhostWriter: Executing workflow with variable values:', variableValues);
+            }
             
             const executor = new ExecutionEngine();
-            await executor.executeWorkflow(steps, intent);
+            await executor.executeWorkflow(steps, intent, variableValues, workflowVariables);
             
             chrome.runtime.sendMessage({
               type: 'EXECUTE_WORKFLOW_RESPONSE',

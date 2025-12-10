@@ -246,31 +246,50 @@ export class ContextScanner {
     // Find the parent container (dropdown menu, list, etc.)
     const container = this.findListContainer(element);
     if (!container) {
+      console.log('🔍 ContextScanner: No container found for dropdown item');
       return null;
     }
 
     // Get all siblings (all options in the container)
     const options = this.getAllSiblingOptions(container);
     if (options.length === 0) {
+      console.log('🔍 ContextScanner: No options found in container');
       return null;
     }
 
     // Find the selected index
     const selectedIndex = this.findSelectedIndex(container, element);
 
-    // Get the selected text
+    // Get the selected text - CRITICAL: This is what the AI needs to describe
     const selectedText = this.extractOptionText(element) || '';
+    
+    if (!selectedText) {
+      console.warn('🔍 ContextScanner: Could not extract selectedText from dropdown item');
+      console.warn('🔍 ContextScanner: Element:', element.tagName, 'Classes:', element.className?.toString()?.substring(0, 50));
+      console.warn('🔍 ContextScanner: textContent:', element.textContent?.trim()?.substring(0, 50));
+      console.warn('🔍 ContextScanner: innerText:', (element as HTMLElement).innerText?.trim()?.substring(0, 50));
+    } else {
+      console.log('🔍 ContextScanner: Extracted selectedText:', selectedText);
+    }
 
     // Generate container selector
     const containerSelector = this.generateContainerSelector(container);
 
-    return {
-      type: 'LIST_SELECTION',
+    const decisionSpace = {
+      type: 'LIST_SELECTION' as const,
       options,
       selectedIndex,
       selectedText,
       containerSelector,
     };
+    
+    console.log('🔍 ContextScanner: Created decisionSpace:', {
+      selectedText: decisionSpace.selectedText,
+      selectedIndex: decisionSpace.selectedIndex,
+      optionsCount: decisionSpace.options.length,
+    });
+
+    return decisionSpace;
   }
 
   /**
@@ -392,28 +411,56 @@ export class ContextScanner {
    * Extract text from an option element
    */
   private static extractOptionText(element: Element): string | null {
-    // Try aria-label first
+    // PRIORITY 1: Try aria-label first (most reliable for dropdown items)
     const ariaLabel = element.getAttribute('aria-label');
-    if (ariaLabel) {
-      return ariaLabel.trim();
+    if (ariaLabel && ariaLabel.trim().length > 0) {
+      const trimmed = ariaLabel.trim();
+      // Filter out very long aria-labels that might be concatenated text
+      if (trimmed.length < 100) {
+        return trimmed;
+      }
     }
 
-    // Try text content
+    // PRIORITY 2: Try innerText (only visible text, excludes hidden children)
+    // This is better than textContent for dropdown items
+    if (element instanceof HTMLElement) {
+      const innerText = element.innerText?.trim();
+      if (innerText && innerText.length > 0 && innerText.length < 100) {
+        return innerText;
+      }
+    }
+
+    // PRIORITY 3: Try direct text nodes (not from children)
+    const directText: string[] = [];
+    for (const node of Array.from(element.childNodes)) {
+      if (node.nodeType === Node.TEXT_NODE && node.textContent) {
+        const trimmed = node.textContent.trim();
+        if (trimmed.length > 0 && trimmed.length < 100) {
+          directText.push(trimmed);
+        }
+      }
+    }
+    if (directText.length > 0) {
+      return directText.join(' ').trim();
+    }
+
+    // PRIORITY 4: Try text content (includes hidden text, but might be too long)
     const textContent = element.textContent?.trim();
-    if (textContent) {
-      return textContent;
+    if (textContent && textContent.length > 0) {
+      // Limit to 100 chars to avoid concatenated text
+      return textContent.length > 100 ? textContent.substring(0, 100) : textContent;
     }
 
-    // Try innerText
-    const innerText = (element as HTMLElement).innerText?.trim();
-    if (innerText) {
-      return innerText;
-    }
-
-    // Try value attribute (for option elements)
+    // PRIORITY 5: Try value attribute (for option elements)
     const value = element.getAttribute('value');
-    if (value) {
+    if (value && value.trim().length > 0) {
       return value.trim();
+    }
+
+    // PRIORITY 6: Try data attributes that might contain the text
+    const dataLabel = element.getAttribute('data-label') || element.getAttribute('data-text');
+    if (dataLabel && dataLabel.trim().length > 0 && dataLabel.trim().length < 100) {
+      return dataLabel.trim();
     }
 
     return null;

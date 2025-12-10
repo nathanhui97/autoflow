@@ -1,16 +1,19 @@
 /**
  * AI Service - Client-side service that calls Supabase Edge Function for AI recovery
  * No direct Gemini API calls from client (all handled server-side)
+ * Phase 4: Enhanced with page type, visual similarity, and correction memory
  */
 
 import type { WorkflowStep } from '../types/workflow';
 import type { AIAnalysisPayload } from '../types/ai';
 import type { FailureSnapshot } from './dom-distiller';
+import type { PageType } from '../types/visual';
 import { AIDataBuilder } from '../content/ai-data-builder';
 import { DOMDistiller } from './dom-distiller';
 import { PIIScrubber } from './pii-scrubber';
 import { AICache } from './ai-cache';
 import { aiConfig } from './ai-config';
+import { CorrectionMemory } from './correction-memory';
 
 export interface ElementFindingResult {
   candidateIndex?: number;
@@ -34,6 +37,7 @@ export interface StepDescriptionResult {
 export class AIService {
   /**
    * Recover target element using AI (calls Supabase Edge Function)
+   * Phase 4: Enhanced with page type context and correction learning
    */
   static async recoverTarget(
     step: WorkflowStep,
@@ -56,12 +60,30 @@ export class AIService {
       
       // Step 4: Add failure snapshot context to payload (for Edge Function)
       // The Edge Function will use this to build the prompt
-      const enhancedPayload: AIAnalysisPayload & { failureSnapshot?: FailureSnapshot } = {
+      const enhancedPayload: AIAnalysisPayload & { 
+        failureSnapshot?: FailureSnapshot;
+        pageTypeContext?: PageType;
+        hasCorrectionHistory?: boolean;
+      } = {
         ...aiPayload,
-        failureSnapshot: scrubbedSnapshot, // Add failure snapshot with candidates
+        failureSnapshot: scrubbedSnapshot,
       };
       
-      // Generate cache key
+      // Phase 4: Add page type context for better AI understanding
+      if (step.payload.pageType) {
+        enhancedPayload.pageTypeContext = step.payload.pageType;
+      }
+      
+      // Phase 4: Check if we have correction history for this type of step
+      if (aiConfig.isCorrectionLearningEnabled()) {
+        const corrections = await CorrectionMemory.findSimilarCorrections(step, 1);
+        if (corrections.length > 0) {
+          enhancedPayload.hasCorrectionHistory = true;
+          console.log('GhostWriter: AI recovery has correction history context');
+        }
+      }
+      
+      // Generate cache key (including page type for better cache hits)
       const cacheKey = AICache.generateKey({
         selector: step.payload.selector,
         elementText: step.payload.elementText,
@@ -69,6 +91,7 @@ export class AIService {
         url: step.payload.url,
         visualSnapshot: step.payload.visualSnapshot ? 'has_snapshot' : 'no_snapshot',
         candidates: scrubbedSnapshot.candidates.length,
+        pageType: step.payload.pageType?.type,
       });
 
       // Check local cache first
@@ -362,6 +385,8 @@ export class AIService {
 
     try {
       // Generate cache key (include visual snapshot hash to differentiate similar steps)
+      // CRITICAL: Include decisionSpace selectedText and selectedIndex to differentiate dropdown items
+      // Also include elementText to differentiate similar elements
       const cacheKey = AICache.generateKey({
         type: 'step_description',
         stepType: step.type,
@@ -371,7 +396,9 @@ export class AIService {
         elementText: step.payload.elementText,
         url: step.payload.url,
         selectedText: step.payload.context?.decisionSpace?.selectedText,
-        snapshotHash: step.payload.visualSnapshot?.elementSnippet?.substring(0, 100),
+        selectedIndex: step.payload.context?.decisionSpace?.selectedIndex,
+        containerText: step.payload.context?.container?.text, // Include container context in cache key
+        snapshotHash: step.payload.visualSnapshot?.elementSnippet?.substring(0, 200), // Increased from 100 to 200 for better differentiation
       });
 
       // Check local cache first
@@ -419,6 +446,7 @@ export class AIService {
     console.log(`🤖 GhostWriter: Has decisionSpace:`, !!step.payload.context?.decisionSpace);
     console.log(`🤖 GhostWriter: Element text:`, step.payload.elementText);
     console.log(`🤖 GhostWriter: Label:`, step.payload.label);
+    console.log(`🤖 GhostWriter: Container context:`, step.payload.context?.container?.text || 'NONE');
     
     // Create abort controller for timeout
     const controller = new AbortController();
@@ -478,27 +506,93 @@ export class AIService {
 
   /**
    * Generate fallback description when AI fails
+   * Returns concise, relevant descriptions (max 50 chars)
    */
   private static generateFallbackDescription(step: WorkflowStep): string {
     switch (step.type) {
       case 'CLICK':
-        if (step.payload.label) {
-          return `Click on "${step.payload.label}"`;
+        // Priority 1: Use button context if available (most specific)
+        if (step.payload.context?.buttonContext?.label) {
+          const label = step.payload.context.buttonContext.label;
+          return label.length > 40 ? label.substring(0, 40) + '...' : `Click "${label}"`;
         }
+        
+        // Priority 2: Use decision space (dropdown selection)
+        if (step.payload.context?.decisionSpace?.selectedText) {
+          const selected = step.payload.context.decisionSpace.selectedText;
+          return selected.length > 40 ? selected.substring(0, 40) + '...' : `Select "${selected}"`;
+        }
+        
+        // Priority 3: Use label
+        if (step.payload.label) {
+          const label = step.payload.label;
+          return label.length > 40 ? label.substring(0, 40) + '...' : `Click "${label}"`;
+        }
+        
+        // Priority 4: Use element text (but limit to 40 chars)
         if (step.payload.elementText) {
-          return `Click on "${step.payload.elementText}"`;
+          const text = step.payload.elementText;
+          return text.length > 40 ? text.substring(0, 40) + '...' : `Click "${text}"`;
         }
-        return 'Click on element';
+        
+        // Priority 5: Use container context (combine with element text if available)
+        if (step.payload.context?.container?.text) {
+          const containerText = step.payload.context.container.text;
+          const elementText = step.payload.elementText;
+          
+          if (elementText && elementText.length <= 30) {
+            // Combine: "Click [element] in [container]"
+            const combined = `Click "${elementText}" in ${containerText}`;
+            return combined.length > 50 ? combined.substring(0, 47) + '...' : combined;
+          } else if (containerText.length <= 40) {
+            return `Click in "${containerText}"`;
+          }
+        }
+        
+        // Last resort: at least mention it's a click action
+        return step.payload.elementText 
+          ? `Click "${step.payload.elementText.substring(0, 30)}"`
+          : 'Click element';
       case 'INPUT':
+        const value = step.payload.value || '';
+        const valuePreview = value.length > 20 ? value.substring(0, 20) + '...' : value;
+        
         if (step.payload.label) {
-          return `Enter "${step.payload.value || ''}" in "${step.payload.label}"`;
+          const label = step.payload.label.length > 20 
+            ? step.payload.label.substring(0, 20) + '...' 
+            : step.payload.label;
+          return `Enter "${valuePreview}" in "${label}"`;
         }
-        return `Enter "${step.payload.value || ''}"`;
+        
+        if (step.payload.context?.formCoordinates?.label) {
+          const fieldLabel = step.payload.context.formCoordinates.label;
+          const label = fieldLabel.length > 20 
+            ? fieldLabel.substring(0, 20) + '...' 
+            : fieldLabel;
+          return `Enter "${valuePreview}" in "${label}"`;
+        }
+        
+        return value ? `Enter "${valuePreview}"` : 'Enter value';
       case 'NAVIGATION':
-        return `Navigate to ${step.payload.url}`;
+        try {
+          const url = new URL(step.payload.url || '');
+          const path = url.pathname.split('/').filter(p => p).pop() || url.hostname;
+          return path.length > 40 ? path.substring(0, 40) + '...' : `Navigate to ${path}`;
+        } catch {
+          return 'Navigate';
+        }
       case 'KEYBOARD':
         const key = step.payload.keyboardDetails?.key || 'key';
         return `Press ${key}`;
+      case 'SCROLL':
+        const scrollX = step.payload.viewport?.scrollX || 0;
+        const scrollY = step.payload.viewport?.scrollY || 0;
+        if (scrollY > 0) {
+          return `Scroll down to position ${Math.round(scrollY)}`;
+        } else if (scrollX > 0) {
+          return `Scroll right to position ${Math.round(scrollX)}`;
+        }
+        return 'Scroll';
       default:
         return `${step.type} action`;
     }

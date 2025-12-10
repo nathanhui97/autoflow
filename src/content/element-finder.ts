@@ -1,13 +1,17 @@
 /**
- * ElementFinder - Robust element finding with 8+ fallback strategies
+ * ElementFinder - Robust element finding with 12+ fallback strategies
  * Performance-optimized for large React apps with tag scoping and container scoping
+ * Enhanced with visual analysis strategies for human-like element finding
  */
 
 import { TextMatcher } from './text-matcher';
 import { ElementStateCapture } from './element-state';
 import { AIService } from '../lib/ai-service';
+import { VisualAnalysisService } from '../lib/visual-analysis';
+import { CorrectionMemory } from '../lib/correction-memory';
 import { aiConfig } from '../lib/ai-config';
 import type { WorkflowStep } from '../types/workflow';
+import type { VisualCandidate, PageAnalysis } from '../types/visual';
 
 export class ElementFinder {
   /**
@@ -70,6 +74,19 @@ export class ElementFinder {
       if (element) return element;
     }
 
+    // Strategy 8.5: Correction Memory (learned from user corrections)
+    if (aiConfig.isCorrectionLearningEnabled()) {
+      try {
+        const element = await this.findFromCorrectionMemory(step, doc);
+        if (element && this.isElementValid(element, step)) {
+          console.log('GhostWriter: Found element via correction memory');
+          return element;
+        }
+      } catch (error) {
+        console.warn('GhostWriter: Correction memory lookup failed:', error);
+      }
+    }
+
     // Strategy 9: AI Element Finder (single multimodal request via Supabase)
     if (this.shouldUseAI(step)) {
       try {
@@ -86,7 +103,399 @@ export class ElementFinder {
       }
     }
 
+    // Strategy 10: Visual Similarity Matching (human-like visual comparison)
+    if (this.shouldUseVisualAnalysis(step)) {
+      try {
+        const element = await this.findByVisualSimilarity(step, doc);
+        if (element && this.isElementValid(element, step)) {
+          console.log('GhostWriter: Found element via visual similarity');
+          return element;
+        }
+      } catch (error) {
+        console.warn('GhostWriter: Visual similarity matching failed:', error);
+      }
+    }
+
+    // Strategy 11: Visual Importance Scoring (find prominent matching elements)
+    if (this.shouldUseVisualAnalysis(step)) {
+      try {
+        const element = await this.findByVisualImportance(step, doc);
+        if (element && this.isElementValid(element, step)) {
+          console.log('GhostWriter: Found element via visual importance');
+          return element;
+        }
+      } catch (error) {
+        console.warn('GhostWriter: Visual importance finding failed:', error);
+      }
+    }
+
+    // Strategy 12: Visual Context Finding (use nearby elements and landmarks)
+    if (this.shouldUseVisualAnalysis(step)) {
+      try {
+        const element = await this.findByVisualContext(step, doc);
+        if (element && this.isElementValid(element, step)) {
+          console.log('GhostWriter: Found element via visual context');
+          return element;
+        }
+      } catch (error) {
+        console.warn('GhostWriter: Visual context finding failed:', error);
+      }
+    }
+
     return null;
+  }
+
+  // ============================================
+  // Visual Analysis Strategies (10, 11, 12)
+  // ============================================
+
+  /**
+   * Check if visual analysis should be used
+   */
+  private static shouldUseVisualAnalysis(step: WorkflowStep): boolean {
+    try {
+      if (!aiConfig.isVisualAnalysisEnabled()) {
+        return false;
+      }
+    } catch (e) {
+      return false;
+    }
+
+    // Only for CLICK and INPUT steps
+    if (step.type !== 'CLICK' && step.type !== 'INPUT') {
+      return false;
+    }
+
+    // Must have visual snapshot from recording
+    if (!step.payload.visualSnapshot?.elementSnippet) {
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Strategy 10: Find element by visual similarity
+   * Compares recorded visual snapshot with current candidates
+   */
+  private static async findByVisualSimilarity(
+    step: WorkflowStep,
+    doc: Document
+  ): Promise<Element | null> {
+    const targetScreenshot = step.payload.visualSnapshot?.elementSnippet;
+    if (!targetScreenshot) return null;
+
+    // Get page analysis for context
+    let pageAnalysis: PageAnalysis | null = null;
+    try {
+      pageAnalysis = await VisualAnalysisService.analyzePageType();
+    } catch (e) {
+      // Continue without page analysis
+    }
+
+    // Find candidate elements
+    const candidates = await this.buildVisualCandidates(step, doc);
+    if (candidates.length === 0) return null;
+
+    // Call visual similarity matching
+    const result = await VisualAnalysisService.findVisualSimilarity(
+      targetScreenshot,
+      candidates,
+      pageAnalysis?.pageType
+    );
+
+    if (result && result.confidence > 0.6 && result.bestMatchSelector) {
+      try {
+        const element = doc.querySelector(result.bestMatchSelector);
+        if (element) {
+          console.log(`GhostWriter: Visual similarity match found (confidence: ${result.confidence.toFixed(2)})`);
+          return element;
+        }
+      } catch (e) {
+        // Invalid selector
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Strategy 11: Find element by visual importance
+   * Look for the most prominent element matching the criteria
+   */
+  private static async findByVisualImportance(
+    step: WorkflowStep,
+    doc: Document
+  ): Promise<Element | null> {
+    const scope = this.getSearchScope(step, doc);
+    const tagSelectors = this.getTagSelectorsForStep(step);
+    const candidates = Array.from(scope.querySelectorAll(tagSelectors.join(', ')));
+
+    // Filter visible candidates
+    const visibleCandidates = candidates.filter(el => 
+      ElementStateCapture.isElementVisible(el)
+    );
+
+    if (visibleCandidates.length === 0) return null;
+
+    // Score candidates by visual importance
+    let bestMatch: Element | null = null;
+    let bestScore = 0;
+
+    for (const candidate of visibleCandidates) {
+      // Quick local importance scoring (no API call)
+      const importance = await VisualAnalysisService.scoreVisualImportance(candidate);
+      
+      // Weight by text match if we have target text
+      let score = importance.overallImportance;
+      
+      if (step.payload.elementText) {
+        const candidateText = candidate.textContent?.trim() || 
+                             candidate.getAttribute('aria-label') || '';
+        const textSimilarity = TextMatcher.similarityScore(
+          step.payload.elementText,
+          candidateText
+        );
+        // Combine visual importance with text similarity
+        score = (importance.overallImportance * 0.4) + (textSimilarity * 0.6);
+      }
+
+      if (score > bestScore && score > 0.5) {
+        bestScore = score;
+        bestMatch = candidate;
+      }
+    }
+
+    if (bestMatch) {
+      console.log(`GhostWriter: Visual importance match found (score: ${bestScore.toFixed(2)})`);
+    }
+
+    return bestMatch;
+  }
+
+  /**
+   * Strategy 12: Find element by visual context
+   * Use nearby elements and landmarks to locate target
+   */
+  private static async findByVisualContext(
+    step: WorkflowStep,
+    doc: Document
+  ): Promise<Element | null> {
+    // Get recorded visual context
+    const recordedContext = step.payload.context;
+    if (!recordedContext) return null;
+
+    const scope = this.getSearchScope(step, doc);
+    const tagSelectors = this.getTagSelectorsForStep(step);
+    const candidates = Array.from(scope.querySelectorAll(tagSelectors.join(', ')));
+
+    // Filter visible candidates
+    const visibleCandidates = candidates.filter(el => 
+      ElementStateCapture.isElementVisible(el)
+    );
+
+    if (visibleCandidates.length === 0) return null;
+
+    let bestMatch: Element | null = null;
+    let bestScore = 0;
+
+    for (const candidate of visibleCandidates) {
+      // Extract current context for this candidate
+      const currentContext = await VisualAnalysisService.extractVisualContext(candidate);
+      
+      // Compare contexts
+      let score = 0;
+
+      // Compare visual pattern
+      if (recordedContext.gridCoordinates && currentContext.visualPattern === 'data_table') {
+        score += 0.3;
+      }
+      if (recordedContext.formCoordinates && currentContext.visualPattern === 'form_layout') {
+        score += 0.3;
+      }
+
+      // Compare region type
+      if (recordedContext.container?.type && 
+          currentContext.regionType === recordedContext.container.type) {
+        score += 0.2;
+      }
+
+      // Compare nearby elements
+      if (currentContext.nearbyElements.length > 0) {
+        // Check if any nearby elements have matching descriptions
+        const hasMatchingNearby = currentContext.nearbyElements.some(nearby => {
+          if (recordedContext.surroundingText) {
+            return nearby.visualDescription.toLowerCase().includes(
+              recordedContext.surroundingText.toLowerCase().substring(0, 20)
+            );
+          }
+          return false;
+        });
+        if (hasMatchingNearby) score += 0.2;
+      }
+
+      // Weight by text match
+      if (step.payload.elementText) {
+        const candidateText = candidate.textContent?.trim() || '';
+        const textMatch = TextMatcher.similarityScore(
+          step.payload.elementText,
+          candidateText
+        );
+        score += textMatch * 0.3;
+      }
+
+      if (score > bestScore && score > 0.4) {
+        bestScore = score;
+        bestMatch = candidate;
+      }
+    }
+
+    if (bestMatch) {
+      console.log(`GhostWriter: Visual context match found (score: ${bestScore.toFixed(2)})`);
+    }
+
+    return bestMatch;
+  }
+
+  /**
+   * Build visual candidates for similarity matching
+   */
+  private static async buildVisualCandidates(
+    step: WorkflowStep,
+    doc: Document
+  ): Promise<VisualCandidate[]> {
+    const scope = this.getSearchScope(step, doc);
+    const tagSelectors = this.getTagSelectorsForStep(step);
+    const elements = Array.from(scope.querySelectorAll(tagSelectors.join(', ')));
+
+    // Filter visible elements
+    const visibleElements = elements.filter(el => 
+      ElementStateCapture.isElementVisible(el)
+    );
+
+    // Limit candidates to prevent token explosion
+    const maxCandidates = 5;
+    const limitedElements = visibleElements.slice(0, maxCandidates);
+
+    // Build visual candidates
+    const candidates: VisualCandidate[] = [];
+
+    for (const element of limitedElements) {
+      try {
+        const selector = this.generateSelector(element);
+        const candidate = await VisualAnalysisService.buildVisualCandidate(element, selector);
+        if (candidate) {
+          candidates.push(candidate);
+        }
+      } catch (e) {
+        // Skip failed candidates
+      }
+    }
+
+    return candidates;
+  }
+
+  // ============================================
+  // Correction Memory Strategy (8.5)
+  // ============================================
+
+  /**
+   * Strategy 8.5: Find element using correction memory
+   * Applies learned patterns from previous user corrections
+   */
+  private static async findFromCorrectionMemory(
+    step: WorkflowStep,
+    doc: Document
+  ): Promise<Element | null> {
+    // Find similar corrections
+    const corrections = await CorrectionMemory.findSimilarCorrections(step, 3);
+    
+    if (corrections.length === 0) {
+      return null;
+    }
+
+    console.log(`GhostWriter: Found ${corrections.length} similar correction(s)`);
+
+    for (const correction of corrections) {
+      // Try corrected selector directly
+      if (correction.correctedSelector) {
+        try {
+          const element = doc.querySelector(correction.correctedSelector);
+          if (element && this.isElementValid(element, step)) {
+            // Record success
+            await CorrectionMemory.recordSuccess(correction.id);
+            return element;
+          }
+        } catch (e) {
+          // Invalid selector
+        }
+      }
+
+      // Try applying learned pattern
+      if (correction.learnedPattern) {
+        const generatedSelector = CorrectionMemory.applyLearnedPattern(
+          step,
+          correction.learnedPattern
+        );
+        
+        if (generatedSelector) {
+          try {
+            const element = doc.querySelector(generatedSelector);
+            if (element && this.isElementValid(element, step)) {
+              await CorrectionMemory.recordSuccess(correction.id);
+              return element;
+            }
+          } catch (e) {
+            // Invalid selector
+          }
+        }
+      }
+
+      // Record failure for this correction attempt
+      await CorrectionMemory.recordFailure(correction.id);
+    }
+
+    return null;
+  }
+
+  /**
+   * Generate a selector for an element (for visual candidates)
+   */
+  private static generateSelector(element: Element): string {
+    // Try ID first
+    if (element.id) {
+      return `#${element.id}`;
+    }
+
+    // Try unique class combination
+    if (element.className) {
+      const classes = element.className.toString().split(' ')
+        .filter(c => c && !c.includes('ng-') && !c.includes('_'))
+        .slice(0, 3);
+      if (classes.length > 0) {
+        const selector = `${element.tagName.toLowerCase()}.${classes.join('.')}`;
+        try {
+          if (document.querySelectorAll(selector).length === 1) {
+            return selector;
+          }
+        } catch (e) {
+          // Invalid selector
+        }
+      }
+    }
+
+    // Fallback to nth-of-type
+    const parent = element.parentElement;
+    if (parent) {
+      const siblings = Array.from(parent.children).filter(
+        el => el.tagName === element.tagName
+      );
+      const index = siblings.indexOf(element) + 1;
+      const parentSelector = this.generateSelector(parent);
+      return `${parentSelector} > ${element.tagName.toLowerCase()}:nth-of-type(${index})`;
+    }
+
+    return element.tagName.toLowerCase();
   }
 
   /**
