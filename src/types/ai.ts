@@ -1,0 +1,156 @@
+/**
+ * AI Analysis Types - Optimized payload structures for LLM consumption
+ */
+
+/**
+ * Semantic context extracted from step (prioritized for AI understanding)
+ */
+export interface SemanticContext {
+  // Grid/Spreadsheet context (highest priority for spreadsheet workflows)
+  gridCoordinates?: {
+    cellReference?: string; // "A1", "B2"
+    columnHeader?: string; // "Price", "Product Name"
+    rowHeader?: string;
+    rowIndex?: number;
+    columnIndex?: number;
+    isHeader?: boolean;
+  };
+  
+  // Form context (highest priority for form workflows)
+  formCoordinates?: {
+    label?: string; // "Client Name"
+    fieldOrder?: number;
+    fieldset?: string;
+    section?: string;
+  };
+  
+  // Table context
+  tableCoordinates?: {
+    rowIndex?: number;
+    columnIndex?: number;
+    headerRow?: number;
+    headerColumn?: number;
+  };
+  
+  // Decision space (dropdowns, lists)
+  decisionSpace?: {
+    type: 'LIST_SELECTION';
+    options: string[]; // All available options
+    selectedIndex: number;
+    selectedText: string;
+    containerSelector?: string;
+  };
+  
+  // Button context (Interactive Section Anchoring - for generic div buttons in Salesforce/React)
+  buttonContext?: {
+    section?: string; // Section header (e.g., "Account Information")
+    label?: string; // Button text or aria-label
+    role?: string; // ARIA role if present
+  };
+}
+
+/**
+ * Element context (simplified for AI)
+ */
+export interface ElementContext {
+  text?: string; // Element text content
+  label?: string; // Associated label
+  value?: string; // Input value
+  role?: string; // ARIA role
+  container?: {
+    type?: string; // "dashboard", "widget", "table"
+    text?: string; // Container title
+  };
+  position?: {
+    index: number;
+    total: number;
+    type: string;
+  };
+  surroundingText?: string; // Nearby text for context
+}
+
+/**
+ * Page context (simplified - coordinates removed)
+ */
+export interface PageContext {
+  title: string;
+  url: string;
+  // scrollPosition removed - coordinates are meaningless to text models
+  // viewport removed - dimensions are meaningless without visual context
+}
+
+/**
+ * Flow context (previous action, pattern detection)
+ */
+export interface FlowContext {
+  previousAction?: string; // Previous action type
+  pattern?: {
+    type: 'repetitive' | 'sequential' | 'template' | 'unique';
+    confidence: number;
+  };
+}
+
+/**
+ * AI-optimized step analysis payload
+ * Prioritizes semantic understanding over technical details
+ * Token-optimized: Removed CSS selectors, coordinates, timing, HTML
+ * 
+ * EXPLICITLY EXCLUDED FIELDS (to prevent token explosion):
+ * ✂️ fallbackSelectors: CSS selectors are noise for LLMs
+ * ✂️ ancestors: Full DOM tree burns tokens (~500+ per step)
+ * ✂️ eventDetails: Coordinates (x, y) are meaningless to text models
+ * ✂️ elementBounds: Bounding box coordinates are meaningless without visual context
+ * ✂️ timing: Performance data (timestamp, delayAfter) not needed for intent
+ * ✂️ html/outerHTML: Raw HTML causes context window overflow
+ * ✂️ scrollPosition & viewport: Coordinates meaningless without visual context
+ */
+export interface AIAnalysisPayload {
+  // Action metadata (minimal)
+  action: {
+    type: 'CLICK' | 'INPUT' | 'SCROLL' | 'KEYBOARD' | 'NAVIGATION';
+    url: string;
+  };
+  
+  // Semantic context (HIGHEST PRIORITY - what AI cares about most)
+  semanticContext?: SemanticContext;
+  
+  // Element understanding (simplified - NO ancestors, NO html, NO coordinates)
+  elementContext?: ElementContext;
+  
+  // Page context (simplified - NO coordinates)
+  pageContext: PageContext;
+  
+  // Flow context (optional)
+  flowContext?: FlowContext;
+  
+  // Visual snapshot (Phase 2 - for AI vision)
+  // CRITICAL: This provides spatial context that coordinates cannot
+  visualSnapshot?: {
+    viewport?: string; // Base64 data URL of viewport
+    elementSnippet?: string; // Base64 data URL of element + context (cropped)
+  };
+  
+  // NOTE: CSS selectors, ancestors, eventDetails, elementBounds, timing, html are
+  // intentionally excluded. AI should rely on semantic anchors (gridCoordinates, label, visualSnapshot) instead.
+}
+
+/**
+ * AI-optimized workflow analysis payload
+ */
+export interface AIWorkflowPayload {
+  workflow: {
+    id: string;
+    name: string;
+    stepCount: number;
+  };
+  
+  steps: AIAnalysisPayload[];
+  
+  // Pattern detection (if available)
+  pattern?: {
+    type: 'repetitive' | 'sequential' | 'template' | 'unique';
+    sequenceType?: 'row' | 'column' | 'grid' | 'none';
+    confidence: number;
+  };
+}
+

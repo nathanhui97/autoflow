@@ -7,7 +7,14 @@ export type MessageType =
   | 'START_RECORDING' 
   | 'STOP_RECORDING' 
   | 'EXECUTE_STEP'
-  | 'RECORDED_STEP';
+  | 'RECORDED_STEP'
+  | 'UPDATE_STEP'
+  | 'AI_VALIDATION_STARTED'
+  | 'AI_VALIDATION_COMPLETED'
+  | 'STEP_ENHANCED'
+  | 'ANALYZE_WORKFLOW'
+  | 'EXECUTE_WORKFLOW_ADAPTIVE'
+  | 'CAPTURE_VIEWPORT';
 
 /**
  * Base message interface for all extension messages
@@ -85,6 +92,69 @@ export interface RecordedStepMessage extends ExtensionMessage {
   type: 'RECORDED_STEP';
   payload: {
     step: import('./workflow').WorkflowStep;
+  };
+}
+
+/**
+ * UPDATE_STEP message - sent from content script to side panel to update an existing step
+ */
+export interface UpdateStepMessage extends ExtensionMessage {
+  type: 'UPDATE_STEP';
+  payload: {
+    stepId: string;
+    step: import('./workflow').WorkflowStep;
+  };
+}
+
+/**
+ * AI_VALIDATION_STARTED message - sent when AI validation begins for a step
+ */
+export interface AIValidationStartedMessage extends ExtensionMessage {
+  type: 'AI_VALIDATION_STARTED';
+  payload: {
+    stepId: string;
+  };
+}
+
+/**
+ * AI_VALIDATION_COMPLETED message - sent when AI validation completes (with or without enhancements)
+ */
+export interface AIValidationCompletedMessage extends ExtensionMessage {
+  type: 'AI_VALIDATION_COMPLETED';
+  payload: {
+    stepId: string;
+    enhanced: boolean;
+  };
+}
+
+/**
+ * STEP_ENHANCED message - sent when a step has been enhanced with AI suggestions
+ */
+export interface StepEnhancedMessage extends ExtensionMessage {
+  type: 'STEP_ENHANCED';
+  payload: {
+    stepId: string;
+  };
+}
+
+/**
+ * ANALYZE_WORKFLOW message - request AI analysis of workflow
+ */
+export interface AnalyzeWorkflowMessage extends ExtensionMessage {
+  type: 'ANALYZE_WORKFLOW';
+  payload: {
+    steps: import('./workflow').WorkflowStep[];
+  };
+}
+
+/**
+ * EXECUTE_WORKFLOW_ADAPTIVE message - execute workflow with intent
+ */
+export interface ExecuteWorkflowAdaptiveMessage extends ExtensionMessage {
+  type: 'EXECUTE_WORKFLOW_ADAPTIVE';
+  payload: {
+    steps: import('./workflow').WorkflowStep[];
+    intent?: import('./workflow').WorkflowIntent;
   };
 }
 

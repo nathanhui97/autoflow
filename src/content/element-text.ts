@@ -19,7 +19,7 @@ export class ElementTextCapture {
       if (!text || text.length === 0) {
         if (element instanceof HTMLElement) {
           text = element.innerText?.trim();
-        }
+    }
       }
       
       // For links and buttons, also check aria-label as fallback
@@ -53,7 +53,7 @@ export class ElementTextCapture {
         return placeholder.trim();
       }
     }
-    
+
     return undefined;
   }
 }

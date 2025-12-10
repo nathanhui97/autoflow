@@ -9,6 +9,12 @@ import { ElementSimilarity } from './element-similarity';
 import { ElementStateCapture } from './element-state';
 import { ElementTextCapture } from './element-text';
 import { WaitConditionDeterminer } from './wait-conditions';
+import { IframeUtils } from './iframe-utils';
+import { ContextScanner } from './context-scanner';
+import { VisualSnapshotService } from './visual-snapshot';
+import { AIService } from '../lib/ai-service';
+import { DOMDistiller } from '../lib/dom-distiller';
+import { PIIScrubber } from '../lib/pii-scrubber';
 import type { WorkflowStep } from '../types/workflow';
 
 export class RecordingManager {
@@ -17,12 +23,22 @@ export class RecordingManager {
   private clickHandler: ((event: MouseEvent) => void) | null = null;
   private inputHandler: ((event: Event) => void) | null = null;
   private changeHandler: ((event: Event) => void) | null = null;
+  private keyboardHandler: ((event: KeyboardEvent) => void) | null = null;
+  private focusHandler: ((event: FocusEvent) => void) | null = null;
+  private mousedownHandler: ((event: MouseEvent) => void) | null = null;
   private currentUrl: string = window.location.href;
   private readonly DEBOUNCE_DELAY = 500; // 500ms debounce for input events
   private readonly CLICK_DEDUP_WINDOW = 2000; // 2 seconds - ignore duplicate clicks on same element within this window
   private lastInputStep: { selector: string; value: string } | null = null; // Track last input to prevent duplicates
   private lastClickStep: { selector: string; timestamp: number } | null = null; // Track last click to prevent duplicates
   private lastStep: WorkflowStep | null = null; // Track last step for wait condition determination
+  // Value Cache Pattern: Cache input values for Google Sheets (contenteditable elements that clear on blur)
+  private lastInputValue: string = ''; // Cache for contenteditable values (Google Sheets)
+  private currentInputElement: Element | null = null; // Track which element we're editing
+  // Visual Snapshot Cache: Promise-based cache for snapshots captured on mousedown
+  private pendingSnapshot: Promise<{ viewport: string; elementSnippet: string } | null> | null = null;
+  // AI Validation: Track pending validations to wait before saving
+  private pendingValidations: Promise<void>[] = [];
 
   /**
    * Start recording - attach event listeners
@@ -41,9 +57,10 @@ export class RecordingManager {
       document.body.setAttribute('data-ghostwriter-recording', 'true');
     }
 
-    // Setup click handler - use bubble phase to avoid blocking clicks
+    // Setup click handler - use CAPTURE phase to catch events before React/Base UI stops propagation
+    // This is critical for dropdown options that might have stopPropagation() called
     this.clickHandler = this.handleClick.bind(this);
-    document.addEventListener('click', this.clickHandler, false);
+    document.addEventListener('click', this.clickHandler, true); // true = capture phase
 
     // Setup input handler - use bubble phase to avoid blocking input
     this.inputHandler = this.handleInput.bind(this);
@@ -53,13 +70,26 @@ export class RecordingManager {
     this.changeHandler = this.handleChange.bind(this);
     document.addEventListener('change', this.changeHandler, false);
 
+    // Setup keyboard handler - only capture important keys (Enter, Tab, Escape)
+    this.keyboardHandler = this.handleKeyboard.bind(this);
+    document.addEventListener('keydown', this.keyboardHandler, false);
+
+    // Setup focus handler to clear cache when focusing on a new element
+    this.focusHandler = this.handleFocus.bind(this);
+    document.addEventListener('focus', this.focusHandler, true); // Use capture phase
+
+    // Setup mousedown handler to cache snapshots (Guardrail 3: Prevent race condition)
+    this.mousedownHandler = this.handleMousedown.bind(this);
+    document.addEventListener('mousedown', this.mousedownHandler, true); // Capture phase
+
     console.log('Recording started');
   }
 
   /**
    * Stop recording - remove event listeners
+   * Waits for pending AI validations (max 2 seconds) before completing
    */
-  stop(): void {
+  async stop(): Promise<void> {
     if (!this.isRecording) {
       return;
     }
@@ -71,9 +101,9 @@ export class RecordingManager {
       document.body.removeAttribute('data-ghostwriter-recording');
     }
 
-    // Remove event listeners
+    // Remove event listeners (must match the phase used in addEventListener)
     if (this.clickHandler) {
-      document.removeEventListener('click', this.clickHandler, false);
+      document.removeEventListener('click', this.clickHandler, true); // true = capture phase (matches addEventListener)
       this.clickHandler = null;
     }
 
@@ -87,6 +117,21 @@ export class RecordingManager {
       this.changeHandler = null;
     }
 
+    if (this.keyboardHandler) {
+      document.removeEventListener('keydown', this.keyboardHandler, false);
+      this.keyboardHandler = null;
+    }
+
+    if (this.focusHandler) {
+      document.removeEventListener('focus', this.focusHandler, true);
+      this.focusHandler = null;
+    }
+
+    if (this.mousedownHandler) {
+      document.removeEventListener('mousedown', this.mousedownHandler, true);
+      this.mousedownHandler = null;
+    }
+
     // Clear any pending debounce timer
     if (this.inputDebounceTimer !== null) {
       clearTimeout(this.inputDebounceTimer);
@@ -97,8 +142,92 @@ export class RecordingManager {
     this.lastInputStep = null;
     this.lastClickStep = null;
     this.lastStep = null;
+    this.lastInputValue = '';
+    this.currentInputElement = null;
+    this.pendingSnapshot = null;
+
+    // Wait for AI validations to complete (max 2 seconds)
+    if (this.pendingValidations.length > 0) {
+      console.log(`🤖 GhostWriter: Waiting for ${this.pendingValidations.length} pending AI validation(s) to complete...`);
+      const waitStartTime = performance.now();
+      await Promise.race([
+        Promise.all(this.pendingValidations).then(() => {
+          const waitTime = performance.now() - waitStartTime;
+          console.log(`🤖 GhostWriter: All AI validations completed in ${waitTime.toFixed(2)}ms`);
+        }).catch((error) => {
+          const waitTime = performance.now() - waitStartTime;
+          console.warn(`🤖 GhostWriter: Some AI validations failed after ${waitTime.toFixed(2)}ms:`, error);
+        }),
+        new Promise(resolve => setTimeout(() => {
+          const waitTime = performance.now() - waitStartTime;
+          console.warn(`🤖 GhostWriter: Timeout waiting for AI validations (waited ${waitTime.toFixed(2)}ms, ${this.pendingValidations.length} still pending)`);
+          resolve(undefined);
+        }, 10000)) // Increased to 10 seconds to allow AI requests to complete
+      ]);
+      this.pendingValidations = [];
+    }
 
     console.log('Recording stopped');
+  }
+
+  /**
+   * Check if element is a list item or option (for dropdown/menu items)
+   */
+  private isListItemOrOption(element: Element): boolean {
+    const role = element.getAttribute('role');
+    if (role === 'option' || role === 'menuitem' || role === 'listitem') {
+      return true;
+    }
+
+    const tagName = element.tagName.toLowerCase();
+    if (tagName === 'li' || tagName === 'option') {
+      return true;
+    }
+
+    // Check class names for common patterns
+    const className = element.className?.toString().toLowerCase() || '';
+    if (className.includes('option') || 
+        className.includes('menuitem') || 
+        className.includes('list-item') ||
+        className.includes('dropdown-item') ||
+        className.includes('select-option')) {
+      return true;
+    }
+
+    // CRITICAL: Check if element is inside a dropdown/listbox/menu container
+    // Many React dropdowns don't set role="option" on the option elements themselves
+    // They just use div elements inside a [role="listbox"] or [role="menu"] container
+    const container = element.closest('[role="listbox"], [role="menu"], [role="list"], select, [data-baseui="listbox"], [data-baseui="menu"]');
+    if (container && element !== container) {
+      // If we're inside a dropdown container, this is very likely a dropdown option
+      // Be permissive: any clickable element inside a listbox/menu is probably an option
+      // This catches cases where the option is a div inside a listbox without explicit roles
+      if (this.isInteractiveElement(element)) {
+        console.log('GhostWriter: Detected dropdown option inside container:', container.tagName, 'Role:', container.getAttribute('role'), 'Element:', element.tagName);
+        return true;
+      }
+      
+      // Also check if this is a direct child of the container (even if not explicitly interactive)
+      // Some dropdowns use non-interactive divs that become clickable via event handlers
+      const isDirectChild = element.parentElement === container;
+      if (isDirectChild) {
+        console.log('GhostWriter: Detected direct child of dropdown container as option:', container.tagName, 'Role:', container.getAttribute('role'));
+        return true;
+      }
+    }
+
+    // Check if parent has list-related role
+    const parent = element.parentElement;
+    if (parent) {
+      const parentRole = parent.getAttribute('role');
+      if (parentRole === 'listbox' || 
+          parentRole === 'menu' || 
+          parentRole === 'list') {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -193,10 +322,16 @@ export class RecordingManager {
       const elementsAtPoint = document.elementsFromPoint(event.clientX, event.clientY);
       
       // Filter for visible, interactive elements that are not overlays
+      // CRITICAL: Be permissive for list items/options (portal elements)
       const visibleElements = elementsAtPoint.filter(el => {
         if (el === element) return false; // Skip the original overlay element
         if (this.isOverlayElement(el)) return false; // Skip other overlays
-        if (!ElementStateCapture.isElementVisible(el)) return false; // Must be visible
+        
+        // For list items/options, be more permissive with visibility
+        const isListItemOrOption = this.isListItemOrOption(el);
+        const isVisible = ElementStateCapture.isElementVisible(el);
+        if (!isVisible && !isListItemOrOption) return false; // Must be visible (unless list item/option)
+        
         return this.isInteractiveElement(el); // Must be interactive
       });
       
@@ -246,29 +381,42 @@ export class RecordingManager {
       }
     }
 
-    // Strategy 4: Try to find any visible, interactive element near the click point
-    // This is a last resort - look for siblings or nearby elements
-    try {
-      const rect = element.getBoundingClientRect();
-      const centerX = rect.left + rect.width / 2;
-      const centerY = rect.top + rect.height / 2;
-      
-      // Try elementsFromPoint at the center of the element
-      const elementsAtCenter = document.elementsFromPoint(centerX, centerY);
-      for (const el of elementsAtCenter) {
-        if (el === element) continue;
-        if (this.isOverlayElement(el)) continue;
-        if (ElementStateCapture.isElementVisible(el) && this.isInteractiveElement(el)) {
-          return el;
+      // Strategy 4: Try to find any visible, interactive element near the click point
+      // This is a last resort - look for siblings or nearby elements
+      try {
+        const rect = element.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        const centerY = rect.top + rect.height / 2;
+        
+        // Try elementsFromPoint at the center of the element
+        const elementsAtCenter = document.elementsFromPoint(centerX, centerY);
+        for (const el of elementsAtCenter) {
+          if (el === element) continue;
+          if (this.isOverlayElement(el)) continue;
+          
+          // CRITICAL: For list items/options, be more permissive with visibility
+          const isListItemOrOption = this.isListItemOrOption(el);
+          const isVisible = ElementStateCapture.isElementVisible(el);
+          const isInteractive = this.isInteractiveElement(el);
+          
+          if ((isVisible || isListItemOrOption) && isInteractive) {
+            return el;
+          }
         }
+      } catch (error) {
+        // Ignore errors in fallback strategy
       }
-    } catch (error) {
-      // Ignore errors in fallback strategy
-    }
 
-    // If no better target found, return null (caller will skip recording)
-    console.warn('GhostWriter: Could not find visible, interactive element for click. Original element:', element.tagName, 'Visible:', isVisible, 'Overlay:', isOverlay);
-    return null;
+      // CRITICAL: If the original element is a list item/option, return it even if visibility checks fail
+      // Portal elements might have visibility quirks, but we still want to record them
+      if (this.isListItemOrOption(element)) {
+        console.log('GhostWriter: Returning list item/option element despite visibility/overlay checks (portal element)');
+        return element;
+      }
+
+      // If no better target found, return null (caller will skip recording)
+      console.warn('GhostWriter: Could not find visible, interactive element for click. Original element:', element.tagName, 'Visible:', isVisible, 'Overlay:', isOverlay);
+      return null;
   }
 
   private getActualElement(event: Event): Element | null {
@@ -285,30 +433,90 @@ export class RecordingManager {
     return (event.target as Element) || null;
   }
 
+  /**
+   * Find the scrollable container for an element
+   */
+  private findScrollContainer(element: Element): HTMLElement | null {
+    let current: Element | null = element;
+    const maxLevels = 10;
+    let level = 0;
+
+    while (current && level < maxLevels && current !== document.body && current !== document.documentElement) {
+      if (current instanceof HTMLElement) {
+        const style = window.getComputedStyle(current);
+        const overflow = style.overflow || style.overflowY || style.overflowX;
+        
+        // Check if element is scrollable
+        if (overflow === 'auto' || overflow === 'scroll') {
+          // Verify it actually scrolls
+          if (current.scrollHeight > current.clientHeight || current.scrollWidth > current.clientWidth) {
+            return current;
+          }
+        }
+      }
+      
+      current = current.parentElement;
+      level++;
+    }
+
+    return null;
+  }
+
 
   /**
    * Handle click events
-   * IMPORTANT: This handler must NOT block event propagation
+   * IMPORTANT: Using capture phase (useCapture: true) to catch events before React/Base UI stops propagation
+   * This is critical for dropdown options that might have stopPropagation() called
    */
   private handleClick(event: MouseEvent): void {
     if (!this.isRecording) return;
 
     // Process asynchronously to avoid blocking the click event
     // Use requestIdleCallback or setTimeout(0) to ensure event can propagate
-    const processClick = () => {
+    // Note: We're in capture phase, so we see the event before it reaches the target
+    const processClick = async () => {
       try {
         // Get actual element (handles Shadow DOM)
         const actualElement = this.getActualElement(event);
         if (!actualElement) return;
 
-        // Find the actual clickable element (handles overlay clicks)
-        const clickableElement = this.findActualClickableElement(actualElement, event);
+        // Check if this is a list item/option FIRST (before filtering)
+        // This is critical for dropdown options in portals
+        const isListItemOrOption = this.isListItemOrOption(actualElement);
         
-        // Final visibility check - never record invisible elements
-        // This is the safety net: even if overlay piercing fails, we won't record bad data
-        if (!clickableElement || !ElementStateCapture.isElementVisible(clickableElement)) {
-          console.warn('GhostWriter: Skipping click on invisible element or no target found. Original element:', actualElement.tagName);
-          return; // Don't record invisible elements
+        // Find the actual clickable element (handles overlay clicks)
+        // BUT: For list items/options, be more permissive - they might be in portals
+        let clickableElement: Element | null;
+        if (isListItemOrOption) {
+          // For list items/options, use the element directly (portals might not pass visibility checks)
+          // Only try overlay piercing if it's clearly an overlay
+          if (this.isOverlayElement(actualElement)) {
+            clickableElement = this.findActualClickableElement(actualElement, event);
+          } else {
+            clickableElement = actualElement;
+          }
+        } else {
+          clickableElement = this.findActualClickableElement(actualElement, event);
+        }
+        
+        // Final visibility check - but be permissive for list items/options
+        // Portal elements might have visibility quirks, but we still want to record them
+        if (!clickableElement) {
+          console.warn('GhostWriter: No clickable element found. Original element:', actualElement.tagName);
+          return;
+        }
+        
+        // For list items/options, be more lenient with visibility checks
+        // They might be in portals with different visibility contexts
+        const isVisible = ElementStateCapture.isElementVisible(clickableElement);
+        if (!isVisible && !isListItemOrOption) {
+          console.warn('GhostWriter: Skipping click on invisible element. Original element:', actualElement.tagName);
+          return; // Don't record invisible elements (unless it's a list item/option)
+        }
+        
+        // Log if we're recording a list item/option (for debugging)
+        if (isListItemOrOption) {
+          console.log('GhostWriter: Recording list item/option click:', clickableElement.tagName, 'Text:', (clickableElement as HTMLElement).textContent?.trim()?.substring(0, 50));
         }
         
         const target = clickableElement as HTMLElement;
@@ -316,6 +524,20 @@ export class RecordingManager {
         // Ignore clicks on extension UI elements
         if (target.closest && target.closest('[data-ghostwriter]')) {
           return;
+        }
+
+        // CRITICAL: For list items/options, log the element details for debugging
+        if (isListItemOrOption) {
+          const role = target.getAttribute('role');
+          const className = target.className?.toString() || '';
+          const text = target.textContent?.trim()?.substring(0, 100) || '';
+          console.log('GhostWriter: List item/option detected - Role:', role, 'Class:', className.substring(0, 50), 'Text:', text);
+          
+          // Find parent container to log
+          const container = target.closest('[role="listbox"], [role="menu"], [role="list"], ul, ol, select');
+          if (container) {
+            console.log('GhostWriter: Found container:', container.tagName, 'Role:', container.getAttribute('role'));
+          }
         }
 
         const url = window.location.href;
@@ -353,13 +575,46 @@ export class RecordingManager {
         }
 
         // Deduplicate: Skip if this is the same click on the same element within the dedup window
-        // Check BEFORE processing to avoid duplicate work
+        // BUT: NEVER skip list items/options - they are critical for dropdown interactions
         const currentTimestamp = Date.now();
-        if (this.lastClickStep && 
+        
+        // Check if the last step was a dropdown trigger (has wait condition for listbox/menu)
+        const wasDropdownTrigger = this.lastStep?.payload?.waitConditions?.some(
+          wc => wc.type === 'element' && 
+          (wc.selector?.includes('[role="listbox"]') || 
+           wc.selector?.includes('[role="menu"]') ||
+           wc.selector?.includes('listbox') ||
+           wc.selector?.includes('menu'))
+        ) || false;
+        
+        // CRITICAL: Always allow list items/options to be recorded, even if within dedup window
+        // This ensures dropdown option clicks are never filtered out
+        if (isListItemOrOption) {
+          console.log('GhostWriter: List item/option click - ALWAYS recording (bypassing deduplication)');
+          // Continue - always record list items/options
+        } else if (this.lastClickStep && 
             this.lastClickStep.selector === selectors.primary &&
             (currentTimestamp - this.lastClickStep.timestamp) < this.CLICK_DEDUP_WINDOW) {
           console.log('GhostWriter: Skipping duplicate click on same element within', this.CLICK_DEDUP_WINDOW, 'ms');
-          return; // Skip duplicate click
+          return; // Skip duplicate click (same selector, not a list item/option)
+        }
+        
+        // Special case: If this is a list item/option and the last click was on a different selector,
+        // allow it even if within the dedup window (dropdown trigger -> option is a valid sequence)
+        if (isListItemOrOption && this.lastClickStep && 
+            this.lastClickStep.selector !== selectors.primary &&
+            (currentTimestamp - this.lastClickStep.timestamp) < this.CLICK_DEDUP_WINDOW) {
+          console.log('GhostWriter: Allowing list item/option click after different selector (dropdown sequence)');
+          // Continue - don't skip this click
+        }
+        
+        // EXTRA PERMISSIVE: If the last click was a dropdown trigger, be very permissive about the next click
+        // This catches dropdown options that might not be detected as list items/options
+        if (wasDropdownTrigger && this.lastClickStep && 
+            this.lastClickStep.selector !== selectors.primary &&
+            (currentTimestamp - this.lastClickStep.timestamp) < 5000) { // 5 second window for dropdown options
+          console.log('GhostWriter: Last click was dropdown trigger - allowing next click as potential option');
+          // Continue - don't skip this click (it's likely a dropdown option)
         }
 
         // Mark this click as pending to prevent duplicates during async processing
@@ -379,19 +634,129 @@ export class RecordingManager {
           console.warn('GhostWriter: Error capturing element state/text:', stateError);
         }
 
+        // Capture event details (Phase 1: Critical)
+        const hasModifiers = event.ctrlKey || event.shiftKey || event.altKey || event.metaKey;
+        const eventDetails: import('../types/workflow').EventDetails = {
+          mouseButton: event.button === 0 ? 'left' : event.button === 1 ? 'middle' : event.button === 2 ? 'right' : undefined,
+          // Only include modifiers if at least one is true
+          modifiers: hasModifiers ? {
+            ctrl: event.ctrlKey || undefined,
+            shift: event.shiftKey || undefined,
+            alt: event.altKey || undefined,
+            meta: event.metaKey || undefined,
+          } : undefined,
+          coordinates: {
+            x: event.clientX,
+            y: event.clientY,
+          },
+          eventSequence: ['mousedown', 'focus', 'mouseup', 'click'], // Standard sequence for React/Angular
+        };
+
+        // Capture viewport and scroll information (Phase 1: Critical) - only if needed
+        let viewport: import('../types/workflow').ViewportInfo | undefined = undefined;
+        const scrollContainer = this.findScrollContainer(target);
+        const scrollX = window.scrollX || window.pageXOffset;
+        const scrollY = window.scrollY || window.pageYOffset;
+        const hasScroll = scrollX !== 0 || scrollY !== 0;
+        const hasScrollContainer = scrollContainer && (scrollContainer.scrollTop !== 0 || scrollContainer.scrollLeft !== 0);
+        
+        // Only include viewport if scroll exists or has scroll container with non-zero scroll
+        if (hasScroll || hasScrollContainer) {
+          viewport = {
+            width: window.innerWidth,
+            height: window.innerHeight,
+          };
+          
+          // Only include scrollX/scrollY if non-zero
+          if (scrollX !== 0) {
+            viewport.scrollX = scrollX;
+          }
+          if (scrollY !== 0) {
+            viewport.scrollY = scrollY;
+          }
+          
+          // Only include elementScrollContainer if it has non-zero scroll
+          if (hasScrollContainer && scrollContainer) {
+            const containerSelector = SelectorEngine.generateSelectors(scrollContainer).primary;
+            const containerScrollTop = scrollContainer.scrollTop;
+            const containerScrollLeft = scrollContainer.scrollLeft;
+            
+            viewport.elementScrollContainer = {
+              selector: containerSelector,
+            };
+            
+            // Only include scrollTop/scrollLeft if non-zero
+            if (containerScrollTop !== 0) {
+              viewport.elementScrollContainer.scrollTop = containerScrollTop;
+            }
+            if (containerScrollLeft !== 0) {
+              viewport.elementScrollContainer.scrollLeft = containerScrollLeft;
+            }
+          }
+        }
+
+        // Capture element bounds (Phase 2: Important) - simplified (top/left/right/bottom removed)
+        const rect = target.getBoundingClientRect();
+        const elementBounds: import('../types/workflow').ElementBounds = {
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height,
+        };
+
+        // Capture element role (Phase 3: Minor)
+        const elementRole = target.getAttribute('role') || undefined;
+
+        // Capture page state (Phase 3: Minor) - only include if not 'complete' or for debugging
+        // Omit pageState as it's usually 'complete' and loadTime is not used by replayer
+        const pageState: import('../types/workflow').PageState | undefined = undefined;
+
+        // Capture timing information (Phase 2: Important) - only include if delayAfter exists
+        const delayAfter = this.lastStep ? (currentTimestamp - this.lastStep.payload.timestamp) : undefined;
+        const timing: import('../types/workflow').TimingInfo | undefined = delayAfter ? {
+          delayAfter,
+          // animationWait and networkWait omitted when false
+        } : undefined;
+
+        // Capture iframe context (Phase 2: Important)
+        const iframeContext = IframeUtils.getIframeContext(target);
+
+        // Capture retry strategy (Phase 3: Minor) - omitted (always defaults, replayer uses fallbackSelectors)
+        // Retry strategy removed - replayer uses fallbackSelectors directly with default retry logic
+        const retryStrategy: import('../types/workflow').RetryStrategy | undefined = undefined;
+
+        // Capture focus events (Phase 3: Minor) - only include if true
+        const needsFocus = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
+        const focusEvents: import('../types/workflow').FocusEvents | undefined = needsFocus ? {
+          needsFocus: true,
+          // needsBlur omitted when false
+        } : undefined;
+
+        // Capture network conditions (Phase 3: Minor) - only include if waitForRequests is true
+        // Currently always false, so omit entirely
+        const networkConditions: import('../types/workflow').NetworkConditions | undefined = undefined;
+
         // Check for navigation after a short delay
-        setTimeout(() => {
+        setTimeout(async () => {
           // Don't send step if recording was stopped
           if (!this.isRecording) return;
 
           // Double-check deduplication here (in case another click happened during the delay)
           const checkTimestamp = Date.now();
+          // Check for duplicate, but ALWAYS allow list items/options
+          // CRITICAL: Never skip list items/options - they are essential for dropdown interactions
+          const isListItemOrOptionCheck = this.isListItemOrOption(target);
           if (this.lastClickStep && 
               this.lastClickStep.selector === selectors.primary &&
               this.lastClickStep.timestamp !== currentTimestamp && // Different click
               (checkTimestamp - this.lastClickStep.timestamp) < this.CLICK_DEDUP_WINDOW) {
-            console.log('GhostWriter: Skipping duplicate click detected during async processing');
-            return; // Skip duplicate click
+            // Only skip if it's NOT a list item/option (dropdown options should always be recorded)
+            if (!isListItemOrOptionCheck) {
+              console.log('GhostWriter: Skipping duplicate click detected during async processing');
+              return; // Skip duplicate click
+            } else {
+              console.log('GhostWriter: Allowing list item/option click even if within dedup window (async check)');
+            }
           }
 
           const newUrl = window.location.href;
@@ -405,25 +770,116 @@ export class RecordingManager {
             finalContainerContext.text = selectors.anchorText;
           }
 
+          // Generate semantic fallback selectors for grid cells
+          const semanticContext = ContextScanner.scan(target);
+          let enhancedFallbacks = [...selectors.fallbacks];
+          
+          if (semanticContext.gridCoordinates?.cellReference) {
+            const cellRef = semanticContext.gridCoordinates.cellReference;
+            // Generate semantic selectors based on cell reference
+            // Google Sheets uses verbose aria-labels like "Cell A1", "Row 1, Column A"
+            // So we use "contains" logic for safety
+            const semanticSelectors = [
+              `[aria-label*="${cellRef}"]`,                    // Contains: "Cell A1", "A1 value is..."
+              `[aria-label="${cellRef}"]`,                     // Exact: "A1" (rare but possible)
+              `[aria-label="Cell ${cellRef}"]`,                // Common Google pattern
+              `[aria-label^="${cellRef} "]`,                   // Starts with: "A1 value..."
+              `//*[@role="gridcell" and contains(@aria-label, "${cellRef}")]`, // XPath (safest)
+              `[data-cell="${cellRef}"]`,                      // Data attribute fallback
+              `[data-cellref="${cellRef}"]`,                  // Alternative data attribute
+            ];
+            
+            // Add semantic selectors to the front of fallbacks (highest priority)
+            enhancedFallbacks = [...semanticSelectors, ...enhancedFallbacks];
+            
+            console.log('🔍 RecordingManager: Generated semantic fallback selectors for cell', cellRef, ':', semanticSelectors.length, 'selectors');
+          }
+
+          // Check selector stability and log warnings
+          const primaryStability = SelectorEngine.getSelectorStabilityScore(selectors.primary);
+          const isPrimaryFragile = SelectorEngine.isPotentiallyFragile(selectors.primary);
+          
+          // Debug: Always log primary selector and stability
+          console.log(`🔍 GhostWriter: Primary selector: "${selectors.primary}" | Stability: ${primaryStability.toFixed(2)} | Fragile: ${isPrimaryFragile}`);
+          
+          if (isPrimaryFragile || primaryStability < 0.7) {
+            console.warn(`GhostWriter: Recording step with fragile primary selector (stability: ${primaryStability.toFixed(2)}):`, selectors.primary);
+            console.warn('GhostWriter: Fallback selectors available:', enhancedFallbacks.length);
+            if (semanticContext.gridCoordinates?.cellReference) {
+              console.log('🔍 GhostWriter: Semantic fallback selectors available for cell:', semanticContext.gridCoordinates.cellReference);
+            }
+          }
+
+          // Resolve the snapshot started on mousedown (Guardrail 3: Prevent race condition)
+          let visualSnapshot: WorkflowStep['payload']['visualSnapshot'] | undefined;
+          if (this.pendingSnapshot) {
+            try {
+              console.log('📸 GhostWriter: Awaiting snapshot from mousedown...');
+              const visuals = await this.pendingSnapshot;
+              if (visuals) {
+                visualSnapshot = {
+                  viewport: visuals.viewport,
+                  elementSnippet: visuals.elementSnippet,
+                  timestamp: Date.now(),
+                  viewportSize: {
+                    width: window.innerWidth,
+                    height: window.innerHeight
+                  },
+                  elementBounds: elementBounds
+                };
+                console.log('📸 GhostWriter: Snapshot attached to click event');
+              } else {
+                console.warn('📸 GhostWriter: Snapshot promise resolved but returned null');
+              }
+            } catch (err) {
+              console.warn('📸 GhostWriter: Failed to get cached snapshot:', err);
+            } finally {
+              // Clear it after use
+              this.pendingSnapshot = null;
+            }
+          } else {
+            console.log('📸 GhostWriter: No pending snapshot for click event');
+          }
+
           const stepPayload: WorkflowStep['payload'] = {
             selector: selectors.primary,
-            fallbackSelectors: selectors.fallbacks.length > 0 ? selectors.fallbacks : [selectors.primary], // Ensure never empty
+            fallbackSelectors: enhancedFallbacks.length > 0 ? enhancedFallbacks : [selectors.primary], // Ensure never empty
             xpath: selectors.xpath,
             timestamp: Date.now(),
             url: isNavigation ? this.currentUrl : url,
             shadowPath: selectors.shadowPath,
             elementState: elementState || undefined,
             elementText: elementText,
+            // Phase 1: Critical fixes
+            eventDetails,
+            viewport,
+            // Phase 2: Important fixes
+            elementBounds,
+            iframeContext: iframeContext || undefined,
+            timing,
+            visualSnapshot, // Phase 2: Visual snapshots for AI reliability
+            // Phase 3: Minor enhancements
+            elementRole,
+            pageState,
+            retryStrategy,
+            focusEvents,
+            networkConditions,
             context: context ? {
-              siblings: context.siblings,
+              // Only include siblings if they have content, omit empty arrays
+              siblings: (context.siblings.before.length > 0 || context.siblings.after.length > 0) ? {
+                ...(context.siblings.before.length > 0 ? { before: context.siblings.before } : {}),
+                ...(context.siblings.after.length > 0 ? { after: context.siblings.after } : {}),
+              } : undefined,
               parent: context.parent || undefined,
-              ancestors: context.ancestors,
+              ancestors: context.ancestors.length > 0 ? context.ancestors : undefined,
               container: finalContainerContext || undefined,
               position: context.position,
               surroundingText: context.surroundingText,
               uniqueAttributes: Object.keys(disambiguationAttrs).length > 0 ? disambiguationAttrs : undefined,
-              formContext: context.formContext,
-            } : undefined,
+            formContext: context.formContext,
+            // Capture semantic coordinates for AI interpretation (includes decisionSpace)
+            ...ContextScanner.scan(target),
+          } : ContextScanner.scan(target),
             similarity: similarElements.length > 0 ? {
               similarCount: similarElements.length,
               uniquenessScore,
@@ -446,6 +902,13 @@ export class RecordingManager {
             payload: stepPayload,
           };
 
+          // Debug: Log if visualSnapshot is present
+          if (stepPayload.visualSnapshot) {
+            console.log('📸 GhostWriter: Step includes visualSnapshot with viewport size:', stepPayload.visualSnapshot.viewport?.length || 0, 'chars, snippet size:', stepPayload.visualSnapshot.elementSnippet?.length || 0, 'chars');
+          } else {
+            console.warn('📸 GhostWriter: Step does NOT include visualSnapshot');
+          }
+
           this.sendStep(step);
           this.lastStep = step;
           // Update last click timestamp (already set earlier, but update with actual step timestamp)
@@ -453,6 +916,23 @@ export class RecordingManager {
             selector: selectors.primary,
             timestamp: stepPayload.timestamp,
           };
+
+          // Trigger AI validation if selector is fragile (non-blocking, background)
+          // TEST MODE: Set to true to force AI validation on all selectors for testing
+          const FORCE_AI_VALIDATION = true; // Set to true to test AI validation
+          
+          if (FORCE_AI_VALIDATION || isPrimaryFragile || primaryStability < 0.7) {
+            if (FORCE_AI_VALIDATION) {
+              console.log('🧪 TEST MODE: Forcing AI validation (even for stable selectors)');
+            } else {
+              console.log('🤖 GhostWriter: Triggering AI validation for fragile selector...');
+            }
+            const validationPromise = this.enhanceStepWithAI(step, enhancedFallbacks, target);
+            this.pendingValidations.push(validationPromise);
+            console.log('🤖 GhostWriter: AI validation promise added, pending count:', this.pendingValidations.length);
+          } else {
+            console.log('✅ GhostWriter: Selector is stable, skipping AI validation');
+          }
 
           if (isNavigation) {
             this.currentUrl = newUrl;
@@ -483,9 +963,29 @@ export class RecordingManager {
       const actualElement = this.getActualElement(event);
       if (!actualElement) return;
 
-      const target = actualElement as HTMLInputElement | HTMLTextAreaElement;
-      if (!target || (target.tagName !== 'INPUT' && target.tagName !== 'TEXTAREA')) {
+      const target = actualElement as HTMLElement;
+      
+      // Check for standard inputs, textareas, OR contenteditable elements
+      const isStandardInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA';
+      const isContentEditable = (target.isContentEditable || target.getAttribute('contenteditable') === 'true');
+      
+      if (!isStandardInput && !isContentEditable) {
         return;
+      }
+
+      // CACHE VALUE: Store the current value in memory (critical for Google Sheets)
+      // This ensures we have the value even if Google Sheets clears the DOM on blur
+      // Store on EVERY input event, regardless of whether value exists (captures empty strings too)
+      if (isContentEditable) {
+        this.lastInputValue = target.textContent?.trim() || target.innerText?.trim() || '';
+        this.currentInputElement = target;
+        if (this.lastInputValue) {
+          console.log('GhostWriter: Cached input value:', this.lastInputValue);
+        }
+      } else if (isStandardInput) {
+        // For standard inputs, also cache (though less critical)
+        this.lastInputValue = (target as HTMLInputElement | HTMLTextAreaElement).value || '';
+        this.currentInputElement = target;
       }
 
       // Ignore password fields (though user chose to record all)
@@ -500,7 +1000,7 @@ export class RecordingManager {
       this.inputDebounceTimer = window.setTimeout(() => {
         // Don't capture if recording was stopped
         if (!this.isRecording) return;
-        this.captureInputValue(target);
+        this.captureInputValue(target as HTMLInputElement | HTMLTextAreaElement | HTMLElement);
       }, this.DEBOUNCE_DELAY);
     } catch (error) {
       console.error('Error handling input:', error);
@@ -529,13 +1029,244 @@ export class RecordingManager {
   }
 
   /**
+   * Handle mousedown events - start capturing snapshot immediately
+   * This prevents race condition by capturing before navigation/click
+   */
+  private handleMousedown(event: MouseEvent): void {
+    if (!this.isRecording) return;
+    
+    const actualElement = this.getActualElement(event);
+    if (!actualElement) return;
+    
+    // Start capturing IMMEDIATELY. Do not await it here.
+    // Store the Promise so the Click handler can await it.
+    // Users can't click two things at the exact same millisecond, so single Promise is sufficient
+    console.log('📸 GhostWriter: Starting snapshot capture on mousedown');
+    this.pendingSnapshot = VisualSnapshotService.capture(actualElement);
+  }
+
+  /**
+   * Handle focus events - clear cache when focusing on a new element
+   * This prevents accidentally using cached value from a previous element
+   */
+  private handleFocus(event: FocusEvent): void {
+    if (!this.isRecording) return;
+
+    const target = event.target as HTMLElement;
+    if (!target) return;
+
+    // Check if this is an input element
+    const isStandardInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA';
+    const isContentEditable = (target.isContentEditable || target.getAttribute('contenteditable') === 'true');
+    
+    if (!isStandardInput && !isContentEditable) {
+      return; // Not an input element, ignore
+    }
+
+    // If we're focusing on a different element than the one we were editing, clear cache
+    if (this.currentInputElement && this.currentInputElement !== target) {
+      console.log('GhostWriter: Focus moved to new element, clearing input cache');
+      this.lastInputValue = '';
+      this.currentInputElement = null;
+    }
+  }
+
+  /**
+   * Handle keyboard events (Phase 2: Important)
+   * Only captures important keys: Enter, Tab, Escape
+   */
+  private handleKeyboard(event: KeyboardEvent): void {
+    if (!this.isRecording) return;
+
+    // Only capture specific important keys
+    const importantKeys = ['Enter', 'Tab', 'Escape'];
+    if (!importantKeys.includes(event.key)) {
+      return;
+    }
+
+    // Don't capture if user is typing in an input (that's handled by input handler)
+    const target = event.target as HTMLElement;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+      // Only capture Enter in inputs (for form submission)
+      if (event.key !== 'Enter') {
+        return;
+      }
+    }
+
+    try {
+      // Get actual element (handles Shadow DOM)
+      const actualElement = this.getActualElement(event);
+      if (!actualElement) return;
+
+      const url = window.location.href;
+
+      // Capture keyboard details
+      const hasModifiers = event.ctrlKey || event.shiftKey || event.altKey || event.metaKey;
+      const keyboardDetails: import('../types/workflow').KeyboardDetails = {
+        key: event.key,
+        code: event.code,
+        // Only include modifiers if at least one is true
+        modifiers: hasModifiers ? {
+          ctrl: event.ctrlKey || undefined,
+          shift: event.shiftKey || undefined,
+          alt: event.altKey || undefined,
+          meta: event.metaKey || undefined,
+        } : undefined,
+      };
+
+      // Generate selectors for the target element
+      let selectors: ReturnType<typeof SelectorEngine.generateSelectors>;
+      try {
+        selectors = SelectorEngine.generateSelectors(actualElement);
+      } catch (selectorError) {
+        console.warn('GhostWriter: Error generating selectors for keyboard event:', selectorError);
+        return;
+      }
+
+      // Capture viewport and scroll information - only if needed
+      let viewport: import('../types/workflow').ViewportInfo | undefined = undefined;
+      const scrollContainer = this.findScrollContainer(actualElement);
+      const scrollX = window.scrollX || window.pageXOffset;
+      const scrollY = window.scrollY || window.pageYOffset;
+      const hasScroll = scrollX !== 0 || scrollY !== 0;
+      const hasScrollContainer = scrollContainer && (scrollContainer.scrollTop !== 0 || scrollContainer.scrollLeft !== 0);
+      
+      // Only include viewport if scroll exists or has scroll container with non-zero scroll
+      if (hasScroll || hasScrollContainer) {
+        viewport = {
+          width: window.innerWidth,
+          height: window.innerHeight,
+        };
+        
+        // Only include scrollX/scrollY if non-zero
+        if (scrollX !== 0) {
+          viewport.scrollX = scrollX;
+        }
+        if (scrollY !== 0) {
+          viewport.scrollY = scrollY;
+        }
+        
+        // Only include elementScrollContainer if it has non-zero scroll
+        if (hasScrollContainer && scrollContainer) {
+          const containerSelector = SelectorEngine.generateSelectors(scrollContainer).primary;
+          const containerScrollTop = scrollContainer.scrollTop;
+          const containerScrollLeft = scrollContainer.scrollLeft;
+          
+          viewport.elementScrollContainer = {
+            selector: containerSelector,
+          };
+          
+          // Only include scrollTop/scrollLeft if non-zero
+          if (containerScrollTop !== 0) {
+            viewport.elementScrollContainer.scrollTop = containerScrollTop;
+          }
+          if (containerScrollLeft !== 0) {
+            viewport.elementScrollContainer.scrollLeft = containerScrollLeft;
+          }
+        }
+      }
+
+      // Capture page state (Phase 3: Minor) - omitted (usually 'complete' and loadTime not used by replayer)
+      const pageState: import('../types/workflow').PageState | undefined = undefined;
+
+      // Capture timing information - only include if delayAfter exists
+      const stepTimestamp = Date.now();
+      const delayAfter = this.lastStep ? (stepTimestamp - this.lastStep.payload.timestamp) : undefined;
+      const timing: import('../types/workflow').TimingInfo | undefined = delayAfter ? {
+        delayAfter,
+        // animationWait and networkWait omitted when false
+      } : undefined;
+
+      // Generate semantic fallback selectors for grid cells (keyboard events can happen on grid cells)
+      const semanticContext = ContextScanner.scan(actualElement);
+      let enhancedFallbacks = [...selectors.fallbacks];
+      
+      if (semanticContext.gridCoordinates?.cellReference) {
+        const cellRef = semanticContext.gridCoordinates.cellReference;
+        const semanticSelectors = [
+          `[aria-label*="${cellRef}"]`,
+          `[aria-label="${cellRef}"]`,
+          `[aria-label="Cell ${cellRef}"]`,
+          `[aria-label^="${cellRef} "]`,
+          `//*[@role="gridcell" and contains(@aria-label, "${cellRef}")]`,
+          `[data-cell="${cellRef}"]`,
+          `[data-cellref="${cellRef}"]`,
+        ];
+        enhancedFallbacks = [...semanticSelectors, ...enhancedFallbacks];
+      }
+
+      const stepPayload: WorkflowStep['payload'] = {
+        selector: selectors.primary,
+        fallbackSelectors: enhancedFallbacks.length > 0 ? enhancedFallbacks : [selectors.primary],
+        xpath: selectors.xpath,
+        timestamp: stepTimestamp,
+        url: url,
+        shadowPath: selectors.shadowPath,
+        // Phase 2: Important fixes
+        keyboardDetails,
+        viewport,
+        timing,
+        // Phase 3: Minor enhancements
+        pageState,
+      };
+
+      // Determine wait conditions
+      const tempStep: WorkflowStep = {
+        type: 'KEYBOARD',
+        payload: stepPayload,
+      };
+      const waitConditions = WaitConditionDeterminer.determineWaitConditions(tempStep, this.lastStep || undefined);
+      stepPayload.waitConditions = waitConditions.length > 0 ? waitConditions : undefined;
+
+      const step: WorkflowStep = {
+        type: 'KEYBOARD',
+        payload: stepPayload,
+      };
+
+      this.sendStep(step);
+      this.lastStep = step;
+    } catch (error) {
+      console.error('Error handling keyboard event:', error);
+    }
+  }
+
+  /**
    * Capture the final value of an input element
    */
-  private captureInputValue(element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement): void {
+  private async captureInputValue(element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | HTMLElement): Promise<void> {
     try {
+      // Check if element is contenteditable
+      const isContentEditable = (element as HTMLElement).isContentEditable || 
+                                element.getAttribute('contenteditable') === 'true';
+      
       const selectors = SelectorEngine.generateSelectors(element, undefined);
       const label = LabelFinder.findLabel(element);
-      const value = element.value || (element as HTMLInputElement).checked?.toString() || '';
+      
+      // Extract value: for contenteditable, use textContent/innerText; for standard inputs, use value
+      let value: string;
+      if (isContentEditable) {
+        value = (element as HTMLElement).textContent?.trim() || 
+                (element as HTMLElement).innerText?.trim() || '';
+        
+        // RECOVERY STRATEGY: If DOM is empty but we have cached value, use cache
+        // This fixes the Google Sheets bug where contenteditable clears on blur/Enter
+        // Don't check element equality - just use cache if DOM is empty (simpler and more reliable)
+        if (!value && this.lastInputValue) {
+          console.log('GhostWriter: Recovering value from cache:', this.lastInputValue);
+          value = this.lastInputValue;
+        }
+      } else if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
+        value = element.value || (element as HTMLInputElement).checked?.toString() || '';
+        
+        // RECOVERY STRATEGY: For standard inputs too (less common but safe)
+        if (!value && this.lastInputValue) {
+          console.log('GhostWriter: Recovering value from cache:', this.lastInputValue);
+          value = this.lastInputValue;
+        }
+      } else {
+        value = '';
+      }
+      
       const url = window.location.href;
 
       // Deduplicate: Skip if this is the same input with the same value as the last recorded step
@@ -543,6 +1274,26 @@ export class RecordingManager {
           this.lastInputStep.selector === selectors.primary && 
           this.lastInputStep.value === value) {
         return; // Skip duplicate input
+      }
+
+      // Generate semantic fallback selectors for grid cells (same as in handleClick)
+      const semanticContext = ContextScanner.scan(element);
+      let enhancedFallbacks = [...selectors.fallbacks];
+      
+      if (semanticContext.gridCoordinates?.cellReference) {
+        const cellRef = semanticContext.gridCoordinates.cellReference;
+        // Same semantic selectors as in handleClick (Google Sheets verbose aria-labels)
+        const semanticSelectors = [
+          `[aria-label*="${cellRef}"]`,                    // Contains: "Cell A1", "A1 value is..."
+          `[aria-label="${cellRef}"]`,                     // Exact: "A1" (rare but possible)
+          `[aria-label="Cell ${cellRef}"]`,                // Common Google pattern
+          `[aria-label^="${cellRef} "]`,                   // Starts with: "A1 value..."
+          `//*[@role="gridcell" and contains(@aria-label, "${cellRef}")]`, // XPath (safest)
+          `[data-cell="${cellRef}"]`,                      // Data attribute fallback
+          `[data-cellref="${cellRef}"]`,                  // Alternative data attribute
+        ];
+        enhancedFallbacks = [...semanticSelectors, ...enhancedFallbacks];
+        console.log('🔍 RecordingManager: Generated semantic fallback selectors for input cell', cellRef, ':', semanticSelectors.length, 'selectors');
       }
 
       // Capture context for input elements too (with error handling)
@@ -569,6 +1320,125 @@ export class RecordingManager {
         }
       }
 
+      // Capture input details (Phase 2: Important)
+      // Only HTMLInputElement has min, max, pattern, step properties
+      // For contenteditable, we don't have these properties
+      const inputDetails: import('../types/workflow').InputDetails | undefined = 
+        isContentEditable ? undefined : {
+          type: (element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement).type || 'text',
+          required: (element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement).required || false,
+          min: element instanceof HTMLInputElement ? (element.min || undefined) : undefined,
+          max: element instanceof HTMLInputElement ? (element.max || undefined) : undefined,
+          pattern: element instanceof HTMLInputElement ? (element.pattern || undefined) : undefined,
+          step: element instanceof HTMLInputElement ? (element.step ? parseFloat(element.step) : undefined) : undefined,
+        };
+
+      // Capture viewport and scroll information (Phase 1: Critical) - only if needed
+      let viewport: import('../types/workflow').ViewportInfo | undefined = undefined;
+      const scrollContainer = this.findScrollContainer(element);
+      const scrollX = window.scrollX || window.pageXOffset;
+      const scrollY = window.scrollY || window.pageYOffset;
+      const hasScroll = scrollX !== 0 || scrollY !== 0;
+      const hasScrollContainer = scrollContainer && (scrollContainer.scrollTop !== 0 || scrollContainer.scrollLeft !== 0);
+      
+      // Only include viewport if scroll exists or has scroll container with non-zero scroll
+      if (hasScroll || hasScrollContainer) {
+        viewport = {
+          width: window.innerWidth,
+          height: window.innerHeight,
+        };
+        
+        // Only include scrollX/scrollY if non-zero
+        if (scrollX !== 0) {
+          viewport.scrollX = scrollX;
+        }
+        if (scrollY !== 0) {
+          viewport.scrollY = scrollY;
+        }
+        
+        // Only include elementScrollContainer if it has non-zero scroll
+        if (hasScrollContainer && scrollContainer) {
+          const containerSelector = SelectorEngine.generateSelectors(scrollContainer).primary;
+          const containerScrollTop = scrollContainer.scrollTop;
+          const containerScrollLeft = scrollContainer.scrollLeft;
+          
+          viewport.elementScrollContainer = {
+            selector: containerSelector,
+          };
+          
+          // Only include scrollTop/scrollLeft if non-zero
+          if (containerScrollTop !== 0) {
+            viewport.elementScrollContainer.scrollTop = containerScrollTop;
+          }
+          if (containerScrollLeft !== 0) {
+            viewport.elementScrollContainer.scrollLeft = containerScrollLeft;
+          }
+        }
+      }
+
+      // Capture element bounds (Phase 2: Important) - simplified (top/left/right/bottom removed)
+      const rect = element.getBoundingClientRect();
+      const elementBounds: import('../types/workflow').ElementBounds = {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+      };
+
+      // Capture element role (Phase 3: Minor)
+      const elementRole = element.getAttribute('role') || undefined;
+
+      // Capture page state (Phase 3: Minor) - omitted (usually 'complete' and loadTime not used by replayer)
+      const pageState: import('../types/workflow').PageState | undefined = undefined;
+
+      // Capture iframe context (Phase 2: Important)
+      const iframeContext = IframeUtils.getIframeContext(element);
+
+      // Capture timing information (Phase 2: Important) - only include if delayAfter exists
+      const stepTimestamp = Date.now();
+      const delayAfter = this.lastStep ? (stepTimestamp - this.lastStep.payload.timestamp) : undefined;
+      const timing: import('../types/workflow').TimingInfo | undefined = delayAfter ? {
+        delayAfter,
+        // animationWait and networkWait omitted when false
+      } : undefined;
+
+      // Capture retry strategy (Phase 3: Minor) - omitted (always defaults, replayer uses fallbackSelectors)
+      const retryStrategy: import('../types/workflow').RetryStrategy | undefined = undefined;
+
+      // Capture focus events (Phase 3: Minor) - inputs always need focus
+      const focusEvents: import('../types/workflow').FocusEvents = {
+        needsFocus: true,
+        // needsBlur omitted when false
+      };
+
+      // Capture network conditions (Phase 3: Minor) - only include if waitForRequests is true
+      // Currently always false, so omit entirely
+      const networkConditions: import('../types/workflow').NetworkConditions | undefined = undefined;
+
+      // Resolve snapshot if available (from mousedown when user clicked to focus input)
+      let visualSnapshot: WorkflowStep['payload']['visualSnapshot'] | undefined;
+      if (this.pendingSnapshot) {
+        try {
+          const visuals = await this.pendingSnapshot;
+          if (visuals) {
+            visualSnapshot = {
+              viewport: visuals.viewport,
+              elementSnippet: visuals.elementSnippet,
+              timestamp: Date.now(),
+              viewportSize: {
+                width: window.innerWidth,
+                height: window.innerHeight
+              },
+              elementBounds: elementBounds
+            };
+          }
+        } catch (err) {
+          console.warn('GhostWriter: Failed to get cached snapshot for input:', err);
+        } finally {
+          this.pendingSnapshot = null;
+        }
+      }
+
       // Build step payload first (without wait conditions)
       const stepPayload: WorkflowStep['payload'] = {
         selector: selectors.primary,
@@ -576,20 +1446,39 @@ export class RecordingManager {
         xpath: selectors.xpath,
         label: label || undefined,
         value: value,
-        timestamp: Date.now(),
+        timestamp: stepTimestamp,
         url: url,
         shadowPath: selectors.shadowPath,
         elementState: elementState || undefined,
+        // Phase 2: Important fixes
+        inputDetails,
+        viewport,
+        elementBounds,
+        iframeContext: iframeContext || undefined,
+        timing,
+        visualSnapshot, // Phase 2: Visual snapshots for AI reliability
+        // Phase 3: Minor enhancements
+        elementRole,
+        pageState,
+        retryStrategy,
+        focusEvents,
+        networkConditions,
         context: context ? {
-          siblings: context.siblings,
+          // Only include siblings if they have content, and only include non-empty arrays
+          siblings: (context.siblings.before.length > 0 || context.siblings.after.length > 0) ? {
+            ...(context.siblings.before.length > 0 ? { before: context.siblings.before } : {}),
+            ...(context.siblings.after.length > 0 ? { after: context.siblings.after } : {}),
+          } : undefined,
           parent: context.parent || undefined,
-          ancestors: context.ancestors,
+          ancestors: context.ancestors.length > 0 ? context.ancestors : undefined,
           container: context.container || undefined,
           position: context.position,
           surroundingText: context.surroundingText,
           uniqueAttributes: Object.keys(disambiguationAttrs).length > 0 ? disambiguationAttrs : undefined,
           formContext: context.formContext,
-        } : undefined,
+          // Capture semantic coordinates for AI interpretation (includes decisionSpace)
+          ...ContextScanner.scan(element),
+        } : ContextScanner.scan(element),
         similarity: similarElements.length > 0 ? {
           similarCount: similarElements.length,
           uniquenessScore,
@@ -612,6 +1501,13 @@ export class RecordingManager {
         payload: stepPayload,
       };
 
+      // Debug: Log if visualSnapshot is present
+      if (stepPayload.visualSnapshot) {
+        console.log('📸 GhostWriter: Input step includes visualSnapshot with viewport size:', stepPayload.visualSnapshot.viewport?.length || 0, 'chars, snippet size:', stepPayload.visualSnapshot.elementSnippet?.length || 0, 'chars');
+      } else {
+        console.warn('📸 GhostWriter: Input step does NOT include visualSnapshot');
+      }
+
       // Update last input step
       this.lastInputStep = {
         selector: selectors.primary,
@@ -620,6 +1516,10 @@ export class RecordingManager {
 
       this.sendStep(step);
       this.lastStep = step;
+
+      // Clear cache after successful record
+      this.lastInputValue = '';
+      this.currentInputElement = null;
     } catch (error) {
       console.error('Error capturing input value:', error);
     }
@@ -630,12 +1530,54 @@ export class RecordingManager {
    */
   private sendStep(step: WorkflowStep): void {
     try {
+      // Debug: Verify visualSnapshot is in the step before sending
+      const hasVisualSnapshot = !!step.payload.visualSnapshot;
+      if (hasVisualSnapshot && step.payload.visualSnapshot) {
+        const snapshot = step.payload.visualSnapshot;
+        console.log('📸 GhostWriter: Sending step with visualSnapshot - viewport:', snapshot.viewport?.substring(0, 50) || 'missing', '...');
+      } else {
+        console.warn('📸 GhostWriter: Sending step WITHOUT visualSnapshot');
+      }
+
       chrome.runtime.sendMessage({
         type: 'RECORDED_STEP',
         payload: { step },
       } as import('../types/messages').RecordedStepMessage);
+      
+      // Generate description asynchronously (non-blocking)
+      this.generateStepDescription(step).catch((error) => {
+        console.warn('GhostWriter: Failed to generate step description:', error);
+      });
     } catch (error) {
       console.error('Error sending step:', error);
+    }
+  }
+
+  /**
+   * Generate natural language description for a step (async, non-blocking)
+   */
+  private async generateStepDescription(step: WorkflowStep): Promise<void> {
+    try {
+      const result = await AIService.generateStepDescription(step);
+      if (result.description) {
+        // Update step with description
+        const stepId = step.payload.timestamp.toString();
+        const updatedStep: WorkflowStep = {
+          ...step,
+          description: result.description,
+        };
+        
+        // Send update message to side panel
+        chrome.runtime.sendMessage({
+          type: 'UPDATE_STEP',
+          payload: { stepId, step: updatedStep }
+        } as import('../types/messages').UpdateStepMessage);
+        
+        console.log(`📝 GhostWriter: Generated description for step: "${result.description}"`);
+      }
+    } catch (error) {
+      // Fail silently - description is enhancement
+      console.warn('GhostWriter: Description generation failed:', error);
     }
   }
 
@@ -644,6 +1586,131 @@ export class RecordingManager {
    */
   getRecordingState(): boolean {
     return this.isRecording;
+  }
+
+  /**
+   * Enhance step with AI-suggested selectors (non-blocking, background)
+   */
+  private async enhanceStepWithAI(
+    step: WorkflowStep,
+    currentFallbacks: string[],
+    element: Element
+  ): Promise<void> {
+    const startTime = performance.now();
+    const stepId = step.payload.timestamp.toString();
+    
+    // Notify UI that AI validation has started
+    try {
+      chrome.runtime.sendMessage({
+        type: 'AI_VALIDATION_STARTED',
+        payload: { stepId }
+      } as import('../types/messages').AIValidationStartedMessage);
+    } catch (e) {
+      // Fail silently - UI notification is non-critical
+    }
+    
+    try {
+      console.log('🤖 GhostWriter: enhanceStepWithAI started for selector:', step.payload.selector);
+      
+      // Extract context
+      const contextStartTime = performance.now();
+      const context = DOMDistiller.extractElementContext(element);
+      const contextTime = performance.now() - contextStartTime;
+      console.log(`🤖 GhostWriter: Element context extracted in ${contextTime.toFixed(2)}ms, length:`, context.length);
+      
+      // Scrub PII
+      const scrubStartTime = performance.now();
+      const scrubbed = PIIScrubber.scrub(context);
+      const scrubTime = performance.now() - scrubStartTime;
+      console.log(`🤖 GhostWriter: Context scrubbed in ${scrubTime.toFixed(2)}ms, calling AI validation...`);
+      
+      // Call AI validation
+      const aiStartTime = performance.now();
+      console.log('🤖 GhostWriter: Calling AIService.validateSelector...');
+      const result = await AIService.validateSelector(
+        step.payload.selector,
+        scrubbed,
+        {
+          title: document.title,
+          url: window.location.href
+        }
+      );
+      const aiTime = performance.now() - aiStartTime;
+      const totalTime = performance.now() - startTime;
+      console.log(`🤖 GhostWriter: AI validation completed in ${aiTime.toFixed(2)}ms (total: ${totalTime.toFixed(2)}ms)`);
+      console.log('🤖 GhostWriter: AI validation result:', { 
+        isStable: result.isStable, 
+        alternativesCount: result.alternatives.length, 
+        confidence: result.confidence,
+        reasoning: result.reasoning 
+      });
+      if (result.reasoning) {
+        console.log('🤖 GhostWriter: AI reasoning:', result.reasoning);
+      }
+      
+      if (!result.isStable && result.alternatives.length > 0) {
+        const processStartTime = performance.now();
+        // Create updated step with AI suggestions prepended to fallbacks
+        const updatedStep: WorkflowStep = {
+          ...step,
+          payload: {
+            ...step.payload,
+            fallbackSelectors: [
+              ...result.alternatives,
+              ...currentFallbacks
+            ]
+          }
+        };
+        
+        // Send update message to side panel to update step in store
+        // Use timestamp as unique identifier (steps don't have id field)
+        chrome.runtime.sendMessage({
+          type: 'UPDATE_STEP',
+          payload: { stepId: step.payload.timestamp.toString(), step: updatedStep }
+        } as import('../types/messages').UpdateStepMessage);
+        
+        const processTime = performance.now() - processStartTime;
+        const finalTotalTime = performance.now() - startTime;
+        console.log(`🤖 GhostWriter: AI injected robust selectors for step ${step.payload.timestamp} - ${result.alternatives.length} alternatives added (processing: ${processTime.toFixed(2)}ms, total: ${finalTotalTime.toFixed(2)}ms)`);
+        
+        // Notify UI that step has been enhanced
+        try {
+          chrome.runtime.sendMessage({
+            type: 'STEP_ENHANCED',
+            payload: { stepId }
+          });
+        } catch (e) {
+          // Fail silently
+        }
+      } else {
+        const finalTotalTime = performance.now() - startTime;
+        console.log(`🤖 GhostWriter: AI validation completed (no alternatives needed, total: ${finalTotalTime.toFixed(2)}ms)`);
+        
+        // Remove from pending even if no alternatives were added
+        try {
+          chrome.runtime.sendMessage({
+            type: 'AI_VALIDATION_COMPLETED',
+            payload: { stepId, enhanced: false }
+          });
+        } catch (e) {
+          // Fail silently
+        }
+      }
+    } catch (e) {
+      const errorTime = performance.now() - startTime;
+      // Fail silently - AI is enhancement
+      console.warn(`GhostWriter: AI validation failed for step ${step.payload.timestamp} after ${errorTime.toFixed(2)}ms:`, e);
+      
+      // Remove from pending on error
+      try {
+        chrome.runtime.sendMessage({
+          type: 'AI_VALIDATION_COMPLETED',
+          payload: { stepId, enhanced: false }
+        });
+      } catch (err) {
+        // Fail silently
+      }
+    }
   }
 }
 

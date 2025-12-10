@@ -4,7 +4,13 @@ import { runtimeBridge } from '../lib/bridge';
 import { WorkflowStorage } from '../lib/storage';
 import type { ExtensionState } from '../types/state';
 import type { WorkflowStep, SavedWorkflow } from '../types/workflow';
-import type { RecordedStepMessage } from '../types/messages';
+import type { 
+  RecordedStepMessage, 
+  UpdateStepMessage,
+  AIValidationStartedMessage,
+  AIValidationCompletedMessage,
+  StepEnhancedMessage
+} from '../types/messages';
 
 function App() {
   const { 
@@ -16,11 +22,14 @@ function App() {
     savedWorkflows,
     currentWorkflowName,
     isRecording,
+    pendingAIValidations,
+    enhancedSteps,
     setState,
     setConnectionStatus,
     setError,
     setLastPingTime,
     addWorkflowStep,
+    updateWorkflowStep,
     clearWorkflowSteps,
     loadWorkflow,
     setSavedWorkflows,
@@ -28,6 +37,8 @@ function App() {
     removeSavedWorkflow,
     setCurrentWorkflowName,
     setIsRecording,
+    setAIValuationPending,
+    setStepEnhanced,
   } = useExtensionStore();
 
   const [isPinging, setIsPinging] = useState(false);
@@ -98,15 +109,31 @@ function App() {
     loadSavedWorkflows();
   }, [setSavedWorkflows]);
 
-  // Listen for RECORDED_STEP messages from content script
+  // Listen for RECORDED_STEP, UPDATE_STEP, and AI validation messages from content script
   useEffect(() => {
     const handleMessage = (
-      message: RecordedStepMessage,
+      message: RecordedStepMessage | UpdateStepMessage | AIValidationStartedMessage | AIValidationCompletedMessage | StepEnhancedMessage,
       _sender: chrome.runtime.MessageSender,
       _sendResponse: (response?: any) => void
     ) => {
       if (message.type === 'RECORDED_STEP' && message.payload?.step) {
         addWorkflowStep(message.payload.step);
+      } else if (message.type === 'UPDATE_STEP' && message.payload?.stepId && message.payload?.step) {
+        updateWorkflowStep(message.payload.stepId, message.payload.step);
+        // Mark as enhanced when step is updated with AI suggestions
+        if (message.payload.step.payload.fallbackSelectors?.length > 0) {
+          setStepEnhanced(message.payload.stepId);
+        }
+      } else if (message.type === 'AI_VALIDATION_STARTED' && message.payload?.stepId) {
+        setAIValuationPending(message.payload.stepId, true);
+      } else if (message.type === 'AI_VALIDATION_COMPLETED' && message.payload?.stepId) {
+        setAIValuationPending(message.payload.stepId, false);
+        if (message.payload.enhanced) {
+          setStepEnhanced(message.payload.stepId);
+        }
+      } else if (message.type === 'STEP_ENHANCED' && message.payload?.stepId) {
+        setAIValuationPending(message.payload.stepId, false);
+        setStepEnhanced(message.payload.stepId);
       }
       return false;
     };
@@ -118,7 +145,7 @@ function App() {
     return () => {
       chrome.runtime.onMessage.removeListener(handleMessage);
     };
-  }, [addWorkflowStep]);
+  }, [addWorkflowStep, updateWorkflowStep, setAIValuationPending, setStepEnhanced]);
 
   const handleStartRecording = async () => {
     try {
@@ -315,6 +342,23 @@ function App() {
               Current workflow: {currentWorkflowName}
             </p>
           )}
+          {pendingAIValidations.size > 0 && (
+            <div className="mt-2 flex items-center gap-2 text-sm text-yellow-600">
+              <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <span>AI validating {pendingAIValidations.size} step{pendingAIValidations.size > 1 ? 's' : ''}...</span>
+            </div>
+          )}
+          {enhancedSteps.size > 0 && pendingAIValidations.size === 0 && (
+            <div className="mt-2 flex items-center gap-2 text-sm text-blue-600">
+              <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+              </svg>
+              <span>{enhancedSteps.size} step{enhancedSteps.size > 1 ? 's' : ''} enhanced with AI</span>
+            </div>
+          )}
         </div>
 
         {/* Actions */}
@@ -366,22 +410,71 @@ function App() {
               Recorded Steps ({workflowSteps.length})
             </h2>
             <div className="space-y-2 max-h-64 overflow-y-auto">
-              {workflowSteps.map((step, index) => (
-                <div key={index} className="p-3 bg-muted rounded-md text-sm">
-                  <div className="font-medium text-foreground">
-                    {index + 1}. {step.type}
+              {workflowSteps.map((step, index) => {
+                const stepId = step.payload.timestamp.toString();
+                const isPending = pendingAIValidations.has(stepId);
+                const isEnhanced = enhancedSteps.has(stepId);
+                const aiFallbackCount = step.payload.fallbackSelectors?.filter((s: string) => 
+                  !s.includes('nth-of-type') && !s.includes('ng-star-inserted')
+                ).length || 0;
+                
+                return (
+                  <div 
+                    key={index} 
+                    className={`p-3 bg-muted rounded-md text-sm border-l-4 ${
+                      isEnhanced ? 'border-blue-500' : 
+                      isPending ? 'border-yellow-500 animate-pulse' : 
+                      'border-transparent'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex-1">
+                        <div className="font-medium text-foreground">
+                          {index + 1}. {step.type}
+                        </div>
+                        {step.description && (
+                          <div className="text-sm text-blue-600 mt-1 font-medium">
+                            {step.description}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {isPending && (
+                          <div className="flex items-center gap-1 text-yellow-600 text-xs">
+                            <svg className="animate-spin h-3 w-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            <span>AI analyzing...</span>
+                          </div>
+                        )}
+                        {isEnhanced && !isPending && (
+                          <div className="flex items-center gap-1 text-blue-600 text-xs">
+                            <svg className="h-3 w-3" fill="currentColor" viewBox="0 0 20 20">
+                              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                            </svg>
+                            <span>AI enhanced</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    {step.payload.label && (
+                      <div className="text-muted-foreground">Label: {step.payload.label}</div>
+                    )}
+                    {step.payload.value && (
+                      <div className="text-muted-foreground">Value: {step.payload.value}</div>
+                    )}
+                    <div className="text-muted-foreground text-xs mt-1">
+                      Selector: {step.payload.selector}
+                    </div>
+                    {isEnhanced && aiFallbackCount > 0 && (
+                      <div className="text-blue-600 text-xs mt-1">
+                        ✨ {aiFallbackCount} AI-enhanced fallback selector{aiFallbackCount > 1 ? 's' : ''} added
+                      </div>
+                    )}
                   </div>
-                  {step.payload.label && (
-                    <div className="text-muted-foreground">Label: {step.payload.label}</div>
-                  )}
-                  {step.payload.value && (
-                    <div className="text-muted-foreground">Value: {step.payload.value}</div>
-                  )}
-                  <div className="text-muted-foreground text-xs mt-1">
-                    Selector: {step.payload.selector}
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}

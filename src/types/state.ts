@@ -27,3 +27,6 @@ export interface ExtensionStateData {
   lastPingTime: number | null;
 }
 
+
+
+

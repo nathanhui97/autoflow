@@ -113,6 +113,11 @@ export class ElementContext {
     text?: string;
     attributes?: Record<string, string>;
     index?: number;
+    state?: {
+      expanded?: boolean;
+      visible?: boolean;
+      enabled?: boolean;
+    };
   } | null {
     const parent = element.parentElement;
     if (!parent) return null;
@@ -127,16 +132,52 @@ export class ElementContext {
     if (className && typeof className === 'string' && className.length < 100) {
       attributes.class = className;
     }
+    // Capture ARIA attributes for dropdown detection
+    const ariaHaspopup = parent.getAttribute('aria-haspopup');
+    if (ariaHaspopup) attributes['aria-haspopup'] = ariaHaspopup;
+    const ariaExpanded = parent.getAttribute('aria-expanded');
+    if (ariaExpanded !== null) attributes['aria-expanded'] = ariaExpanded;
+    const role = parent.getAttribute('role');
+    if (role) attributes.role = role;
 
     // Find index among similar parents
     const similarParents = this.findSimilarParents(parent);
     const index = similarParents.indexOf(parent) + 1;
+
+    // Capture parent state (Phase 3: Minor enhancement)
+    const state: {
+      expanded?: boolean;
+      visible?: boolean;
+      enabled?: boolean;
+    } = {};
+
+    if (parent instanceof HTMLElement) {
+      // Check if expanded (for accordions, collapsibles)
+      const ariaExpanded = parent.getAttribute('aria-expanded');
+      if (ariaExpanded !== null) {
+        state.expanded = ariaExpanded === 'true';
+      } else {
+        // Check for common expanded indicators
+        const style = window.getComputedStyle(parent);
+        const display = style.display;
+        const visibility = style.visibility;
+        state.visible = display !== 'none' && visibility !== 'hidden';
+      }
+
+      // Check if enabled
+      if ('disabled' in parent && (parent as HTMLButtonElement | HTMLInputElement).disabled) {
+        state.enabled = false;
+      } else {
+        state.enabled = true;
+      }
+    }
 
     return {
       selector,
       text: text && text.length < 200 ? text : undefined,
       attributes: Object.keys(attributes).length > 0 ? attributes : undefined,
       index: similarParents.length > 1 ? index : undefined,
+      state: Object.keys(state).length > 0 ? state : undefined,
     };
   }
 
@@ -179,6 +220,7 @@ export class ElementContext {
     maxDepth: number
   ): Array<{ selector: string; text?: string; role?: string }> {
     const ancestors: Array<{ selector: string; text?: string; role?: string }> = [];
+    const seenSelectors = new Set<string>(); // Deduplicate by selector
     let current: Element | null = element.parentElement;
     let depth = 0;
 
@@ -187,11 +229,15 @@ export class ElementContext {
       const text = current.textContent?.trim();
       const role = current.getAttribute('role');
 
-      ancestors.push({
-        selector,
-        text: text && text.length < 200 ? text : undefined,
-        role: role || undefined,
-      });
+      // Skip if we've already seen this selector (deduplication)
+      if (!seenSelectors.has(selector)) {
+        seenSelectors.add(selector);
+        ancestors.push({
+          selector,
+          text: text && text.length < 200 ? text : undefined,
+          role: role || undefined,
+        });
+      }
 
       current = current.parentElement;
       depth++;
@@ -459,6 +505,8 @@ export class ElementContext {
     formId?: string;
     fieldset?: string;
     section?: string;
+    isValid?: boolean;
+    isSubmitting?: boolean;
   } | undefined {
     const form = element.closest('form');
     if (!form) return undefined;
@@ -473,12 +521,38 @@ export class ElementContext {
                         section?.querySelector('h1, h2, h3, h4, h5, h6')?.textContent?.trim() ||
                         undefined;
 
-    if (!formId && !fieldsetId && !sectionLabel) return undefined;
+    // Capture form state (Phase 3: Minor enhancement)
+    let isValid: boolean | undefined = undefined;
+    let isSubmitting: boolean | undefined = undefined;
+
+    if (form instanceof HTMLFormElement) {
+      // Check form validity (if HTML5 validation is available)
+      try {
+        isValid = form.checkValidity();
+      } catch (e) {
+        // Form might not support checkValidity
+      }
+
+      // Check if form is submitting (look for disabled submit buttons or loading indicators)
+      const submitButtons = form.querySelectorAll('button[type="submit"], input[type="submit"]');
+      for (const btn of submitButtons) {
+        if (btn instanceof HTMLElement && btn.hasAttribute('disabled')) {
+          isSubmitting = true;
+          break;
+        }
+      }
+    }
+
+    if (!formId && !fieldsetId && !sectionLabel && isValid === undefined && isSubmitting === undefined) {
+      return undefined;
+    }
 
     return {
       formId,
       fieldset: fieldsetId,
       section: sectionLabel,
+      isValid,
+      isSubmitting,
     };
   }
 }

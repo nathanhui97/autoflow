@@ -12,6 +12,43 @@ chrome.runtime.onMessage.addListener(
     sender: chrome.runtime.MessageSender,
     sendResponse: (response: MessageResponse) => void
   ) => {
+    // Handle CAPTURE_VIEWPORT request from content script
+    if (message.type === 'CAPTURE_VIEWPORT') {
+      if (!sender.tab) {
+        console.error('📸 Service Worker: CAPTURE_VIEWPORT called without sender.tab');
+        sendResponse({ 
+          success: false, 
+          error: 'No tab context available' 
+        });
+        return false;
+      }
+      
+      console.log('📸 Service Worker: Capturing viewport for tab:', sender.tab.id);
+      // windowId is optional - if not provided, captures active window
+      chrome.tabs.captureVisibleTab({ format: 'png' }, (dataUrl) => {
+        if (chrome.runtime.lastError) {
+          console.error('📸 Service Worker: Capture failed:', chrome.runtime.lastError.message);
+          sendResponse({ 
+            success: false, 
+            error: chrome.runtime.lastError.message 
+          });
+        } else if (!dataUrl) {
+          console.error('📸 Service Worker: Capture returned empty data');
+          sendResponse({ 
+            success: false, 
+            error: 'Screenshot data is empty' 
+          });
+        } else {
+          console.log('📸 Service Worker: Viewport captured successfully, size:', dataUrl.length, 'chars');
+          sendResponse({ 
+            success: true, 
+            data: { snapshot: dataUrl } 
+          });
+        }
+      });
+      return true; // Keep channel open for async
+    }
+
     // If message comes from content script, forward to sidepanel
     if (sender.tab) {
       // Message from content script - could forward to sidepanel if needed

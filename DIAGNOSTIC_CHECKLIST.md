@@ -96,3 +96,6 @@ console.log('Has chrome.runtime:', typeof chrome?.runtime !== 'undefined');
 
 Please share all the information you find!
 
+
+
+

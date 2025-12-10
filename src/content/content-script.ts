@@ -14,6 +14,12 @@ let recordingManager: any = null;
 // Now do imports
 import type { ExtensionMessage, MessageResponse, PongMessage } from '../types/messages';
 import { RecordingManager } from './recording-manager';
+import { AIWorkflowAnalyzer } from './ai-workflow-analyzer';
+import { PatternDetector } from './pattern-detector';
+import { ExecutionEngine } from './execution-engine';
+import { AIDataBuilder } from './ai-data-builder';
+import { VisualSnapshotService } from './visual-snapshot';
+import type { WorkflowStep, WorkflowIntent } from '../types/workflow';
 
 // Full message handler with all message types
 function handleFullMessage(
@@ -69,19 +75,22 @@ function handleFullMessage(
           });
           return false;
         }
-        try {
-          recordingManager.stop();
-          sendResponse({
-            success: true,
-            data: { message: 'Recording stopped' },
-          });
-        } catch (error) {
-          sendResponse({
-            success: false,
-            error: error instanceof Error ? error.message : 'Failed to stop recording',
-          });
-        }
-        return false;
+        // Handle async stop() method
+        (async () => {
+          try {
+            await recordingManager.stop();
+            sendResponse({
+              success: true,
+              data: { message: 'Recording stopped' },
+            });
+          } catch (error) {
+            sendResponse({
+              success: false,
+              error: error instanceof Error ? error.message : 'Failed to stop recording',
+            });
+          }
+        })();
+        return true; // Keep channel open for async response
       }
 
       case 'EXECUTE_STEP': {
@@ -89,6 +98,92 @@ function handleFullMessage(
         sendResponse({
           success: true,
           data: { message: 'Step executed (placeholder)' },
+        });
+        return false;
+      }
+
+      case 'ANALYZE_WORKFLOW': {
+        if (!message.payload?.steps) {
+          sendResponse({
+            success: false,
+            error: 'ANALYZE_WORKFLOW requires steps in payload',
+          });
+          return false;
+        }
+
+        // Analyze workflow asynchronously
+        (async () => {
+          try {
+            const steps = message.payload.steps as WorkflowStep[];
+            
+            // Detect pattern first
+            const pattern = PatternDetector.detectPattern(steps);
+            
+            // Analyze with AI
+            const analyzer = new AIWorkflowAnalyzer();
+            const intent = await analyzer.analyzeWorkflow(steps, pattern || undefined);
+            
+            // Send response back
+            chrome.runtime.sendMessage({
+              type: 'ANALYZE_WORKFLOW_RESPONSE',
+              payload: { intent },
+            });
+          } catch (error) {
+            console.error('GhostWriter: Error analyzing workflow:', error);
+            chrome.runtime.sendMessage({
+              type: 'ANALYZE_WORKFLOW_RESPONSE',
+              payload: {
+                error: error instanceof Error ? error.message : 'Unknown error',
+              },
+            });
+          }
+        })();
+
+        // Return immediately (async response will be sent separately)
+        sendResponse({
+          success: true,
+          data: { message: 'Analysis started' },
+        });
+        return false;
+      }
+
+      case 'EXECUTE_WORKFLOW_ADAPTIVE': {
+        if (!message.payload?.steps) {
+          sendResponse({
+            success: false,
+            error: 'EXECUTE_WORKFLOW_ADAPTIVE requires steps in payload',
+          });
+          return false;
+        }
+
+        // Execute workflow asynchronously
+        (async () => {
+          try {
+            const steps = message.payload.steps as WorkflowStep[];
+            const intent = message.payload.intent as WorkflowIntent | undefined;
+            
+            const executor = new ExecutionEngine();
+            await executor.executeWorkflow(steps, intent);
+            
+            chrome.runtime.sendMessage({
+              type: 'EXECUTE_WORKFLOW_RESPONSE',
+              payload: { success: true },
+            });
+          } catch (error) {
+            console.error('GhostWriter: Error executing workflow:', error);
+            chrome.runtime.sendMessage({
+              type: 'EXECUTE_WORKFLOW_RESPONSE',
+              payload: {
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              },
+            });
+          }
+        })();
+
+        sendResponse({
+          success: true,
+          data: { message: 'Execution started' },
         });
         return false;
       }
@@ -186,6 +281,52 @@ function initialize() {
     console.log('GhostWriter: RecordingManager available:', !!recordingManager);
     console.log('GhostWriter: Document ready state:', document.readyState);
     console.log('GhostWriter: Body exists:', !!document.body);
+    
+    // Expose test function for Phase 1 testing (dev only)
+    (window as any).testPhase1 = (steps: WorkflowStep[]) => {
+      AIDataBuilder.testPhase1(steps);
+    };
+    console.log('GhostWriter: Phase 1 test function available: window.testPhase1(steps)');
+    
+    // Expose test function for snapshot testing (dev only)
+    (window as any).testSnapshot = async (selector?: string) => {
+      const element = selector 
+        ? document.querySelector(selector)
+        : document.body?.querySelector('button, a, input, [role="button"]') || document.body;
+      
+      if (!element) {
+        console.error('📸 Test: No element found');
+        return;
+      }
+      
+      console.log('📸 Test: Testing snapshot capture on element:', element);
+      console.log('📸 Test: Element bounds:', element.getBoundingClientRect());
+      
+      try {
+        const result = await VisualSnapshotService.capture(element);
+        if (result) {
+          console.log('✅ Test: Snapshot captured successfully!');
+          console.log('📸 Test: Viewport size:', result.viewport.length, 'chars');
+          console.log('📸 Test: Element snippet size:', result.elementSnippet.length, 'chars');
+          console.log('📸 Test: Viewport preview:', result.viewport.substring(0, 100) + '...');
+          console.log('📸 Test: Snippet preview:', result.elementSnippet.substring(0, 100) + '...');
+          
+          // Create a test image to verify it works
+          const img = document.createElement('img');
+          img.src = result.elementSnippet;
+          img.style.maxWidth = '300px';
+          img.style.border = '2px solid green';
+          img.style.margin = '10px';
+          document.body.appendChild(img);
+          console.log('📸 Test: Image element added to page for visual verification');
+        } else {
+          console.error('❌ Test: Snapshot returned null');
+        }
+      } catch (error) {
+        console.error('❌ Test: Snapshot capture failed:', error);
+      }
+    };
+    console.log('GhostWriter: Snapshot test function available: window.testSnapshot(selector?)');
   } catch (error) {
     console.error('GhostWriter: Error initializing content script:', error);
     if (error instanceof Error) {

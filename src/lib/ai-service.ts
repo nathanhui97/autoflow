@@ -1,0 +1,506 @@
+/**
+ * AI Service - Client-side service that calls Supabase Edge Function for AI recovery
+ * No direct Gemini API calls from client (all handled server-side)
+ */
+
+import type { WorkflowStep } from '../types/workflow';
+import type { AIAnalysisPayload } from '../types/ai';
+import type { FailureSnapshot } from './dom-distiller';
+import { AIDataBuilder } from '../content/ai-data-builder';
+import { DOMDistiller } from './dom-distiller';
+import { PIIScrubber } from './pii-scrubber';
+import { AICache } from './ai-cache';
+import { aiConfig } from './ai-config';
+
+export interface ElementFindingResult {
+  candidateIndex?: number;
+  selector?: string;
+  confidence: number;
+  reasoning: string;
+}
+
+export interface SelectorValidationResult {
+  isStable: boolean;
+  alternatives: string[];
+  reasoning: string;
+  confidence: number;
+}
+
+export interface StepDescriptionResult {
+  description: string;
+  confidence: number;
+}
+
+export class AIService {
+  /**
+   * Recover target element using AI (calls Supabase Edge Function)
+   */
+  static async recoverTarget(
+    step: WorkflowStep,
+    doc: Document = document
+  ): Promise<Element | null> {
+    if (!aiConfig.isEnabled()) {
+      console.log('GhostWriter: AI recovery disabled');
+      return null;
+    }
+
+    try {
+      // Step 1: Create failure snapshot with DOM Distiller (includes geometric filtering)
+      const snapshot = DOMDistiller.createFailureSnapshot(step, doc);
+      
+      // Step 2: Scrub PII from snapshot
+      const scrubbedSnapshot = PIIScrubber.scrubSnapshot(snapshot);
+      
+      // Step 3: Build AIAnalysisPayload using AIDataBuilder
+      const aiPayload = AIDataBuilder.buildStepAnalysisPayload(step);
+      
+      // Step 4: Add failure snapshot context to payload (for Edge Function)
+      // The Edge Function will use this to build the prompt
+      const enhancedPayload: AIAnalysisPayload & { failureSnapshot?: FailureSnapshot } = {
+        ...aiPayload,
+        failureSnapshot: scrubbedSnapshot, // Add failure snapshot with candidates
+      };
+      
+      // Generate cache key
+      const cacheKey = AICache.generateKey({
+        selector: step.payload.selector,
+        elementText: step.payload.elementText,
+        label: step.payload.label,
+        url: step.payload.url,
+        visualSnapshot: step.payload.visualSnapshot ? 'has_snapshot' : 'no_snapshot',
+        candidates: scrubbedSnapshot.candidates.length,
+      });
+
+      // Check local cache first
+      const cachedResult = await AICache.getFromLocal(cacheKey);
+      if (cachedResult) {
+        console.log('GhostWriter: Using cached AI recovery result');
+        return this.findElementFromResult(cachedResult, step, doc, scrubbedSnapshot.candidates);
+      }
+
+      // Call Supabase Edge Function
+      const result = await this.callSupabaseFunction(enhancedPayload);
+      
+      // Cache the result
+      await AICache.saveToLocal(cacheKey, result);
+      
+      // Find element from result
+      return this.findElementFromResult(result, step, doc, scrubbedSnapshot.candidates);
+    } catch (error) {
+      console.warn('GhostWriter: AI recovery failed:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Call Supabase Edge Function
+   */
+  private static async callSupabaseFunction(
+    payload: AIAnalysisPayload
+  ): Promise<ElementFindingResult> {
+    const config = aiConfig.getConfig();
+    
+    if (!config.supabaseUrl || !config.supabaseAnonKey) {
+      throw new Error('GhostWriter: Supabase configuration missing');
+    }
+
+    const url = `${config.supabaseUrl}/functions/v1/${config.edgeFunctionName}`;
+    
+    // Create abort controller for timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), config.timeout);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${config.supabaseAnonKey}`,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Supabase Edge Function error: ${response.status} - ${errorText}`);
+      }
+
+      const data = await response.json();
+      return this.parseElementFindingResponse(data);
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`GhostWriter: AI recovery timeout after ${config.timeout}ms`);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Parse Supabase function response
+   */
+  private static parseElementFindingResponse(
+    response: any
+  ): ElementFindingResult {
+    // Expected response format from Edge Function:
+    // { candidateIndex?: number, selector?: string, confidence: number, reasoning: string }
+    
+    if (typeof response !== 'object' || response === null) {
+      throw new Error('Invalid response format from Edge Function');
+    }
+
+    const result: ElementFindingResult = {
+      confidence: typeof response.confidence === 'number' ? response.confidence : 0,
+      reasoning: typeof response.reasoning === 'string' ? response.reasoning : '',
+    };
+
+    if (typeof response.candidateIndex === 'number') {
+      result.candidateIndex = response.candidateIndex;
+    }
+
+    if (typeof response.selector === 'string') {
+      result.selector = response.selector;
+    }
+
+    return result;
+  }
+
+  /**
+   * Find element in DOM from AI result
+   */
+  private static findElementFromResult(
+    result: ElementFindingResult,
+    _step: WorkflowStep,
+    doc: Document,
+    candidates?: Array<{ selector: string; tag: string; text: string }>
+  ): Element | null {
+    // Try selector first (if provided)
+    if (result.selector) {
+      try {
+        const element = doc.querySelector(result.selector);
+        if (element) {
+          return element;
+        }
+      } catch (e) {
+        // Invalid selector, continue
+      }
+    }
+
+    // Try candidate index (if provided and candidates available)
+    if (result.candidateIndex !== undefined && candidates) {
+      const candidate = candidates[result.candidateIndex];
+      
+      if (candidate) {
+        try {
+          const element = doc.querySelector(candidate.selector);
+          if (element) {
+            return element;
+          }
+        } catch (e) {
+          // Invalid selector, continue
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Validate selector stability and get better alternatives (calls Supabase Edge Function)
+   */
+  static async validateSelector(
+    selector: string,
+    elementContext: string,
+    pageContext: { title: string; url: string }
+  ): Promise<SelectorValidationResult> {
+    if (!aiConfig.isEnabled()) {
+      console.log('GhostWriter: AI validation disabled');
+      return {
+        isStable: true,
+        alternatives: [],
+        reasoning: 'AI validation disabled',
+        confidence: 0,
+      };
+    }
+
+    try {
+      // Generate cache key
+      const cacheKey = AICache.generateKey({
+        type: 'selector_validation',
+        selector,
+        elementContext: elementContext.substring(0, 200), // Truncate for cache key
+        url: pageContext.url,
+      });
+
+      // Check local cache first
+      const cachedResult = await AICache.getFromLocal(cacheKey);
+      if (cachedResult) {
+        console.log('GhostWriter: Using cached selector validation result');
+        return cachedResult;
+      }
+
+      // Call Supabase Edge Function
+      const result = await this.callValidateSelectorFunction(selector, elementContext, pageContext);
+      
+      // Cache the result
+      await AICache.saveToLocal(cacheKey, result);
+      
+      return result;
+    } catch (error) {
+      console.warn('GhostWriter: Selector validation failed:', error);
+      // Return stable result on error (fail gracefully)
+      return {
+        isStable: true,
+        alternatives: [],
+        reasoning: 'Validation failed, assuming stable',
+        confidence: 0,
+      };
+    }
+  }
+
+  /**
+   * Call Supabase Edge Function for selector validation
+   */
+  private static async callValidateSelectorFunction(
+    selector: string,
+    elementContext: string,
+    pageContext: { title: string; url: string }
+  ): Promise<SelectorValidationResult> {
+    const config = aiConfig.getConfig();
+    
+    if (!config.supabaseUrl || !config.supabaseAnonKey) {
+      throw new Error('GhostWriter: Supabase configuration missing');
+    }
+
+    const validateSelectorFunctionName = config.validateSelectorEdgeFunctionName || 'validate_selector';
+    const timeout = config.validateSelectorTimeout || 5000;
+    const url = `${config.supabaseUrl}/functions/v1/${validateSelectorFunctionName}`;
+    
+    console.log(`🤖 GhostWriter: Calling validate_selector at ${url} (timeout: ${timeout}ms)`);
+    
+    // Create abort controller for timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      console.warn(`🤖 GhostWriter: Request timeout after ${timeout}ms - Edge Function may not be deployed or is slow`);
+      controller.abort();
+    }, timeout);
+
+    try {
+      const fetchStartTime = performance.now();
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${config.supabaseAnonKey}`,
+        },
+        body: JSON.stringify({
+          selector,
+          elementContext,
+          pageContext,
+        }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+      const fetchTime = performance.now() - fetchStartTime;
+      console.log(`🤖 GhostWriter: Received response in ${fetchTime.toFixed(2)}ms, status: ${response.status}`);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`🤖 GhostWriter: Edge Function error ${response.status}:`, errorText);
+        throw new Error(`Supabase Edge Function error: ${response.status} - ${errorText}`);
+      }
+
+      const data = await response.json();
+      return this.parseSelectorValidationResponse(data);
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error instanceof Error && error.name === 'AbortError') {
+        console.error(`🤖 GhostWriter: Request aborted (timeout or network error). Check if Edge Function is deployed.`);
+        throw new Error(`GhostWriter: Selector validation timeout after ${timeout}ms. Is the Edge Function deployed?`);
+      }
+      if (error instanceof Error && error.message.includes('Failed to fetch')) {
+        console.error(`🤖 GhostWriter: Network error - Edge Function may not be deployed or URL is incorrect`);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Parse Supabase function response for selector validation
+   */
+  private static parseSelectorValidationResponse(
+    response: any
+  ): SelectorValidationResult {
+    if (typeof response !== 'object' || response === null) {
+      throw new Error('Invalid response format from Edge Function');
+    }
+
+    return {
+      isStable: typeof response.isStable === 'boolean' ? response.isStable : true,
+      alternatives: Array.isArray(response.alternatives) ? response.alternatives : [],
+      reasoning: typeof response.reasoning === 'string' ? response.reasoning : '',
+      confidence: typeof response.confidence === 'number' ? response.confidence : 0,
+    };
+  }
+
+  /**
+   * Generate natural language description for a workflow step
+   */
+  static async generateStepDescription(
+    step: WorkflowStep
+  ): Promise<StepDescriptionResult> {
+    if (!aiConfig.isEnabled()) {
+      return {
+        description: `${step.type} action`,
+        confidence: 0,
+      };
+    }
+
+    try {
+      // Generate cache key (include visual snapshot hash to differentiate similar steps)
+      const cacheKey = AICache.generateKey({
+        type: 'step_description',
+        stepType: step.type,
+        selector: step.payload.selector,
+        label: step.payload.label,
+        value: step.payload.value,
+        elementText: step.payload.elementText,
+        url: step.payload.url,
+        selectedText: step.payload.context?.decisionSpace?.selectedText,
+        snapshotHash: step.payload.visualSnapshot?.elementSnippet?.substring(0, 100),
+      });
+
+      // Check local cache first
+      const cachedResult = await AICache.getFromLocal(cacheKey);
+      if (cachedResult) {
+        console.log('GhostWriter: Using cached step description');
+        return cachedResult as StepDescriptionResult;
+      }
+
+      // Call Supabase Edge Function
+      const result = await this.callGenerateDescriptionFunction(step);
+
+      // Cache the result
+      await AICache.saveToLocal(cacheKey, result);
+
+      return result;
+    } catch (error) {
+      console.warn('GhostWriter: Step description generation failed:', error);
+      // Return fallback description
+      return {
+        description: this.generateFallbackDescription(step),
+        confidence: 0,
+      };
+    }
+  }
+
+  /**
+   * Call Supabase Edge Function for step description generation
+   */
+  private static async callGenerateDescriptionFunction(
+    step: WorkflowStep
+  ): Promise<StepDescriptionResult> {
+    const config = aiConfig.getConfig();
+    
+    if (!config.supabaseUrl || !config.supabaseAnonKey) {
+      throw new Error('GhostWriter: Supabase configuration missing');
+    }
+
+    const functionName = 'generate_step_description';
+    const timeout = config.timeout || 10000;
+    const url = `${config.supabaseUrl}/functions/v1/${functionName}`;
+    
+    console.log(`🤖 GhostWriter: Generating description for ${step.type} step...`);
+    console.log(`🤖 GhostWriter: Has visual snapshot:`, !!step.payload.visualSnapshot?.elementSnippet);
+    console.log(`🤖 GhostWriter: Has decisionSpace:`, !!step.payload.context?.decisionSpace);
+    console.log(`🤖 GhostWriter: Element text:`, step.payload.elementText);
+    console.log(`🤖 GhostWriter: Label:`, step.payload.label);
+    
+    // Create abort controller for timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      console.warn(`🤖 GhostWriter: Description generation timeout after ${timeout}ms`);
+      controller.abort();
+    }, timeout);
+
+    try {
+      const fetchStartTime = performance.now();
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${config.supabaseAnonKey}`,
+        },
+        body: JSON.stringify({ step }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+      const fetchTime = performance.now() - fetchStartTime;
+      console.log(`🤖 GhostWriter: Description received in ${fetchTime.toFixed(2)}ms, status: ${response.status}`);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`🤖 GhostWriter: Edge Function error ${response.status}:`, errorText);
+        throw new Error(`Supabase Edge Function error: ${response.status} - ${errorText}`);
+      }
+
+      const data = await response.json();
+      return this.parseDescriptionResponse(data);
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`GhostWriter: Description generation timeout after ${timeout}ms`);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Parse Supabase function response for step description
+   */
+  private static parseDescriptionResponse(
+    response: any
+  ): StepDescriptionResult {
+    if (typeof response !== 'object' || response === null) {
+      throw new Error('Invalid response format from Edge Function');
+    }
+
+    return {
+      description: typeof response.description === 'string' ? response.description : '',
+      confidence: typeof response.confidence === 'number' ? response.confidence : 0,
+    };
+  }
+
+  /**
+   * Generate fallback description when AI fails
+   */
+  private static generateFallbackDescription(step: WorkflowStep): string {
+    switch (step.type) {
+      case 'CLICK':
+        if (step.payload.label) {
+          return `Click on "${step.payload.label}"`;
+        }
+        if (step.payload.elementText) {
+          return `Click on "${step.payload.elementText}"`;
+        }
+        return 'Click on element';
+      case 'INPUT':
+        if (step.payload.label) {
+          return `Enter "${step.payload.value || ''}" in "${step.payload.label}"`;
+        }
+        return `Enter "${step.payload.value || ''}"`;
+      case 'NAVIGATION':
+        return `Navigate to ${step.payload.url}`;
+      case 'KEYBOARD':
+        const key = step.payload.keyboardDetails?.key || 'key';
+        return `Press ${key}`;
+      default:
+        return `${step.type} action`;
+    }
+  }
+}

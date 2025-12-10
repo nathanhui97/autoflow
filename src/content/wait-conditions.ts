@@ -16,6 +16,47 @@ export class WaitConditionDeterminer {
   ): WaitCondition[] {
     const conditions: WaitCondition[] = [];
 
+    // CRITICAL: If THIS step is a dropdown click, wait for menu to appear
+    if (step.type === 'CLICK' && this.isDropdownClick(step)) {
+      // Wait for common dropdown menu indicators
+      const menuSelectors = [
+        '[role="listbox"]',
+        '[role="menu"]',
+        '[role="option"]',
+        'ul[role="listbox"]',
+        'ul[role="menu"]',
+        '.dropdown-menu',
+        '.menu',
+        '[aria-expanded="true"]',
+      ];
+      
+      // Try to find a menu selector from context or fallbacks
+      const dropdownSelector = this.getDropdownSelector(step);
+      if (dropdownSelector) {
+        conditions.push({
+          type: 'element',
+          selector: dropdownSelector,
+          timeout: this.DEFAULT_TIMEOUT,
+        });
+      } else {
+        // Fallback: wait for any menu/listbox to appear
+        for (const menuSelector of menuSelectors) {
+          conditions.push({
+            type: 'element',
+            selector: menuSelector,
+            timeout: this.DEFAULT_TIMEOUT,
+          });
+          break; // Just wait for first one
+        }
+      }
+      
+      // Also wait a small delay for menu animation
+      conditions.push({
+        type: 'time',
+        timeout: 300, // 300ms for menu to appear
+      });
+    }
+
     // After a CLICK, we might need to wait for various things
     if (previousStep?.type === 'CLICK') {
       // If current step is NAVIGATION, we already navigated, so wait for URL
@@ -26,7 +67,7 @@ export class WaitConditionDeterminer {
           timeout: this.DEFAULT_TIMEOUT,
         });
       }
-      // If clicking a dropdown, wait for dropdown menu to appear
+      // If previous step was a dropdown click, wait for dropdown menu to appear
       else if (this.isDropdownClick(previousStep)) {
         // Try to determine dropdown selector from context
         const dropdownSelector = this.getDropdownSelector(previousStep);
@@ -94,7 +135,23 @@ export class WaitConditionDeterminer {
       });
     }
 
-    return conditions;
+    // Deduplicate wait conditions (remove duplicates with same type and selector/text)
+    const uniqueConditions: WaitCondition[] = [];
+    const seenKeys = new Set<string>();
+    
+    for (const condition of conditions) {
+      const key = condition.type === 'element' ? `element:${condition.selector}` :
+                  condition.type === 'text' ? `text:${condition.text}` :
+                  condition.type === 'url' ? `url:${condition.url}` :
+                  `time:${condition.timeout}`;
+      
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        uniqueConditions.push(condition);
+      }
+    }
+
+    return uniqueConditions;
   }
 
   /**
@@ -104,16 +161,53 @@ export class WaitConditionDeterminer {
     if (step.type !== 'CLICK') return false;
 
     const elementText = step.payload.elementText?.toLowerCase() || '';
-    const selector = step.payload.selector.toLowerCase();
     
-    // Check for common dropdown indicators
-    const dropdownIndicators = ['open', 'menu', 'dropdown', 'select', 'options'];
-    if (dropdownIndicators.some(indicator => elementText.includes(indicator) || selector.includes(indicator))) {
+    // Check for ARIA attributes that indicate dropdown (highest confidence)
+    const ariaHaspopup = step.payload.context?.parent?.attributes?.['aria-haspopup'];
+    const ariaExpanded = step.payload.context?.parent?.attributes?.['aria-expanded'];
+    if (ariaHaspopup === 'true' || ariaHaspopup === 'listbox' || ariaHaspopup === 'menu') {
+      return true;
+    }
+    if (ariaExpanded === 'false') { // Closed dropdown that will expand
       return true;
     }
 
-    // Check if next step is clicking something that appeared (like a menu item)
-    // This would be determined by the caller based on context
+    // Check for role attributes
+    const role = step.payload.elementRole || step.payload.context?.parent?.attributes?.['role'];
+    if (role === 'combobox' || (role === 'button' && ariaHaspopup)) {
+      return true;
+    }
+
+    // Check for common dropdown indicators in text (but be more specific)
+    // Only if text is short (dropdown triggers are usually short labels)
+    if (elementText.length < 50) {
+      const dropdownIndicators = ['select', 'choose', 'dropdown'];
+      if (dropdownIndicators.some(indicator => elementText.includes(indicator))) {
+        // Also check if element has siblings that suggest dropdown (e.g., "open" after click)
+        if (step.payload.context?.siblings?.after) {
+          const afterSiblings = step.payload.context.siblings.after;
+          if (afterSiblings.some(sibling => 
+            sibling.toLowerCase().includes('open') || 
+            sibling.toLowerCase().includes('menu')
+          )) {
+            return true;
+          }
+        }
+      }
+    }
+
+    // Check if element has siblings that suggest it's a dropdown trigger
+    // (e.g., "open" text after clicking a select field) - but only if text is short
+    if (elementText.length < 50 && step.payload.context?.siblings?.after) {
+      const afterSiblings = step.payload.context.siblings.after;
+      if (afterSiblings.some(sibling => 
+        sibling.toLowerCase().includes('open') || 
+        sibling.toLowerCase().includes('menu')
+      )) {
+        return true;
+      }
+    }
+
     return false;
   }
 
