@@ -57,6 +57,7 @@ interface StepMetadata {
   isSelectableOption?: boolean;
   isDropdown?: boolean;        // Whether this is a dropdown/select
   dropdownOptions?: string[];  // Available options in dropdown (if known)
+  selector?: string;           // Element selector (for detecting dropdowns)
 }
 
 /**
@@ -113,11 +114,15 @@ export class VariableDetector {
       };
     }
 
+    console.log(`[VariableDetector] Starting detection for ${steps.length} total steps`);
+    console.log(`[VariableDetector] Step types:`, steps.map(s => s.type));
+
     // Filter steps to only those that could contain variables
     const stepsForAnalysis = this.filterStepsForAnalysis(steps);
 
     if (stepsForAnalysis.length === 0) {
       console.log('[VariableDetector] No steps to analyze for variables');
+      console.log('[VariableDetector] Reasons: Steps may be missing visual snapshots or are not INPUT/selectable CLICK steps');
       return {
         variables: [],
         detectedAt: Date.now(),
@@ -126,6 +131,12 @@ export class VariableDetector {
     }
 
     console.log(`[VariableDetector] Analyzing ${stepsForAnalysis.length} steps for variables (filtered from ${steps.length} total)`);
+    console.log(`[VariableDetector] Steps to analyze:`, stepsForAnalysis.map(s => ({
+      type: s.metadata.stepType,
+      hasBefore: !!s.beforeSnapshot,
+      hasAfter: !!s.afterSnapshot,
+      isDropdown: s.metadata.isDropdown,
+    })));
 
     try {
       // Call Edge Function
@@ -134,7 +145,16 @@ export class VariableDetector {
       // Filter to only confirmed variables
       const confirmedVariables = response.variables.filter(v => v.isVariable && v.confidence >= 0.5);
 
-      console.log(`[VariableDetector] Detected ${confirmedVariables.length} variables from ${response.analysisCount} analyzed steps`);
+      console.log(`[VariableDetector] Edge Function response:`, {
+        totalVariables: response.variables.length,
+        confirmedVariables: confirmedVariables.length,
+        analysisCount: response.analysisCount,
+        allVariables: response.variables.map(v => ({
+          fieldName: v.fieldName,
+          isVariable: v.isVariable,
+          confidence: v.confidence,
+        })),
+      });
 
       return {
         variables: confirmedVariables,
@@ -162,27 +182,92 @@ export class VariableDetector {
       const step = steps[i];
       const payload = step.payload;
 
-      // Skip steps without snapshots (can't do visual analysis)
-      if (!payload.visualSnapshot?.viewport && !payload.visualSnapshot?.elementSnippet) {
-        continue;
-      }
-
       // Always include INPUT steps (primary variable source)
+      // INPUT steps are important even without snapshots - the value is what matters
       if (step.type === 'INPUT') {
-        result.push(this.createStepForAnalysis(i, step, steps));
+        // Include if it has a value (what user typed) OR a label (field name)
+        const hasValue = !!payload.value;
+        const hasLabel = !!payload.label;
+        const hasSnapshot = !!(payload.visualSnapshot?.viewport || payload.visualSnapshot?.elementSnippet);
+        
+        if (hasValue || hasLabel) {
+          console.log(`[VariableDetector] Including INPUT step ${i}: value="${payload.value || '(empty)'}", label="${payload.label || '(none)'}", hasSnapshot=${hasSnapshot}`);
+          result.push(this.createStepForAnalysis(i, step, steps));
+        } else {
+          console.log(`[VariableDetector] Skipping INPUT step ${i}: no value and no label`);
+        }
         continue;
       }
 
       // Include KEYBOARD steps that have a value (text input via keyboard)
       if (step.type === 'KEYBOARD' && payload.value) {
+        // KEYBOARD steps can work without snapshots if they have a value
+        console.log(`[VariableDetector] Including KEYBOARD step ${i}: value="${payload.value}", hasSnapshot=${!!(payload.visualSnapshot?.viewport || payload.visualSnapshot?.elementSnippet)}`);
         result.push(this.createStepForAnalysis(i, step, steps));
         continue;
       }
 
       // For CLICK steps, only include if it's a selectable option (not navigation)
       if (step.type === 'CLICK') {
-        if (this.isSelectableOption(payload)) {
-          result.push(this.createStepForAnalysis(i, step, steps));
+        const isSelectable = this.isSelectableOption(payload);
+        console.log(`[VariableDetector] CLICK step ${i} check:`, {
+          isSelectable,
+          elementText: payload.elementText?.substring(0, 50),
+          label: payload.label?.substring(0, 50),
+          hasContext: !!payload.context,
+          hasDecisionSpace: !!payload.context?.decisionSpace,
+          decisionSpaceType: payload.context?.decisionSpace?.type,
+          decisionSpaceOptions: payload.context?.decisionSpace?.options,
+          decisionSpaceOptionsLength: payload.context?.decisionSpace?.options?.length || 0,
+        });
+        
+        if (isSelectable) {
+          // For dropdowns, include even without snapshot if we have decisionSpace data
+          const hasSnapshot = payload.visualSnapshot?.viewport || payload.visualSnapshot?.elementSnippet;
+          const hasDecisionSpace = payload.context?.decisionSpace?.type === 'LIST_SELECTION' && 
+                                    payload.context.decisionSpace.options && 
+                                    payload.context.decisionSpace.options.length > 0;
+          
+          // Also check if it's a dropdown by checking if the element has role="option" or is in a listbox
+          // Check both single and double quotes in selector (XPath can use either)
+          const selectorLower = (payload.selector || '').toLowerCase();
+          const isLikelyDropdown = payload.elementRole === 'option' || 
+                                   payload.context?.decisionSpace?.type === 'LIST_SELECTION' ||
+                                   selectorLower.includes('role="option"') ||
+                                   selectorLower.includes("role='option'") ||
+                                   selectorLower.includes('role=\'option\'') ||
+                                   selectorLower.includes('listbox') ||
+                                   selectorLower.includes('[role="option"]') ||
+                                   selectorLower.includes("[role='option']");
+          
+          // Also check if this is the step immediately after a dropdown trigger
+          const isAfterDropdownTrigger = i > 0 && 
+                                         steps[i - 1]?.type === 'CLICK' &&
+                                         (steps[i - 1].payload.label?.toLowerCase().includes('select') ||
+                                          steps[i - 1].payload.label?.toLowerCase().includes('choose') ||
+                                          steps[i - 1].payload.elementText?.toLowerCase().includes('select') ||
+                                          steps[i - 1].payload.selector?.toLowerCase().includes('promotion type'));
+          
+          const shouldInclude = hasSnapshot || hasDecisionSpace || isLikelyDropdown || isAfterDropdownTrigger;
+          
+          console.log(`[VariableDetector] CLICK step ${i} inclusion check:`, {
+            hasSnapshot,
+            hasDecisionSpace,
+            isLikelyDropdown,
+            isAfterDropdownTrigger,
+            elementRole: payload.elementRole,
+            selector: payload.selector?.substring(0, 100),
+            willInclude: shouldInclude,
+          });
+          
+          if (shouldInclude) {
+            console.log(`[VariableDetector] ✅ Including CLICK step ${i}: hasSnapshot=${hasSnapshot}, hasDecisionSpace=${hasDecisionSpace}, isLikelyDropdown=${isLikelyDropdown}, isAfterDropdownTrigger=${isAfterDropdownTrigger}`);
+            result.push(this.createStepForAnalysis(i, step, steps));
+          } else {
+            console.log(`[VariableDetector] ❌ Skipping CLICK step ${i}: no snapshot, no decisionSpace, and not a dropdown`);
+          }
+        } else {
+          console.log(`[VariableDetector] ❌ Skipping CLICK step ${i}: not a selectable option (likely navigation)`);
         }
         // Skip navigation clicks
       }
@@ -271,19 +356,66 @@ export class VariableDetector {
     }
 
     // Get "after" snapshot from current step
-    const afterSnapshot = payload.visualSnapshot?.viewport || 
-                          payload.visualSnapshot?.elementSnippet;
+    // For dropdowns without snapshots, try to use the previous step's snapshot (dropdown trigger)
+    let afterSnapshot = payload.visualSnapshot?.viewport || 
+                        payload.visualSnapshot?.elementSnippet;
+    
+    // If no snapshot, try to use previous step's snapshot (for dropdowns or INPUT steps)
+    if (!afterSnapshot && (step.type === 'CLICK' || step.type === 'INPUT')) {
+      if (stepIndex > 0) {
+        const prevStep = allSteps[stepIndex - 1];
+        afterSnapshot = prevStep.payload.visualSnapshot?.viewport || 
+                       prevStep.payload.visualSnapshot?.elementSnippet;
+        if (afterSnapshot) {
+          console.log(`[VariableDetector] Using previous step's snapshot for ${step.type} step ${stepIndex}`);
+        }
+      }
+    }
 
     // Check if this is a dropdown and extract options
     const isDropdown = this.isDropdownStep(payload);
-    const dropdownOptions = isDropdown ? this.extractDropdownOptions(payload) : undefined;
+    let dropdownOptions = isDropdown ? this.extractDropdownOptions(payload) : undefined;
+    
+    // Log decisionSpace data for debugging
+    if (step.type === 'CLICK') {
+      console.log(`[VariableDetector] CLICK step ${stepIndex} decisionSpace check:`, {
+        hasDecisionSpace: !!payload.context?.decisionSpace,
+        decisionSpaceType: payload.context?.decisionSpace?.type,
+        decisionSpaceOptions: payload.context?.decisionSpace?.options,
+        decisionSpaceOptionsLength: payload.context?.decisionSpace?.options?.length || 0,
+        selectedText: payload.context?.decisionSpace?.selectedText,
+      });
+    }
+    
+    // If no options extracted but we have decisionSpace, use those options
+    if (isDropdown && (!dropdownOptions || dropdownOptions.length === 0)) {
+      if (payload.context?.decisionSpace?.options && Array.isArray(payload.context.decisionSpace.options)) {
+        dropdownOptions = payload.context.decisionSpace.options;
+        console.log(`[VariableDetector] ✅ Using decisionSpace options for dropdown step ${stepIndex}:`, dropdownOptions);
+      } else {
+        console.log(`[VariableDetector] ⚠️ Dropdown step ${stepIndex} has no options extracted and no decisionSpace data`);
+      }
+    }
+
+    // Extract value - try multiple sources
+    let extractedValue = payload.value || payload.context?.decisionSpace?.selectedText;
+    
+    // For dropdown options without value, try to extract from selector
+    // Example: //*[@role='option'][contains(normalize-space(.), 'BOGO')] -> extract "BOGO"
+    if (!extractedValue && isDropdown && payload.selector) {
+      const valueMatch = payload.selector.match(/contains\([^,]+,\s*['"]([^'"]+)['"]\)/);
+      if (valueMatch && valueMatch[1]) {
+        extractedValue = valueMatch[1];
+        console.log(`[VariableDetector] Extracted value from selector for step ${stepIndex}: "${extractedValue}"`);
+      }
+    }
 
     // Extract metadata
     const metadata: StepMetadata = {
       stepIndex,
       stepId: `${payload.timestamp}`,
       stepType: step.type as 'INPUT' | 'CLICK' | 'SELECT' | 'KEYBOARD',
-      value: payload.value,
+      value: extractedValue,
       label: payload.label,
       inputType: payload.inputDetails?.type,
       elementRole: payload.elementRole,
@@ -292,7 +424,20 @@ export class VariableDetector {
       isSelectableOption: step.type === 'CLICK' ? this.isSelectableOption(payload) : undefined,
       isDropdown,
       dropdownOptions,
+      selector: payload.selector, // Include selector for Edge Function to detect dropdowns
     };
+    
+    // Log metadata for dropdown CLICK steps
+    if (step.type === 'CLICK' && isDropdown) {
+      console.log(`[VariableDetector] Dropdown CLICK step ${stepIndex} metadata:`, {
+        isDropdown,
+        hasDropdownOptions: !!dropdownOptions,
+        dropdownOptionsCount: dropdownOptions?.length || 0,
+        value: metadata.value,
+        label: metadata.label,
+        hasDecisionSpace: !!payload.context?.decisionSpace,
+      });
+    }
 
     return {
       metadata,
@@ -339,7 +484,17 @@ export class VariableDetector {
 
     // Check if element role suggests dropdown
     const role = (payload.elementRole || '').toLowerCase();
-    if (role === 'combobox' || role === 'listbox') {
+    if (role === 'combobox' || role === 'listbox' || role === 'option') {
+      return true;
+    }
+
+    // Check if selector contains role="option" or role='option' (dropdown option)
+    const selector = (payload.selector || '').toLowerCase();
+    if (selector.includes('role="option"') || 
+        selector.includes("role='option'") ||
+        selector.includes('[role="option"]') ||
+        selector.includes("[role='option']") ||
+        selector.includes('listbox')) {
       return true;
     }
 
@@ -383,6 +538,9 @@ export class VariableDetector {
       pageContext,
     };
 
+    console.log(`[VariableDetector] Calling Edge Function: ${url}`);
+    console.log(`[VariableDetector] Sending ${stepsForAnalysis.length} steps for analysis`);
+    
     const response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -394,10 +552,18 @@ export class VariableDetector {
 
     if (!response.ok) {
       const errorText = await response.text();
+      console.error(`[VariableDetector] Edge Function error ${response.status}:`, errorText);
       throw new Error(`Edge Function error: ${response.status} - ${errorText}`);
     }
 
-    return await response.json();
+    const result = await response.json();
+    console.log(`[VariableDetector] Edge Function response received:`, {
+      variablesCount: result.variables?.length || 0,
+      analysisCount: result.analysisCount || 0,
+      hasError: !!result.error,
+    });
+    
+    return result;
   }
 
   /**

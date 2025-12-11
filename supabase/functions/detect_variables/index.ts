@@ -80,8 +80,12 @@ serve(async (req) => {
     const payload: DetectVariablesRequest = await req.json();
 
     if (!GEMINI_API_KEY) {
+      console.error('[detect_variables] GEMINI_API_KEY is not set in environment variables');
       throw new Error('GEMINI_API_KEY not configured');
     }
+    
+    // Log API key status (first 10 chars only for security)
+    console.log(`[detect_variables] GEMINI_API_KEY is set: ${GEMINI_API_KEY.substring(0, 10)}...`);
 
     if (!payload.steps || payload.steps.length === 0) {
       return new Response(JSON.stringify({ variables: [], analysisCount: 0 }), {
@@ -117,8 +121,72 @@ serve(async (req) => {
     let analysisCount = 0;
 
     for (const step of payload.steps) {
-      // Skip steps without snapshots
-      if (!step.afterSnapshot) {
+      // For INPUT steps, we can analyze even without snapshots (value is what matters)
+      // For CLICK steps (dropdowns), we need at least a snapshot, value, or dropdown options
+      const isInputStep = step.metadata.stepType === 'INPUT' || step.metadata.stepType === 'KEYBOARD';
+      const isClickStep = step.metadata.stepType === 'CLICK';
+      const isDropdown = step.metadata.isDropdown;
+      const hasSnapshot = !!step.afterSnapshot || !!step.beforeSnapshot;
+      const hasValue = !!step.metadata.value;
+      const hasDropdownOptions = isDropdown && step.metadata.dropdownOptions && step.metadata.dropdownOptions.length > 0;
+      
+      console.log(`[detect_variables] Processing step ${step.metadata.stepIndex}:`, {
+        stepType: step.metadata.stepType,
+        isDropdown,
+        hasSnapshot,
+        hasValue,
+        hasDropdownOptions,
+        value: step.metadata.value,
+        label: step.metadata.label,
+        dropdownOptions: step.metadata.dropdownOptions,
+      });
+      
+      // For INPUT steps, require at least a value
+      if (isInputStep && !hasValue) {
+        console.log(`[detect_variables] Skipping INPUT step ${step.metadata.stepIndex}: no value`);
+        continue;
+      }
+      
+      // For CLICK steps (dropdowns), require at least: snapshot, value, or dropdown options
+      if (isClickStep) {
+        // Check if this looks like a dropdown option (even if not explicitly marked)
+        const selector = step.metadata.selector || '';
+        const looksLikeDropdown = isDropdown || 
+                                  step.metadata.elementRole === 'option' ||
+                                  selector.includes('role="option"') || 
+                                  selector.includes("role='option'") ||
+                                  selector.includes('[role="option"]') ||
+                                  selector.includes("[role='option']") ||
+                                  selector.includes('listbox');
+        
+        console.log(`[detect_variables] CLICK step ${step.metadata.stepIndex} dropdown check:`, {
+          isDropdown,
+          elementRole: step.metadata.elementRole,
+          selector: selector.substring(0, 100),
+          looksLikeDropdown,
+          hasSnapshot,
+          hasValue,
+          hasDropdownOptions,
+          label: step.metadata.label,
+        });
+        
+        if (looksLikeDropdown) {
+          // It's a dropdown - analyze if we have ANY data (snapshot, value, options, or even just a label)
+          if (hasSnapshot || hasValue || hasDropdownOptions || step.metadata.label) {
+            console.log(`[detect_variables] ✅ Including dropdown CLICK step ${step.metadata.stepIndex}`);
+          } else {
+            console.log(`[detect_variables] ⚠️ Dropdown CLICK step ${step.metadata.stepIndex} has no data, but including anyway for AI analysis`);
+          }
+        } else {
+          // Not a dropdown, skip (navigation clicks are filtered out client-side)
+          console.log(`[detect_variables] ❌ Skipping non-dropdown CLICK step ${step.metadata.stepIndex}`);
+          continue;
+        }
+      }
+      
+      // Skip if no snapshot AND no value AND not a dropdown with options
+      if (!isInputStep && !isDropdown && !hasSnapshot && !hasValue) {
+        console.log(`[detect_variables] Skipping step ${step.metadata.stepIndex}: no snapshot and no value`);
         continue;
       }
 
@@ -127,8 +195,23 @@ serve(async (req) => {
       // Analyze this step
       const result = await analyzeStep(step, payload.pageContext);
       
+      console.log(`[detect_variables] Step ${step.metadata.stepIndex} analysis result:`, {
+        hasResult: !!result,
+        isVariable: result?.isVariable,
+        confidence: result?.confidence,
+        fieldName: result?.fieldName,
+        reasoning: result?.reasoning,
+      });
+      
       if (result && result.isVariable) {
+        console.log(`[detect_variables] ✅ Adding variable for step ${step.metadata.stepIndex}: ${result.fieldName}`);
         variables.push(result);
+      } else {
+        console.log(`[detect_variables] ❌ Not adding step ${step.metadata.stepIndex} as variable:`, {
+          hasResult: !!result,
+          isVariable: result?.isVariable,
+          confidence: result?.confidence,
+        });
       }
     }
 
@@ -174,8 +257,8 @@ async function analyzeStep(
 ): Promise<VariableDefinition | null> {
   const { metadata, beforeSnapshot, afterSnapshot } = step;
 
-  // Build the prompt based on step type
-  const prompt = buildVariableDetectionPrompt(metadata, pageContext);
+  // Build the prompt based on step type (pass snapshots for context-aware prompts)
+  const prompt = buildVariableDetectionPrompt(metadata, pageContext, beforeSnapshot, afterSnapshot);
 
   // Build Gemini API request with screenshots
   const parts: any[] = [{ text: prompt }];
@@ -194,7 +277,8 @@ async function analyzeStep(
     });
   }
 
-  // Add after snapshot (required)
+  // Add after snapshot if available
+  // For INPUT steps without snapshots, we can still analyze using the value and metadata
   if (afterSnapshot) {
     const afterBase64 = extractBase64Data(afterSnapshot);
     parts.push({
@@ -206,6 +290,19 @@ async function analyzeStep(
         data: afterBase64
       }
     });
+  } else if (metadata.stepType === 'INPUT' || metadata.stepType === 'KEYBOARD') {
+    // For INPUT steps without snapshots, add a note in the prompt
+    parts[0] = { 
+      text: prompt + '\n\nNOTE: No screenshot available for this input field, but the value entered is: "' + (metadata.value || '') + '". Analyze based on the value, field label, and input type.'
+    };
+  } else if (metadata.stepType === 'CLICK' && metadata.isDropdown) {
+    // For DROPDOWN CLICK steps without snapshots, add a note with available options
+    const optionsNote = metadata.dropdownOptions && metadata.dropdownOptions.length > 0
+      ? `\n\nNOTE: No screenshot available, but you have the dropdown options from the DOM: ${metadata.dropdownOptions.join(', ')}. The selected option is: "${metadata.value || 'unknown'}". Analyze based on the dropdown label, available options, and selected value.`
+      : `\n\nNOTE: No screenshot available. Analyze based on the dropdown label "${metadata.label || 'dropdown'}" and selected value "${metadata.value || 'unknown'}".`;
+    parts[0] = { 
+      text: prompt + optionsNote
+    };
   }
 
   const geminiRequest = {
@@ -230,14 +327,56 @@ async function analyzeStep(
 
     if (!geminiResponse.ok) {
       const errorText = await geminiResponse.text();
-      console.error(`Gemini API error for step ${metadata.stepIndex}:`, errorText);
+      console.error(`[detect_variables] Gemini API error for step ${metadata.stepIndex}:`, errorText);
+      // Don't return null immediately - check fallback first
+      const fallbackResult = checkFallbackHeuristic(metadata);
+      if (fallbackResult) {
+        console.log(`[detect_variables] ✅ Using fallback due to API error for step ${metadata.stepIndex}`);
+        return fallbackResult;
+      }
       return null;
     }
 
     const geminiData = await geminiResponse.json();
-    return parseVariableResponse(geminiData, metadata);
+    const result = parseVariableResponse(geminiData, metadata);
+    
+    console.log(`[detect_variables] After parsing, result for step ${metadata.stepIndex}:`, {
+      hasResult: !!result,
+      isVariable: result?.isVariable,
+      confidence: result?.confidence,
+      value: metadata.value,
+      label: metadata.label,
+      stepType: metadata.stepType,
+    });
+    
+    // Use fallback ONLY if AI completely failed (returned null or error)
+    // If AI returned a result (even if isVariable: false), trust the AI
+    if (!result) {
+      // AI failed completely - use fallback as backup
+      const fallbackResult = checkFallbackHeuristic(metadata);
+      if (fallbackResult) {
+        console.log(`[detect_variables] ✅ Using fallback (AI failed) for step ${metadata.stepIndex}: ${fallbackResult.fieldName}`);
+        return fallbackResult;
+      }
+      return null;
+    }
+    
+    // AI returned a result - trust it
+    if (result.isVariable) {
+      console.log(`[detect_variables] ✅ AI detected variable for step ${metadata.stepIndex}: ${result.fieldName} (confidence: ${result.confidence})`);
+    } else {
+      console.log(`[detect_variables] AI determined step ${metadata.stepIndex} is NOT a variable: ${result.reasoning || 'no reasoning provided'}`);
+    }
+    
+    return result;
   } catch (error) {
-    console.error(`Error analyzing step ${metadata.stepIndex}:`, error);
+    console.error(`[detect_variables] Exception analyzing step ${metadata.stepIndex}:`, error);
+    // Only use fallback if there's an exception (AI completely failed)
+    const fallbackResult = checkFallbackHeuristic(metadata);
+    if (fallbackResult) {
+      console.log(`[detect_variables] ✅ Using fallback due to exception for step ${metadata.stepIndex}: ${fallbackResult.fieldName}`);
+      return fallbackResult;
+    }
     return null;
   }
 }
@@ -247,9 +386,23 @@ async function analyzeStep(
  */
 function buildVariableDetectionPrompt(
   metadata: StepMetadata,
-  pageContext?: { url: string; title: string; pageType?: string }
+  pageContext?: { url: string; title: string; pageType?: string },
+  beforeSnapshot?: string,
+  afterSnapshot?: string
 ): string {
-  let prompt = `TASK: Analyze this workflow step to determine if the user-entered value should be a VARIABLE (parameterized, different each execution) or STATIC (same value each time).
+  let prompt = `PRODUCT CONTEXT:
+You are analyzing steps from a browser automation tool called "GhostWriter" (also known as Autoflow). 
+This tool allows users to record repetitive browser tasks (like filling forms, creating promotions, processing orders) 
+and then execute them multiple times with different input values. 
+
+The goal is to identify which values the user typed should be "variables" - meaning they can be changed 
+each time the workflow runs. For example, if a user records filling a form with "Budget Amount: 1000", 
+they should be able to run the workflow again with "Budget Amount: 2000" or any other amount.
+
+VARIABLES = Values that users would want to change each execution (amounts, names, dates, selections)
+STATIC = Values that should stay the same every time (system IDs, fixed configurations, navigation)
+
+TASK: Analyze this workflow step to determine if the user-entered value should be a VARIABLE (parameterized, different each execution) or STATIC (same value each time).
 
 `;
 
@@ -274,46 +427,108 @@ ${metadata.elementTag ? `- Element Tag: ${metadata.elementTag}` : ''}
 `;
 
   if (metadata.stepType === 'INPUT' || metadata.stepType === 'KEYBOARD') {
-    prompt += `ANALYZE THIS INPUT FIELD:
+    prompt += `ANALYZE THIS INPUT FIELD USING VISUAL CONTEXT:
 
-Compare the before/after screenshots (if provided) to understand what the user entered.
+${beforeSnapshot && afterSnapshot 
+  ? 'You have BEFORE and AFTER screenshots. Compare them to see what changed visually.' 
+  : afterSnapshot 
+    ? 'You have a screenshot showing the field AFTER the user typed. Analyze the visual context.' 
+    : beforeSnapshot
+      ? 'You have a screenshot showing the field BEFORE the user typed. Use this for context.' 
+      : 'No screenshot available - analyze based on metadata only.'}
 
-A value is likely a VARIABLE if:
-- It's user-specific data (name, email, phone, address)
-- It's a credential (username, password)
-- It's a date that would change (appointment date, deadline)
-- It's a search query or filter value
-- It's a unique identifier (ID, code, reference number)
-- The field is empty before and filled after with user-entered text
+CRITICAL: Use the SCREENSHOT to understand:
+1. **What field is this?** Look for:
+   - Field labels visible in the screenshot (text above, beside, or inside the field)
+   - Placeholder text visible in the field
+   - Surrounding context (form section, nearby fields, page layout)
+   - Field position and visual styling
 
-A value is likely STATIC if:
-- It's a system default or placeholder
-- It's a fixed configuration value
-- It looks like test/demo data that wouldn't change
-- It's pre-filled by the system
+2. **What did the user type?** Look for:
+   - The text/value visible in the input field in the screenshot
+   - Compare before/after to see what changed
+   - The visual appearance of the entered value
+
+3. **Field context from screenshot:**
+   - What form is this part of? (registration, payment, search, etc.)
+   - What other fields are nearby? (helps understand the field's purpose)
+   - Visual indicators (required field markers, icons, etc.)
+
+METADATA (use as backup if not visible in screenshot):
+VALUE ENTERED: "${metadata.value || ''}"
+${metadata.label ? `FIELD LABEL: "${metadata.label}"` : ''}
+${metadata.inputType ? `INPUT TYPE: ${metadata.inputType}` : ''}
+${metadata.placeholder ? `PLACEHOLDER: "${metadata.placeholder}"` : ''}
+
+A value is DEFINITELY a VARIABLE if:
+- The field label contains ANY of these words: "Amount", "Budget", "Price", "Cost", "Quantity", "Number", "Percentage", "Rate", "Fee", "Total", "Value", "Count"
+- The field label contains ANY of these words: "Name", "Email", "Phone", "Address", "City", "State", "Zip", "Country", "Company", "Title"
+- The field label contains ANY of these words: "Date", "Time", "Start", "End", "Duration", "Period"
+- The value is a NUMBER (like "1000", "100", "50", etc.) in ANY input field - numbers are almost always variables
+- The screenshot shows the user typed a value that looks like personal/user data
+- The screenshot context suggests this is a form field for user-entered data
+- The field appears in a form where users would enter different values each time
+
+EXAMPLES OF VARIABLES (mark as isVariable: true, confidence: 0.8+):
+- "1000" in a field labeled "Budget Amount" → VARIABLE (confidence: 0.9)
+- "100" in a field labeled "Restaurant Funding Percentage" → VARIABLE (confidence: 0.9)
+- "50" in a field labeled "Quantity" → VARIABLE (confidence: 0.9)
+- Any number in any amount/budget/price field → VARIABLE (confidence: 0.8+)
+- Email addresses, names, addresses → VARIABLE (confidence: 0.9+)
+- Dates, times → VARIABLE (confidence: 0.8+)
+
+A value is STATIC (NOT a variable) ONLY if:
+- The screenshot clearly shows it's a system-generated ID (like "ID: 12345" or "UUID: abc-123")
+- The screenshot shows it's a fixed system configuration that never changes
+- The field is clearly a read-only system field (not an input field)
+- The value is clearly a system constant (like "Version: 2.0" or "Status: Active")
+
+CRITICAL RULES:
+1. **NUMBERS ARE ALMOST ALWAYS VARIABLES** - If you see a number in an input field, it's almost certainly a variable (confidence: 0.8+)
+2. **When in doubt, mark it as a VARIABLE** - It's better to detect too many variables than too few
+3. **Field labels with "Amount", "Budget", "Price", "Percentage" = VARIABLE** (confidence: 0.9+)
+4. **User-typed values in form fields = VARIABLE** (confidence: 0.8+)
 
 `;
   } else if (metadata.stepType === 'CLICK' && metadata.isSelectableOption) {
     if (metadata.isDropdown) {
       prompt += `ANALYZE THIS DROPDOWN SELECTION:
 
-This is a click on a dropdown/select menu option.
-Compare the before/after screenshots to see what option was selected.
+This is a click on a dropdown/select menu option where the user selected a choice from multiple available options.
 
 ${metadata.dropdownOptions && metadata.dropdownOptions.length > 0 
-  ? `KNOWN OPTIONS FROM DOM: ${metadata.dropdownOptions.join(', ')}\n\n` 
-  : 'EXTRACT ALL AVAILABLE OPTIONS: Look at the dropdown menu in the screenshot and list ALL available options.\n\n'}
+  ? `AVAILABLE OPTIONS IN THIS DROPDOWN: ${metadata.dropdownOptions.join(', ')}\n` 
+  : ''}
+${metadata.value ? `SELECTED OPTION: "${metadata.value}"\n` : ''}
+${metadata.label ? `DROPDOWN LABEL/FIELD NAME: "${metadata.label}"\n` : ''}
 
-A selection is likely a VARIABLE if:
-- It's a user preference that could change (e.g., "Select Plan: Pro")
-- It's a category selection that varies per use case
-- It's a filter or sort option
-- The selection represents user choice rather than navigation
+${beforeSnapshot && afterSnapshot 
+  ? 'You have BEFORE and AFTER screenshots. Compare them to see what option was selected and what changed visually.' 
+  : afterSnapshot 
+    ? 'You have a screenshot showing the dropdown AFTER selection. Analyze the visual context.' 
+    : metadata.dropdownOptions && metadata.dropdownOptions.length > 0
+      ? 'No screenshot available, but you have the list of available options from the DOM. Use this to understand the dropdown.'
+      : 'No screenshot available. Analyze based on metadata only.'}
 
-A selection is likely STATIC if:
-- It's a navigation button (Next, Submit, Continue)
-- It's a fixed system setting
-- It's enabling/disabling a feature that's always the same
+CRITICAL RULES FOR DROPDOWNS:
+1. **DROPDOWNS ARE ALMOST ALWAYS VARIABLES** - Users select different options each time they run the workflow
+2. **If the dropdown has 3+ options, it's DEFINITELY a VARIABLE** (confidence: 0.95+)
+3. **If the dropdown label contains words like "Select", "Choose", "Type", "Category", "Plan", "Reason" = VARIABLE** (confidence: 0.9+)
+4. **Only mark as STATIC if it's clearly a navigation button or system toggle**
+
+EXAMPLES OF DROPDOWN VARIABLES (mark as isVariable: true, confidence: 0.9+):
+- "BOGO" selected from "Select Promotion Type" dropdown with options [BOGO, FLAT, FREE DELIVERY, ...] → VARIABLE (confidence: 0.95)
+- "UberEats Growth" selected from "Reason for Uber spend" dropdown → VARIABLE (confidence: 0.9)
+- Any dropdown where user chooses from multiple options → VARIABLE (confidence: 0.9+)
+
+A selection is STATIC (NOT a variable) ONLY if:
+- The screenshot clearly shows it's a navigation button (Next, Submit, Continue)
+- The screenshot shows it's a fixed system setting that never changes
+- The dropdown has only 1-2 options and they're clearly system constants (like "Yes/No" for a system toggle)
+
+${metadata.dropdownOptions && metadata.dropdownOptions.length > 0 
+  ? `\nIMPORTANT: This dropdown has ${metadata.dropdownOptions.length} options. This is a clear indicator it's a VARIABLE.\n` 
+  : ''}
 
 `;
     } else {
@@ -337,23 +552,46 @@ A selection is likely STATIC if:
     }
   }
 
-  prompt += `RESPOND WITH JSON:
+  if (metadata.isDropdown) {
+    prompt += `RESPOND WITH JSON:
 {
   "isVariable": <true or false>,
   "confidence": <0.0 to 1.0>,
   "fieldName": "<human-readable field name from visual analysis>",
   "variableName": "<camelCase variable name suggestion>",
-  "reasoning": "<brief explanation of why this is/isn't a variable>"${metadata.isDropdown ? ',
-  "options": ["<option1>", "<option2>", ...] // ALL available dropdown options from the screenshot' : ''}
+  "reasoning": "<brief explanation of why this is/isn't a variable>",
+  "options": ["<option1>", "<option2>", ...]
+}
+
+CRITICAL INSTRUCTIONS:
+- **NUMBERS IN INPUT FIELDS ARE ALMOST ALWAYS VARIABLES** - Use confidence 0.8+ for numbers
+- **Field labels with "Amount", "Budget", "Price", "Percentage" = VARIABLE** - Use confidence 0.9+
+- **DROPDOWNS WITH MULTIPLE OPTIONS ARE ALMOST ALWAYS VARIABLES** - Use confidence 0.9+ for dropdowns
+- **When in doubt, mark as VARIABLE** - It's better to detect too many than too few
+- Higher confidence (0.8-1.0) for: numbers, amounts, budgets, prices, percentages, emails, names, dates, dropdowns
+- Medium confidence (0.6-0.8) for: other user-entered text fields
+- **DO NOT be overly conservative** - If it's something a user typed or selected, it's likely a variable
+- **Default to VARIABLE for any user-entered data or selections** unless clearly a system constant
+- For dropdowns: Extract ALL visible options from the dropdown menu in the screenshot
+- Include the currently selected option in the options array
+`;
+  } else {
+    prompt += `RESPOND WITH JSON:
+{
+  "isVariable": <true or false>,
+  "confidence": <0.0 to 1.0>,
+  "fieldName": "<human-readable field name from visual analysis>",
+  "variableName": "<camelCase variable name suggestion>",
+  "reasoning": "<brief explanation of why this is/isn't a variable>"
 }
 
 IMPORTANT:
 - Focus on what a human would recognize as "user data" vs "system data"
 - Higher confidence (0.8+) for clear cases like email, password, name fields
 - Medium confidence (0.5-0.8) for ambiguous cases
-- Lower confidence (<0.5) if unsure - lean toward NOT marking as variable${metadata.isDropdown ? `
-- For dropdowns: Extract ALL visible options from the dropdown menu in the screenshot
-- Include the currently selected option in the options array' : ''}`;
+- Lower confidence (<0.5) if unsure - lean toward NOT marking as variable
+`;
+  }
 
   return prompt;
 }
@@ -368,17 +606,269 @@ function parseVariableResponse(
   try {
     const text = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
     
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      console.error('No JSON found in Gemini response for step', metadata.stepIndex);
+    // Log raw response for debugging
+    console.log(`[detect_variables] Raw Gemini response for step ${metadata.stepIndex} (first 500 chars):`, text.substring(0, 500));
+    
+    // Try to extract JSON from markdown code blocks first
+    let jsonText = '';
+    
+    // First, try to find content between ``` markers (handles incomplete blocks too)
+    const codeBlockStart = text.indexOf('```');
+    if (codeBlockStart !== -1) {
+      // Find the content after ```json or ```
+      const afterStart = text.substring(codeBlockStart + 3);
+      const jsonStart = afterStart.match(/^(?:json)?\s*\n?(\{)/);
+      if (jsonStart) {
+        // Extract everything from the opening { to the end
+        const startIdx = jsonStart.index! + jsonStart[0].length - 1;
+        let extracted = afterStart.substring(startIdx);
+        
+        // Try to find a complete JSON object first
+        let braceCount = 0;
+        let jsonEnd = -1;
+        let inString = false;
+        let escapeNext = false;
+        
+        for (let i = 0; i < extracted.length; i++) {
+          const char = extracted[i];
+          
+          if (escapeNext) {
+            escapeNext = false;
+            continue;
+          }
+          
+          if (char === '\\') {
+            escapeNext = true;
+            continue;
+          }
+          
+          if (char === '"' && !escapeNext) {
+            inString = !inString;
+            continue;
+          }
+          
+          if (!inString) {
+            if (char === '{') braceCount++;
+            if (char === '}') {
+              braceCount--;
+              if (braceCount === 0) {
+                jsonEnd = i + 1;
+                break;
+              }
+            }
+          }
+        }
+        
+        if (jsonEnd > 0) {
+          // Found complete JSON
+          jsonText = extracted.substring(0, jsonEnd);
+          console.log(`[detect_variables] Found complete JSON in code block for step ${metadata.stepIndex}`);
+        } else {
+          // JSON is incomplete - try to fix it
+          console.log(`[detect_variables] JSON appears incomplete, attempting to fix for step ${metadata.stepIndex}`);
+          
+          // Find the last complete property (ending with , or })
+          // Look for patterns like: "key": value, or "key": value}
+          const lastCommaMatch = extracted.match(/,\s*"[^"]*":\s*"[^"]*$/);
+          const lastCompletePropMatch = extracted.match(/,\s*"[^"]*":\s*[^,}]+$/);
+          
+          if (lastCommaMatch || lastCompletePropMatch) {
+            // Find the position of the last comma before an incomplete property
+            let lastCommaIdx = -1;
+            inString = false;
+            escapeNext = false;
+            
+            for (let i = extracted.length - 1; i >= 0; i--) {
+              const char = extracted[i];
+              
+              if (escapeNext) {
+                escapeNext = false;
+                continue;
+              }
+              
+              if (char === '\\') {
+                escapeNext = true;
+                continue;
+              }
+              
+              if (char === '"' && !escapeNext) {
+                inString = !inString;
+                continue;
+              }
+              
+              if (!inString && char === ',') {
+                // Check if this comma is followed by an incomplete property
+                const afterComma = extracted.substring(i + 1).trim();
+                if (afterComma.match(/^"[^"]*":\s*"[^"]*$/)) {
+                  // This is an incomplete property, use everything before this comma
+                  lastCommaIdx = i;
+                  break;
+                }
+              }
+            }
+            
+            if (lastCommaIdx > 0) {
+              jsonText = extracted.substring(0, lastCommaIdx) + '}';
+              console.log(`[detect_variables] Fixed incomplete JSON by removing last property for step ${metadata.stepIndex}`);
+            } else {
+              // Try to find the last complete property by looking for the pattern "key": value,
+              const completeMatch = extracted.match(/^(.+),\s*"[^"]*":\s*"[^"]*$/);
+              if (completeMatch) {
+                jsonText = completeMatch[1] + '}';
+                console.log(`[detect_variables] Fixed incomplete JSON by removing incomplete property for step ${metadata.stepIndex}`);
+              } else {
+                // Last resort: just close the object
+                jsonText = extracted.trim();
+                // Remove any incomplete property at the end
+                // Handle cases like: ", "} or ", "variableName": " or ", "variableName": "
+                // First, handle the specific case of trailing ", "} (comma, space, quote, closing brace)
+                if (jsonText.endsWith(', "}')) {
+                  jsonText = jsonText.replace(/,\s*"\s*}$/, '}');
+                } else if (jsonText.match(/,\s*"[^"]*":\s*"[^"]*"\s*}$/)) {
+                  // Handle case like: ", "variableName": "value" }
+                  jsonText = jsonText.replace(/,\s*"[^"]*":\s*"[^"]*"\s*}$/, '}');
+                } else {
+                  // Try to find and remove the last incomplete property
+                  // The incomplete property is the one that extends to the end without a closing quote
+                  // We need to find the LAST comma that's followed by an incomplete property
+                  // Pattern: , "key": "value (no closing quote, extends to end)
+                  
+                  // First, try to find all commas and check which one starts an incomplete property
+                  let lastIncompleteCommaIdx = -1;
+                  let lastIncompletePropName = '';
+                  
+                  // Find all commas, then check backwards from the end
+                  for (let i = jsonText.length - 1; i >= 0; i--) {
+                    if (jsonText[i] === ',') {
+                      // Check if this comma starts an incomplete property
+                      const afterComma = jsonText.substring(i).trim();
+                      const propMatch = afterComma.match(/^,\s*"([^"]+)":\s*"([\s\S]*)$/);
+                      if (propMatch) {
+                        lastIncompleteCommaIdx = i;
+                        lastIncompletePropName = propMatch[1];
+                        break;
+                      }
+                    }
+                  }
+                  
+                  if (lastIncompleteCommaIdx >= 0) {
+                    // Remove the incomplete property (everything from the comma to the end)
+                    jsonText = jsonText.substring(0, lastIncompleteCommaIdx) + '}';
+                    console.log(`[detect_variables] Removed incomplete property "${lastIncompletePropName}" for step ${metadata.stepIndex}`);
+                  } else {
+                    // Try other patterns
+                    jsonText = jsonText.replace(/,\s*"[^"]*":\s*"[^"]*"\s*$/, ''); // Remove incomplete property with complete string but trailing
+                    jsonText = jsonText.replace(/,\s*"[^"]*":\s*$/, ''); // Remove incomplete property key
+                    jsonText = jsonText.replace(/,\s*"[^"]*"\s*$/, ''); // Remove incomplete string value
+                    jsonText = jsonText.replace(/,\s*"[^"]*$/, ''); // Remove incomplete string
+                    jsonText = jsonText.replace(/,\s*"$/, ''); // Remove trailing comma and quote
+                    jsonText = jsonText.replace(/,\s*$/, ''); // Remove trailing comma
+                    if (!jsonText.endsWith('}')) {
+                      jsonText += '}';
+                    }
+                  }
+                }
+                console.log(`[detect_variables] Fixed incomplete JSON by closing object for step ${metadata.stepIndex}`);
+              }
+            }
+          } else {
+            // No clear pattern, try to close it
+            jsonText = extracted.trim();
+            // Remove trailing incomplete string or property
+            // Handle cases like: ", "} or ", "variableName": " or ", "variableName": "
+            // First, handle the specific case of trailing ", "} (comma, space, quote, closing brace)
+            if (jsonText.endsWith(', "}')) {
+              jsonText = jsonText.replace(/,\s*"\s*}$/, '}');
+            } else if (jsonText.match(/,\s*"[^"]*":\s*"[^"]*"\s*}$/)) {
+              // Handle case like: ", "variableName": "value" }
+              jsonText = jsonText.replace(/,\s*"[^"]*":\s*"[^"]*"\s*}$/, '}');
+            } else {
+              // Try to find and remove the last incomplete property
+              // The incomplete property is the one that extends to the end without a closing quote
+              // We need to find the LAST comma that's followed by an incomplete property
+              
+              // Find all commas, then check backwards from the end
+              let lastIncompleteCommaIdx = -1;
+              let lastIncompletePropName = '';
+              
+              for (let i = jsonText.length - 1; i >= 0; i--) {
+                if (jsonText[i] === ',') {
+                  // Check if this comma starts an incomplete property
+                  const afterComma = jsonText.substring(i).trim();
+                  const propMatch = afterComma.match(/^,\s*"([^"]+)":\s*"([\s\S]*)$/);
+                  if (propMatch) {
+                    lastIncompleteCommaIdx = i;
+                    lastIncompletePropName = propMatch[1];
+                    break;
+                  }
+                }
+              }
+              
+              if (lastIncompleteCommaIdx >= 0) {
+                // Remove the incomplete property (everything from the comma to the end)
+                jsonText = jsonText.substring(0, lastIncompleteCommaIdx) + '}';
+                console.log(`[detect_variables] Removed incomplete property "${lastIncompletePropName}" (fallback) for step ${metadata.stepIndex}`);
+              } else {
+                // Try other patterns
+                jsonText = jsonText.replace(/,\s*"[^"]*":\s*"[^"]*"\s*$/, ''); // Remove incomplete property with complete string but trailing
+                jsonText = jsonText.replace(/,\s*"[^"]*":\s*$/, ''); // Remove incomplete property key
+                jsonText = jsonText.replace(/,\s*"[^"]*"\s*$/, ''); // Remove incomplete string value
+                jsonText = jsonText.replace(/,\s*"[^"]*$/, ''); // Remove incomplete string
+                jsonText = jsonText.replace(/,\s*"$/, ''); // Remove trailing comma and quote
+                jsonText = jsonText.replace(/,\s*$/, ''); // Remove trailing comma
+                if (!jsonText.endsWith('}')) {
+                  jsonText += '}';
+                }
+              }
+            }
+            console.log(`[detect_variables] Fixed incomplete JSON by closing object (fallback) for step ${metadata.stepIndex}`);
+          }
+        }
+      }
+    }
+    
+    // If no code block match, try to find JSON object directly in text
+    if (!jsonText) {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        console.error(`[detect_variables] No JSON found in Gemini response for step ${metadata.stepIndex}`);
+        console.error(`[detect_variables] Full response text (first 1000 chars):`, text.substring(0, 1000));
+        return null;
+      }
+      jsonText = jsonMatch[0];
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonText);
+    } catch (parseError) {
+      console.error(`[detect_variables] Failed to parse JSON for step ${metadata.stepIndex}:`, parseError);
+      console.error(`[detect_variables] JSON text (first 500 chars):`, jsonText.substring(0, 500));
       return null;
     }
 
-    const parsed = JSON.parse(jsonMatch[0]);
+    // Log the AI response for debugging
+    console.log(`[detect_variables] Step ${metadata.stepIndex} AI response:`, {
+      isVariable: parsed.isVariable,
+      confidence: parsed.confidence,
+      fieldName: parsed.fieldName,
+      reasoning: parsed.reasoning,
+      value: metadata.value,
+      label: metadata.label,
+    });
 
-    // Only return if marked as variable
+    // Parse the response
     const isVariable = parsed.isVariable === true;
     const confidence = parseFloat(parsed.confidence) || 0;
+
+    console.log(`[detect_variables] Parsed AI response for step ${metadata.stepIndex}:`, {
+      parsedIsVariable: parsed.isVariable,
+      parsedConfidence: parsed.confidence,
+      isVariable,
+      confidence,
+      fieldName: parsed.fieldName,
+      reasoning: parsed.reasoning,
+    });
 
     const result: VariableDefinition = {
       stepIndex: metadata.stepIndex,
@@ -409,6 +899,107 @@ function parseVariableResponse(
     console.error('Error parsing variable response:', error);
     return null;
   }
+}
+
+/**
+ * Check fallback heuristic for variable detection
+ * Returns a VariableDefinition if heuristic matches, null otherwise
+ */
+function checkFallbackHeuristic(metadata: StepMetadata): VariableDefinition | null {
+  const isInputStep = metadata.stepType === 'INPUT' || metadata.stepType === 'KEYBOARD';
+  const isClickStep = metadata.stepType === 'CLICK';
+  const hasValue = !!metadata.value;
+  
+  // Handle INPUT steps
+  if (isInputStep && hasValue) {
+    const valueStr = String(metadata.value).trim();
+    const isNumber = /^\d+(\.\d+)?$/.test(valueStr);
+    const hasVariableKeyword = metadata.label && /(amount|budget|price|percentage|quantity|number|rate|fee|total|value|count|name|email|phone|address|date|time)/i.test(metadata.label);
+    const shouldBeVariable = isNumber || hasVariableKeyword;
+    
+    console.log(`[detect_variables] Fallback check for INPUT step ${metadata.stepIndex}:`, {
+      value: metadata.value,
+      valueStr,
+      isNumber,
+      hasVariableKeyword,
+      label: metadata.label,
+      shouldBeVariable,
+    });
+    
+    if (shouldBeVariable) {
+      return {
+        stepIndex: metadata.stepIndex,
+        stepId: metadata.stepId,
+        fieldName: metadata.label || 'Unknown Field',
+        fieldLabel: metadata.label,
+        variableName: generateVariableName(metadata.label || 'field'),
+        defaultValue: metadata.value || '',
+        inputType: metadata.inputType,
+        isVariable: true,
+        confidence: 0.85, // High confidence for fallback since it's a clear case
+        reasoning: isNumber 
+          ? `Detected via fallback heuristic: number "${metadata.value}" in input field "${metadata.label || 'field'}"`
+          : `Detected via fallback heuristic: variable keyword in label "${metadata.label}"`,
+      };
+    }
+  }
+  
+  // Handle CLICK steps (dropdowns)
+  // Check both metadata.isDropdown AND selector for role="option" patterns
+  const selector = metadata.selector || '';
+  const looksLikeDropdown = metadata.isDropdown || 
+                            selector.includes('role="option"') ||
+                            selector.includes("role='option'") ||
+                            selector.includes('[role="option"]') ||
+                            selector.includes("[role='option']") ||
+                            selector.includes('listbox');
+  
+  if (isClickStep && looksLikeDropdown) {
+    const hasOptions = metadata.dropdownOptions && metadata.dropdownOptions.length > 0;
+    const hasValue = !!metadata.value;
+    
+    console.log(`[detect_variables] Fallback check for DROPDOWN CLICK step ${metadata.stepIndex}:`, {
+      isDropdown: metadata.isDropdown,
+      looksLikeDropdown,
+      selector: selector.substring(0, 100),
+      hasOptions,
+      hasValue,
+      value: metadata.value,
+      label: metadata.label,
+      options: metadata.dropdownOptions,
+    });
+    
+    // Dropdowns are almost always variables (user selects different options)
+    // Even without value/options, if selector shows it's a dropdown option, mark as variable
+    if (hasValue || hasOptions || looksLikeDropdown) {
+      // Extract value from selector if available (e.g., "BOGO" from selector)
+      let defaultValue = metadata.value;
+      if (!defaultValue && selector) {
+        // Try to extract the option text from the selector (e.g., 'BOGO' from contains(..., 'BOGO'))
+        const valueMatch = selector.match(/contains\([^,]+,\s*['"]([^'"]+)['"]\)/);
+        if (valueMatch && valueMatch[1]) {
+          defaultValue = valueMatch[1];
+        }
+      }
+      
+      return {
+        stepIndex: metadata.stepIndex,
+        stepId: metadata.stepId,
+        fieldName: metadata.label || 'Dropdown Selection',
+        fieldLabel: metadata.label,
+        variableName: generateVariableName(metadata.label || 'dropdown'),
+        defaultValue: defaultValue || (hasOptions ? metadata.dropdownOptions![0] : ''),
+        inputType: metadata.inputType,
+        isVariable: true,
+        isDropdown: true,
+        options: metadata.dropdownOptions,
+        confidence: 0.9, // Very high confidence - dropdowns are almost always variables
+        reasoning: `Detected via fallback heuristic: dropdown selection (selector contains role="option")`,
+      };
+    }
+  }
+  
+  return null;
 }
 
 /**

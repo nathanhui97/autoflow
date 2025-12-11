@@ -89,6 +89,23 @@ npm run build
 npm run lint
 ```
 
+## 🔒 Security
+
+This project follows security best practices for API key management:
+
+- ✅ **No API keys in client-side code** - All Gemini API calls go through Supabase Edge Functions
+- ✅ **Server-side only** - API keys are stored in Supabase secrets, never in source code
+- ✅ **Never exposed to GitHub** - All API keys come from Supabase secrets, never committed
+- ✅ **Secure deployment** - Deployment scripts use environment variables, never hardcoded keys
+- ✅ **Git protection** - `.gitignore` configured to prevent accidental commits of secrets
+
+**Verify security before committing:**
+```bash
+./verify-security.sh
+```
+
+See [SECURITY_GUIDE.md](./SECURITY_GUIDE.md) for detailed security information and setup instructions.
+
 ## 📝 License
 
 Private project - All rights reserved

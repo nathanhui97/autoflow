@@ -58,6 +58,7 @@ function App() {
   const [learningFeedback, setLearningFeedback] = useState<string | null>(null);
   // Variable detection state
   const [isDetectingVariables, setIsDetectingVariables] = useState(false);
+  const [expandedVariables, setExpandedVariables] = useState<Set<string>>(new Set());
   const [currentWorkflowVariables, setCurrentWorkflowVariables] = useState<import('../lib/variable-detector').WorkflowVariables | null>(null);
   // Variable form modal state
   const [showVariableForm, setShowVariableForm] = useState(false);
@@ -133,6 +134,10 @@ function App() {
   // Debug: Log when currentWorkflowVariables changes
   useEffect(() => {
     console.log('[App] currentWorkflowVariables changed:', currentWorkflowVariables);
+    if (currentWorkflowVariables) {
+      console.log('[App] Variables count:', currentWorkflowVariables.variables?.length || 0);
+      console.log('[App] Variables:', currentWorkflowVariables.variables);
+    }
   }, [currentWorkflowVariables]);
 
   // Listen for RECORDED_STEP, UPDATE_STEP, and AI validation messages from content script
@@ -187,6 +192,7 @@ function App() {
       clearWorkflowSteps();
       setCurrentWorkflowName(null);
       setCurrentWorkflowVariables(null); // Clear variables when starting new recording
+      setIsDetectingVariables(false); // Reset detection state
       setIsRecording(true);
       setState('RECORDING');
       
@@ -215,6 +221,7 @@ function App() {
   };
 
   const handleStopRecording = async () => {
+    console.log('[App] handleStopRecording called, workflowSteps.length:', workflowSteps.length);
     try {
       setIsRecording(false);
       setState('IDLE');
@@ -225,6 +232,7 @@ function App() {
         throw new Error('No active tab found');
       }
       
+      console.log('[App] Sending STOP_RECORDING message to content script');
       const response = await runtimeBridge.sendMessage(
         {
           type: 'STOP_RECORDING',
@@ -235,9 +243,94 @@ function App() {
       if (!response.success) {
         throw new Error(response.error || 'Failed to stop recording');
       }
+      console.log('[App] STOP_RECORDING message sent successfully');
+
+      // Detect variables immediately after recording stops
+      // Use a small delay to ensure workflowSteps state is updated
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Get current workflow steps (might have been updated by RECORDED_STEP messages)
+      const currentSteps = workflowSteps.length > 0 ? workflowSteps : [];
+      
+      console.log('[App] Checking for variable detection:', {
+        workflowStepsLength: workflowSteps.length,
+        currentStepsLength: currentSteps.length,
+        willDetect: currentSteps.length > 0,
+      });
+      
+      if (currentSteps.length > 0) {
+        console.log('[App] ✅ Starting variable detection for', currentSteps.length, 'steps');
+        console.log('[App] Step types:', currentSteps.map(s => ({ 
+          type: s.type, 
+          hasValue: !!s.payload.value,
+          hasLabel: !!s.payload.label,
+          hasSnapshot: !!(s.payload.visualSnapshot?.viewport || s.payload.visualSnapshot?.elementSnippet)
+        })));
+        
+        // Show loading state immediately
+        setIsDetectingVariables(true);
+        setLearningFeedback('🔍 Analyzing workflow steps for variables...');
+        
+        try {
+          console.log('[App] Calling VariableDetector.detectVariables...');
+          const variables = await VariableDetector.detectVariables(currentSteps);
+          console.log('[App] ✅ Variable detection completed:', {
+            totalVariables: variables.variables.length,
+            analysisCount: variables.analysisCount,
+            variables: variables.variables.map(v => ({
+              fieldName: v.fieldName,
+              variableName: v.variableName,
+              isVariable: v.isVariable,
+              confidence: v.confidence,
+            })),
+          });
+          
+          // Store variables for display (even if empty, so UI shows the section)
+          setCurrentWorkflowVariables(variables);
+          
+          if (variables.variables.length > 0) {
+            setLearningFeedback(`✨ Detected ${variables.variables.length} variable${variables.variables.length > 1 ? 's' : ''} in recorded workflow`);
+            setTimeout(() => setLearningFeedback(null), 4000);
+          } else {
+            console.log('[App] ⚠️ No variables detected. Analysis count:', variables.analysisCount);
+            if (variables.analysisCount === 0) {
+              setLearningFeedback('ℹ️ No steps were analyzed for variables. Make sure INPUT steps have values.');
+              setTimeout(() => setLearningFeedback(null), 3000);
+            } else {
+              setLearningFeedback('ℹ️ AI analyzed steps but didn\'t detect any variables.');
+              setTimeout(() => setLearningFeedback(null), 3000);
+            }
+          }
+        } catch (err) {
+          console.error('[App] ❌ Error detecting variables:', err);
+          console.error('[App] Error stack:', err instanceof Error ? err.stack : 'No stack');
+          const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+          setError(`Variable detection failed: ${errorMessage}`);
+          setLearningFeedback(`❌ Variable detection failed: ${errorMessage}`);
+          setTimeout(() => setLearningFeedback(null), 5000);
+          // Still set empty variables so UI shows the section
+          setCurrentWorkflowVariables({
+            variables: [],
+            detectedAt: Date.now(),
+            analysisCount: 0,
+          });
+        } finally {
+          setIsDetectingVariables(false);
+          console.log('[App] Variable detection finished, isDetectingVariables set to false');
+        }
+      } else {
+        console.log('[App] ⚠️ No workflow steps to analyze for variables (workflowSteps.length =', workflowSteps.length, ')');
+        // Still set empty variables so UI shows the section
+        setCurrentWorkflowVariables({
+          variables: [],
+          detectedAt: Date.now(),
+          analysisCount: 0,
+        });
+      }
     } catch (err) {
-      console.error('Stop recording error:', err);
+      console.error('[App] Stop recording error:', err);
       setError(err instanceof Error ? err.message : 'Failed to stop recording');
+      setIsDetectingVariables(false);
     }
   };
 
@@ -252,8 +345,9 @@ function App() {
       
       // Detect variables using AI vision analysis
       console.log('[SaveWorkflow] Starting variable detection for', workflowSteps.length, 'steps');
+      console.log('[SaveWorkflow] Step types:', workflowSteps.map(s => ({ type: s.type, hasSnapshot: !!s.payload.visualSnapshot })));
       const variables = await VariableDetector.detectVariables(workflowSteps);
-      console.log('[SaveWorkflow] Detected variables:', variables);
+      console.log('[SaveWorkflow] Detected variables result:', JSON.stringify(variables, null, 2));
 
       const workflow: SavedWorkflow = {
         id: `workflow-${Date.now()}`,
@@ -271,9 +365,10 @@ function App() {
       setShowSaveDialog(false);
       setWorkflowName('');
       
-      // Store variables for display
-      console.log('[SaveWorkflow] Setting currentWorkflowVariables:', workflow.variables);
-      setCurrentWorkflowVariables(workflow.variables || null);
+      // Store variables for display (use the fresh detection result, not workflow.variables which might be undefined)
+      console.log('[SaveWorkflow] Setting currentWorkflowVariables:', variables);
+      console.log('[SaveWorkflow] Variables count:', variables.variables.length);
+      setCurrentWorkflowVariables(variables.variables.length > 0 ? variables : null);
       
       // Show feedback if variables were detected
       if (variables.variables.length > 0) {
@@ -678,7 +773,7 @@ function App() {
         )}
 
         {/* Detected Variables */}
-        {(currentWorkflowVariables || (workflowSteps.length > 0 && currentWorkflowName)) && (
+        {workflowSteps.length > 0 && (
           <div className="mb-6 p-4 bg-card rounded-lg border border-border border-purple-200">
             <h2 className="text-lg font-semibold mb-4 text-card-foreground flex items-center gap-2">
               <svg className="h-5 w-5 text-purple-600" fill="currentColor" viewBox="0 0 20 20">
@@ -686,101 +781,182 @@ function App() {
                 <path fillRule="evenodd" d="M4 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v11a2 2 0 01-2 2H6a2 2 0 01-2-2V5zm3 4a1 1 0 000 2h.01a1 1 0 100-2H7zm3 0a1 1 0 000 2h3a1 1 0 100-2h-3zm-3 4a1 1 0 100 2h.01a1 1 0 100-2H7zm3 0a1 1 0 100 2h3a1 1 0 100-2h-3z" clipRule="evenodd" />
               </svg>
               Detected Variables ({currentWorkflowVariables?.variables?.length || 0})
+              {/* Debug: {currentWorkflowVariables ? 'has vars' : 'no vars'} */}
             </h2>
             {currentWorkflowVariables && currentWorkflowVariables.variables && currentWorkflowVariables.variables.length > 0 ? (
-              <div className="space-y-3">
-                {currentWorkflowVariables.variables.map((variable) => (
-                <div 
-                  key={variable.variableName}
-                  className="p-3 bg-purple-50 rounded-md border border-purple-200"
-                >
-                  <div className="flex items-start justify-between mb-2">
-                    <div className="flex-1">
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="font-semibold text-foreground">
-                          {variable.fieldName}
-                        </span>
-                        <span className="px-2 py-0.5 text-xs bg-purple-100 text-purple-700 rounded-full font-mono">
-                          {variable.variableName}
-                        </span>
-                        {variable.isDropdown && (
-                          <span className="px-2 py-0.5 text-xs bg-blue-100 text-blue-700 rounded">
-                            📋 Dropdown
-                          </span>
-                        )}
-                        {variable.confidence >= 0.8 && (
-                          <span className="px-2 py-0.5 text-xs bg-green-100 text-green-700 rounded">
-                            ✓ High confidence
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-sm text-muted-foreground">
-                        <div className="flex items-center gap-2">
-                          <span>Default:</span>
-                          <span className="font-mono bg-white px-2 py-0.5 rounded border">
-                            {variable.defaultValue || '(empty)'}
-                          </span>
-                        </div>
-                        {variable.isDropdown && variable.options && variable.options.length > 0 && (
-                          <div className="mt-2">
-                            <div className="text-xs font-medium text-muted-foreground mb-1">
-                              Available Options ({variable.options.length}):
+              <div className="space-y-2">
+                {currentWorkflowVariables.variables.map((variable) => {
+                  const isExpanded = expandedVariables.has(variable.variableName);
+                  return (
+                    <div 
+                      key={variable.variableName}
+                      className="p-3 bg-purple-50 rounded-md border border-purple-200 hover:border-purple-300 transition-colors cursor-pointer"
+                      onClick={() => {
+                        const newExpanded = new Set(expandedVariables);
+                        if (isExpanded) {
+                          newExpanded.delete(variable.variableName);
+                        } else {
+                          newExpanded.add(variable.variableName);
+                        }
+                        setExpandedVariables(newExpanded);
+                      }}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-medium text-foreground">
+                              {variable.fieldName}
+                            </span>
+                            <span className="px-2 py-0.5 text-xs bg-purple-100 text-purple-700 rounded font-mono">
+                              {variable.variableName}
+                            </span>
+                            {variable.isDropdown && (
+                              <span className="px-2 py-0.5 text-xs bg-blue-100 text-blue-700 rounded">
+                                📋 Dropdown
+                              </span>
+                            )}
+                          </div>
+                          <div className="mt-1.5 flex items-center gap-2 text-sm text-muted-foreground">
+                            <span>Default:</span>
+                            <span className="font-mono bg-white px-2 py-0.5 rounded border text-foreground">
+                              {variable.defaultValue || '(empty)'}
+                            </span>
+                          </div>
+                          {variable.isDropdown && variable.options && variable.options.length > 0 && !isExpanded && (
+                            <div className="mt-2">
+                              <div className="flex flex-wrap gap-1">
+                                {variable.options.slice(0, 5).map((option, idx) => (
+                                  <span
+                                    key={idx}
+                                    className={`px-2 py-0.5 text-xs rounded border ${
+                                      option === variable.defaultValue
+                                        ? 'bg-purple-200 border-purple-400 font-medium text-purple-800'
+                                        : 'bg-white border-gray-300 text-gray-700'
+                                    }`}
+                                  >
+                                    {option}
+                                  </span>
+                                ))}
+                                {variable.options.length > 5 && (
+                                  <span className="px-2 py-0.5 text-xs text-muted-foreground">
+                                    +{variable.options.length - 5} more
+                                  </span>
+                                )}
+                              </div>
                             </div>
-                            <div className="flex flex-wrap gap-1">
-                              {variable.options.map((option, idx) => (
-                                <span
-                                  key={idx}
-                                  className={`px-2 py-0.5 text-xs rounded border ${
-                                    option === variable.defaultValue
-                                      ? 'bg-purple-200 border-purple-400 font-medium text-purple-800'
-                                      : 'bg-white border-gray-300 text-gray-700'
-                                  }`}
-                                >
-                                  {option}
-                                </span>
-                              ))}
+                          )}
+                        </div>
+                        <button
+                          className="ml-2 p-1 text-muted-foreground hover:text-foreground transition-colors"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const newExpanded = new Set(expandedVariables);
+                            if (isExpanded) {
+                              newExpanded.delete(variable.variableName);
+                            } else {
+                              newExpanded.add(variable.variableName);
+                            }
+                            setExpandedVariables(newExpanded);
+                          }}
+                        >
+                          <svg 
+                            className={`h-4 w-4 transition-transform ${isExpanded ? 'rotate-180' : ''}`}
+                            fill="none" 
+                            stroke="currentColor" 
+                            viewBox="0 0 24 24"
+                          >
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                          </svg>
+                        </button>
+                      </div>
+                      
+                      {isExpanded && (
+                        <div className="mt-3 pt-3 border-t border-purple-200 space-y-2">
+                          {variable.isDropdown && variable.options && variable.options.length > 0 && (
+                            <div>
+                              <div className="text-xs font-medium text-muted-foreground mb-1">
+                                All Options ({variable.options.length}):
+                              </div>
+                              <div className="flex flex-wrap gap-1">
+                                {variable.options.map((option, idx) => (
+                                  <span
+                                    key={idx}
+                                    className={`px-2 py-0.5 text-xs rounded border ${
+                                      option === variable.defaultValue
+                                        ? 'bg-purple-200 border-purple-400 font-medium text-purple-800'
+                                        : 'bg-white border-gray-300 text-gray-700'
+                                    }`}
+                                  >
+                                    {option}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                          {variable.inputType && (
+                            <div className="text-xs text-muted-foreground">
+                              Input Type: <span className="font-mono">{variable.inputType}</span>
+                            </div>
+                          )}
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs text-muted-foreground">
+                              Confidence: {Math.round(variable.confidence * 100)}%
+                            </span>
+                            <div className="flex-1 h-1.5 bg-gray-200 rounded-full overflow-hidden max-w-[100px]">
+                              <div 
+                                className="h-full bg-purple-500 rounded-full"
+                                style={{ width: `${variable.confidence * 100}%` }}
+                              />
                             </div>
                           </div>
-                        )}
-                        {variable.inputType && (
-                          <div className="mt-1 text-xs text-muted-foreground">
-                            Type: <span className="font-mono">{variable.inputType}</span>
-                          </div>
-                        )}
-                        <div className="mt-1 flex items-center gap-2">
-                          <span className="text-xs text-muted-foreground">
-                            Confidence: {Math.round(variable.confidence * 100)}%
-                          </span>
-                          <div className="flex-1 h-1.5 bg-gray-200 rounded-full overflow-hidden">
-                            <div 
-                              className="h-full bg-purple-500 rounded-full"
-                              style={{ width: `${variable.confidence * 100}%` }}
-                            />
-                          </div>
+                          {variable.reasoning && (
+                            <div className="text-xs text-muted-foreground italic border-l-2 border-purple-300 pl-2">
+                              {variable.reasoning}
+                            </div>
+                          )}
                         </div>
-                        {variable.reasoning && (
-                          <div className="mt-2 text-xs text-muted-foreground italic border-l-2 border-purple-300 pl-2">
-                            {variable.reasoning}
-                          </div>
-                        )}
-                      </div>
+                      )}
                     </div>
-                  </div>
-                </div>
-              ))}
+                  );
+                })}
               </div>
             ) : (
-              <div className="text-sm text-muted-foreground py-4 text-center">
-                {currentWorkflowVariables ? (
-                  <>No variables detected. Variables are detected when you save the workflow.</>
+              <div className="text-sm text-muted-foreground py-4 text-center border-2 border-dashed border-purple-200 rounded-md bg-purple-50">
+                {isDetectingVariables ? (
+                  <div className="flex items-center justify-center gap-2">
+                    <svg className="animate-spin h-4 w-4 text-purple-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <span>AI is analyzing workflow steps to detect variables...</span>
+                  </div>
+                ) : currentWorkflowVariables ? (
+                  <div>
+                    <p className="font-medium mb-1">No variables detected</p>
+                    <p className="text-xs">
+                      {currentWorkflowVariables.analysisCount > 0 
+                        ? `AI analyzed ${currentWorkflowVariables.analysisCount} step${currentWorkflowVariables.analysisCount !== 1 ? 's' : ''} but didn't find any parameterizable variables.`
+                        : 'No steps were analyzed. Make sure INPUT steps have values and snapshots.'}
+                    </p>
+                    <p className="text-xs mt-2 text-purple-600">
+                      💡 Check the browser console (F12 → Console) for detailed detection logs
+                    </p>
+                  </div>
                 ) : (
-                  <>Variables will be detected when you save the workflow.</>
+                  <div>
+                    <p className="font-medium mb-1">Variables will be detected when recording stops</p>
+                    <p className="text-xs">After you stop recording, AI will automatically analyze which values should be variables.</p>
+                    <p className="text-xs mt-2 text-purple-600">💡 Variables are typically: email addresses, names, amounts, dates, and dropdown selections</p>
+                  </div>
                 )}
               </div>
             )}
             {currentWorkflowVariables && currentWorkflowVariables.variables && currentWorkflowVariables.variables.length > 0 && (
-              <div className="mt-3 pt-3 border-t border-purple-200 text-xs text-muted-foreground">
-                💡 These variables can be customized when executing the workflow
+              <div className="mt-3 pt-3 border-t border-purple-200 text-xs text-muted-foreground flex items-center gap-1">
+                <svg className="h-3 w-3" fill="currentColor" viewBox="0 0 20 20">
+                  <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+                </svg>
+                <span>Click any variable to see details. These can be customized when executing the workflow.</span>
               </div>
             )}
           </div>

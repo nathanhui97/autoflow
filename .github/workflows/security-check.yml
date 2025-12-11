@@ -1,0 +1,45 @@
+# GitHub Actions Workflow: Security Check
+# Runs security verification before allowing merges
+# 
+# This ensures API keys are never committed to the repository
+
+name: Security Check
+
+on:
+  pull_request:
+    branches: [ main, master, develop ]
+  push:
+    branches: [ main, master, develop ]
+
+jobs:
+  security-verification:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Run security verification
+      run: |
+        chmod +x verify-security.sh
+        ./verify-security.sh
+        
+    - name: Check for API keys in code
+      run: |
+        echo "Checking for hardcoded API keys..."
+        if grep -r "AIza[A-Za-z0-9_-]\{35,\}" --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.sh" . | grep -v "node_modules" | grep -v ".git" | grep -v "SECURITY_GUIDE.md" | grep -v "FIX_GEMINI_API_KEY.md" | grep -v "env.example"; then
+          echo "❌ ERROR: Found potential API keys in code!"
+          exit 1
+        else
+          echo "✅ No API keys found in code"
+        fi
+        
+    - name: Verify client-side doesn't call Gemini directly
+      run: |
+        echo "Checking for direct Gemini API calls in client-side..."
+        if grep -r "generativelanguage\.googleapis\.com\|x-goog-api-key" --include="*.ts" --include="*.tsx" src/; then
+          echo "❌ ERROR: Found direct Gemini API calls in client-side code!"
+          exit 1
+        else
+          echo "✅ No direct API calls in client-side code"
+        fi

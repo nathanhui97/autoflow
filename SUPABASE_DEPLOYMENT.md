@@ -37,8 +37,11 @@ If you prefer to run commands manually:
 
 4. **Set the Gemini API Key secret:**
    ```bash
-   npx supabase secrets set GEMINI_API_KEY=AIzaSyBfLwmgunY7n9ckJYQKVYQ0_uhvc5SQoIM
+   # Get your API key from https://aistudio.google.com/app/apikey
+   npx supabase secrets set GEMINI_API_KEY=YOUR_ACTUAL_API_KEY_HERE
    ```
+   
+   **⚠️ Security Note:** Never commit API keys to git. Always use Supabase secrets for production.
 
 ## Verify Deployment
 

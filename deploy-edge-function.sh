@@ -16,9 +16,32 @@ fi
 echo "Linking to Supabase project..."
 npx supabase link --project-ref jfboagngbpzollcipewh || echo "Already linked or login required"
 
-# Set the Gemini API key secret (needed for both functions)
-echo "Setting GEMINI_API_KEY secret..."
-npx supabase secrets set GEMINI_API_KEY=AIzaSyBfLwmgunY7n9ckJYQKVYQ0_uhvc5SQoIM
+# Set the Gemini API key secret (needed for all functions)
+# SECURITY: API keys are stored in Supabase secrets, never hardcoded in scripts.
+# Get your API key from: https://aistudio.google.com/app/apikey
+# 
+# Option 1: Set as environment variable before running:
+#   export GEMINI_API_KEY=YOUR_API_KEY
+#   ./deploy-edge-function.sh
+#
+# Option 2: Set manually after deployment:
+#   npx supabase secrets set GEMINI_API_KEY=YOUR_API_KEY
+if [ -z "$GEMINI_API_KEY" ]; then
+  echo "⚠️  GEMINI_API_KEY environment variable not set."
+  echo ""
+  echo "   To set it now, run:"
+  echo "   npx supabase secrets set GEMINI_API_KEY=YOUR_API_KEY"
+  echo ""
+  echo "   Or export it before running this script:"
+  echo "   export GEMINI_API_KEY=YOUR_API_KEY"
+  echo "   ./deploy-edge-function.sh"
+  echo ""
+  echo "   See SECURITY_GUIDE.md for more information."
+else
+  echo "Setting GEMINI_API_KEY secret..."
+  npx supabase secrets set GEMINI_API_KEY="$GEMINI_API_KEY"
+  echo "✅ API key secret set successfully"
+fi
 
 # Deploy recover_element function
 echo "Deploying recover_element function..."
@@ -32,12 +55,17 @@ npx supabase functions deploy validate_selector
 echo "Deploying generate_step_description function..."
 npx supabase functions deploy generate_step_description
 
+# Deploy detect_variables function
+echo "Deploying detect_variables function..."
+npx supabase functions deploy detect_variables
+
 echo "✅ Deployment complete!"
 echo ""
 echo "Deployed functions:"
 echo "  - recover_element"
 echo "  - validate_selector"
 echo "  - generate_step_description"
+echo "  - detect_variables"
 echo ""
 echo "If deployment fails, make sure you're logged in:"
 echo "  npx supabase login"
