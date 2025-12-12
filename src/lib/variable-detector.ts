@@ -58,6 +58,8 @@ interface StepMetadata {
   isDropdown?: boolean;        // Whether this is a dropdown/select
   dropdownOptions?: string[];  // Available options in dropdown (if known)
   selector?: string;           // Element selector (for detecting dropdowns)
+  columnHeader?: string;       // Column header for spreadsheet cells (e.g., "Price", "Quantity")
+  cellReference?: string;      // Cell reference for spreadsheet cells (e.g., "B5", "A1")
 }
 
 /**
@@ -101,8 +103,18 @@ export class VariableDetector {
   /**
    * Detect variables in workflow steps
    * Filters steps before sending to AI for cost optimization
+   * @param steps - Workflow steps to analyze
+   * @param initialFullPageSnapshot - Optional full page snapshot captured at recording start (for spreadsheet column headers)
    */
-  static async detectVariables(steps: WorkflowStep[]): Promise<WorkflowVariables> {
+  static async detectVariables(
+    steps: WorkflowStep[], 
+    initialFullPageSnapshot?: string | null
+  ): Promise<WorkflowVariables> {
+    console.log('[VariableDetector] detectVariables called with:', {
+      stepsCount: steps.length,
+      hasInitialSnapshot: !!initialFullPageSnapshot,
+      snapshotLength: initialFullPageSnapshot?.length,
+    });
     const config = aiConfig.getConfig();
     
     if (!config.enabled) {
@@ -140,7 +152,7 @@ export class VariableDetector {
 
     try {
       // Call Edge Function
-      const response = await this.callEdgeFunction(stepsForAnalysis, steps);
+      const response = await this.callEdgeFunction(stepsForAnalysis, steps, initialFullPageSnapshot);
       
       // Filter to only confirmed variables
       const confirmedVariables = response.variables.filter(v => v.isVariable && v.confidence >= 0.5);
@@ -410,6 +422,28 @@ export class VariableDetector {
       }
     }
 
+    // Extract column header and cell reference from grid coordinates (for spreadsheets)
+    const columnHeader = payload.context?.gridCoordinates?.columnHeader;
+    let cellReference = payload.context?.gridCoordinates?.cellReference;
+    
+    // CRITICAL FIX: If label matches a cell reference pattern (A15, B15, etc.) and cellReference doesn't match,
+    // use the label as the cellReference. This fixes timing issues where Name Box hasn't updated yet.
+    if (payload.label && /^[A-Z]+\d+$/.test(payload.label) && cellReference !== payload.label) {
+      console.log(`[VariableDetector] ⚠️ Mismatch detected: label="${payload.label}" but cellReference="${cellReference}". Using label as cellReference.`);
+      console.log(`[VariableDetector] Mismatch fix - step ${stepIndex}: label="${payload.label}", originalCellRef="${cellReference}", correctedCellRef="${payload.label}"`);
+      cellReference = payload.label;
+    }
+    
+    // Log spreadsheet context if available
+    if (columnHeader || cellReference) {
+      console.log(`[VariableDetector] Spreadsheet context for step ${stepIndex}:`, {
+        columnHeader,
+        cellReference,
+        rowIndex: payload.context?.gridCoordinates?.rowIndex,
+        columnIndex: payload.context?.gridCoordinates?.columnIndex,
+      });
+    }
+
     // Extract metadata
     const metadata: StepMetadata = {
       stepIndex,
@@ -425,6 +459,8 @@ export class VariableDetector {
       isDropdown,
       dropdownOptions,
       selector: payload.selector, // Include selector for Edge Function to detect dropdowns
+      columnHeader, // Include column header for spreadsheet cells
+      cellReference, // Include cell reference for spreadsheet cells
     };
     
     // Log metadata for dropdown CLICK steps
@@ -517,10 +553,12 @@ export class VariableDetector {
 
   /**
    * Call the detect_variables Edge Function
+   * @param initialFullPageSnapshot - Optional full page snapshot for spreadsheet column header detection
    */
   private static async callEdgeFunction(
     stepsForAnalysis: StepForAnalysis[],
-    allSteps: WorkflowStep[]
+    allSteps: WorkflowStep[],
+    initialFullPageSnapshot?: string | null
   ): Promise<DetectVariablesResponse> {
     const config = aiConfig.getConfig();
     const url = aiConfig.getEdgeFunctionUrl(config.detectVariablesEdgeFunctionName);
@@ -532,14 +570,47 @@ export class VariableDetector {
       title: document.title || '',
       pageType: firstStep.payload.pageType?.type,
     } : undefined;
+    
+    // Check if any step has spreadsheet context (cellReference or columnHeader)
+    const hasSpreadsheetSteps = stepsForAnalysis.some(s => s.metadata.cellReference || s.metadata.columnHeader);
+    console.log('[VariableDetector] Spreadsheet detection:', {
+      hasSpreadsheetSteps,
+      stepsWithCellReference: stepsForAnalysis.filter(s => s.metadata.cellReference).map(s => ({
+        stepIndex: s.metadata.stepIndex,
+        cellReference: s.metadata.cellReference,
+      })),
+    });
 
     const requestPayload = {
       steps: stepsForAnalysis,
       pageContext,
+      initialFullPageSnapshot: initialFullPageSnapshot || undefined, // Include full page snapshot for spreadsheet column header detection
     };
+    console.log('[VariableDetector] Request payload:', {
+      stepsCount: requestPayload.steps.length,
+      hasPageContext: !!requestPayload.pageContext,
+      pageType: requestPayload.pageContext?.pageType,
+      hasInitialSnapshot: !!requestPayload.initialFullPageSnapshot,
+      snapshotLength: requestPayload.initialFullPageSnapshot?.length,
+      stepsWithCellReference: requestPayload.steps.filter(s => s.metadata.cellReference).map(s => ({
+        stepIndex: s.metadata.stepIndex,
+        cellReference: s.metadata.cellReference,
+        columnHeader: s.metadata.columnHeader,
+      })),
+    });
 
     console.log(`[VariableDetector] Calling Edge Function: ${url}`);
     console.log(`[VariableDetector] Sending ${stepsForAnalysis.length} steps for analysis`);
+    
+    // Log request body size to check if snapshot is included
+    const requestBody = JSON.stringify(requestPayload);
+    console.log('[VariableDetector] Request body size:', {
+      totalSize: requestBody.length,
+      hasInitialSnapshot: !!requestPayload.initialFullPageSnapshot,
+      snapshotSize: requestPayload.initialFullPageSnapshot?.length || 0,
+      snapshotInBody: requestBody.includes(requestPayload.initialFullPageSnapshot?.substring(0, 50) || ''),
+      stepsWithCellRef: requestPayload.steps.filter(s => s.metadata.cellReference).map(s => ({ stepIndex: s.metadata.stepIndex, cellRef: s.metadata.cellReference, label: s.metadata.label })),
+    });
     
     const response = await fetch(url, {
       method: 'POST',
@@ -547,7 +618,7 @@ export class VariableDetector {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${config.supabaseAnonKey}`,
       },
-      body: JSON.stringify(requestPayload),
+      body: requestBody,
     });
 
     if (!response.ok) {

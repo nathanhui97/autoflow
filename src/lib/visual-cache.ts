@@ -302,3 +302,5 @@ class VisualCacheManager {
 
 // Singleton instance
 export const visualCache = new VisualCacheManager();
+
+

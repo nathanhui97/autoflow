@@ -33,3 +33,5 @@ $$;
 
 -- Optional: Create a scheduled job to run cleanup (requires pg_cron extension)
 -- SELECT cron.schedule('cleanup-ai-cache', '0 * * * *', 'SELECT cleanup_expired_ai_cache()');
+
+

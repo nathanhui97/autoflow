@@ -51,6 +51,8 @@ function App() {
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [workflowName, setWorkflowName] = useState('');
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
+  const [showRefreshDialog, setShowRefreshDialog] = useState(false);
+  const [pendingTabId, setPendingTabId] = useState<number | null>(null);
   // Correction learning state
   const [showCorrections, setShowCorrections] = useState(false);
   const [storedCorrections, setStoredCorrections] = useState<CorrectionEntry[]>([]);
@@ -187,30 +189,62 @@ function App() {
     };
   }, [addWorkflowStep, updateWorkflowStep, setAIValuationPending, setStepEnhanced]);
 
+  // Helper function to check if current page is a spreadsheet domain
+  const isSpreadsheetDomain = (url: string): boolean => {
+    const urlLower = url.toLowerCase();
+    const hostname = new URL(url).hostname.toLowerCase();
+    
+    // Google Sheets
+    if (hostname.includes('docs.google.com') && urlLower.includes('/spreadsheets')) {
+      return true;
+    }
+    
+    // Excel Online / Office 365
+    if (hostname.includes('office.com') || 
+        hostname.includes('excel.office.com') || 
+        hostname.includes('onedrive.live.com') ||
+        hostname.includes('office365.com')) {
+      return true;
+    }
+    
+    return false;
+  };
+
   const handleStartRecording = async () => {
     try {
       clearWorkflowSteps();
       setCurrentWorkflowName(null);
       setCurrentWorkflowVariables(null); // Clear variables when starting new recording
       setIsDetectingVariables(false); // Reset detection state
-      setIsRecording(true);
-      setState('RECORDING');
       
-      // Get the active tab to send message to its content script
+      // Get the active tab to check domain
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tab?.id) {
+      if (!tab?.id || !tab.url) {
         throw new Error('No active tab found');
       }
       
-      const response = await runtimeBridge.sendMessage(
-        {
-          type: 'START_RECORDING',
-        },
-        tab.id
-      );
+      // Check if it's a spreadsheet domain
+      const isSpreadsheet = isSpreadsheetDomain(tab.url);
       
-      if (!response.success) {
-        throw new Error(response.error || 'Failed to start recording');
+      if (isSpreadsheet) {
+        // Show refresh dialog for spreadsheets
+        setPendingTabId(tab.id);
+        setShowRefreshDialog(true);
+      } else {
+        // For non-spreadsheet pages, start recording directly
+        setIsRecording(true);
+        setState('RECORDING');
+        
+        const response = await runtimeBridge.sendMessage(
+          {
+            type: 'START_RECORDING',
+          },
+          tab.id
+        );
+        
+        if (!response.success) {
+          throw new Error(response.error || 'Failed to start recording');
+        }
       }
     } catch (err) {
       console.error('Start recording error:', err);
@@ -218,6 +252,62 @@ function App() {
       setIsRecording(false);
       setState('IDLE');
     }
+  };
+
+  const handleRefreshConfirm = async () => {
+    if (!pendingTabId) {
+      setShowRefreshDialog(false);
+      return;
+    }
+    
+    try {
+      setShowRefreshDialog(false);
+      
+      // Send REFRESH_PAGE message
+      // Note: Page will refresh, so we won't get a response back
+      // The content script will auto-start recording after refresh using sessionStorage flag
+      await runtimeBridge.sendMessage(
+        {
+          type: 'REFRESH_PAGE',
+        },
+        pendingTabId
+      );
+      
+      // Optimistically update UI - page will refresh and recording will auto-start
+      setIsRecording(true);
+      setState('RECORDING');
+      setPendingTabId(null);
+      
+      // Wait a moment and verify recording actually started
+      setTimeout(async () => {
+        try {
+          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          if (tab?.id) {
+            const pingResponse = await runtimeBridge.ping(tab.id);
+            if (!pingResponse) {
+              // Page might still be loading, that's okay
+              console.log('📸 GhostWriter: Page may still be loading after refresh');
+            }
+          }
+        } catch (err) {
+          // Ignore errors - page is refreshing
+          console.log('📸 GhostWriter: Page is refreshing, will auto-start recording');
+        }
+      }, 1000);
+    } catch (err) {
+      console.error('Refresh error:', err);
+      setError(err instanceof Error ? err.message : 'Failed to refresh page');
+      setIsRecording(false);
+      setState('IDLE');
+      setPendingTabId(null);
+    }
+  };
+
+  const handleRefreshCancel = () => {
+    setShowRefreshDialog(false);
+    setPendingTabId(null);
+    setIsRecording(false);
+    setState('IDLE');
   };
 
   const handleStopRecording = async () => {
@@ -245,6 +335,19 @@ function App() {
       }
       console.log('[App] STOP_RECORDING message sent successfully');
 
+      // Get initial full page snapshot from response (captured at recording start for spreadsheet headers)
+      const initialFullPageSnapshot = response.data?.initialFullPageSnapshot || null;
+      console.log('[App] Initial snapshot check:', {
+        hasResponseData: !!response.data,
+        hasSnapshot: !!initialFullPageSnapshot,
+        snapshotLength: initialFullPageSnapshot?.length,
+      });
+      if (initialFullPageSnapshot) {
+        console.log('[App] ✅ Received initial full page snapshot for spreadsheet column header detection');
+      } else {
+        console.log('[App] ⚠️ No initial full page snapshot received');
+      }
+
       // Detect variables immediately after recording stops
       // Use a small delay to ensure workflowSteps state is updated
       await new Promise(resolve => setTimeout(resolve, 100));
@@ -256,6 +359,7 @@ function App() {
         workflowStepsLength: workflowSteps.length,
         currentStepsLength: currentSteps.length,
         willDetect: currentSteps.length > 0,
+        hasInitialSnapshot: !!initialFullPageSnapshot,
       });
       
       if (currentSteps.length > 0) {
@@ -273,7 +377,7 @@ function App() {
         
         try {
           console.log('[App] Calling VariableDetector.detectVariables...');
-          const variables = await VariableDetector.detectVariables(currentSteps);
+          const variables = await VariableDetector.detectVariables(currentSteps, initialFullPageSnapshot);
           console.log('[App] ✅ Variable detection completed:', {
             totalVariables: variables.variables.length,
             analysisCount: variables.analysisCount,
@@ -346,7 +450,8 @@ function App() {
       // Detect variables using AI vision analysis
       console.log('[SaveWorkflow] Starting variable detection for', workflowSteps.length, 'steps');
       console.log('[SaveWorkflow] Step types:', workflowSteps.map(s => ({ type: s.type, hasSnapshot: !!s.payload.visualSnapshot })));
-      const variables = await VariableDetector.detectVariables(workflowSteps);
+      // For saved workflows, we don't have the initial snapshot, so pass null
+      const variables = await VariableDetector.detectVariables(workflowSteps, null);
       console.log('[SaveWorkflow] Detected variables result:', JSON.stringify(variables, null, 2));
 
       const workflow: SavedWorkflow = {
@@ -1208,6 +1313,32 @@ function App() {
             onConfirm={handleVariableFormConfirm}
             onCancel={handleVariableFormCancel}
           />
+        )}
+
+        {/* Refresh Warning Dialog */}
+        {showRefreshDialog && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+            <div className="bg-card p-6 rounded-lg border border-border max-w-md w-full mx-4">
+              <h2 className="text-xl font-semibold mb-4 text-card-foreground">Refresh Page for Header Detection</h2>
+              <p className="text-sm text-muted-foreground mb-4">
+                This will refresh the page to capture column headers. Any unsaved work may be lost. Continue?
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={handleRefreshConfirm}
+                  className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90"
+                >
+                  Continue
+                </button>
+                <button
+                  onClick={handleRefreshCancel}
+                  className="flex-1 px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
         )}
       </div>
     </div>

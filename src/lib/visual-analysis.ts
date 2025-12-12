@@ -902,3 +902,5 @@ export class VisualAnalysisService {
     };
   }
 }
+
+

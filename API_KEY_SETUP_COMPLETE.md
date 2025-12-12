@@ -159,3 +159,5 @@ All these functions securely use your Supabase secret:
 ---
 
 ✅ **You're all set!** Your API key is secure and will never be exposed to GitHub.
+
+

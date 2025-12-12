@@ -157,3 +157,5 @@ Send to side panel via RECORDED_STEP message
 ✅ No console errors during recording
 
 
+
+

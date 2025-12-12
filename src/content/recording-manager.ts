@@ -49,11 +49,16 @@ export class RecordingManager {
   // Phase 4: Human-like visual understanding
   private currentPageAnalysis: PageAnalysis | null = null;
   private pageAnalysisPending: boolean = false;
+  // Full page snapshot at recording start (for spreadsheet column header detection)
+  private initialFullPageSnapshot: string | null = null;
 
   /**
    * Start recording - attach event listeners
    */
   start(): void {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:entry',message:'RecordingManager.start() called',data:{isRecording:this.isRecording,url:window.location.href},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
     if (this.isRecording) {
       console.warn('Recording already started');
       return;
@@ -71,6 +76,76 @@ export class RecordingManager {
     this.analyzeCurrentPage().catch((error) => {
       console.warn('🎨 GhostWriter: Page analysis failed:', error);
     });
+
+    // Capture full page snapshot at start for spreadsheet column header detection
+    // This allows AI to see all column headers even when cells are scrolled down
+    const isSpreadsheet = VisualSnapshotService.isSpreadsheetDomain();
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:isSpreadsheetCheck',message:'Checking if spreadsheet domain',data:{isSpreadsheet,url:window.location.href,hostname:window.location.hostname},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+    // #endregion
+    if (isSpreadsheet) {
+      console.log('📸 GhostWriter: Capturing initial full page snapshot for spreadsheet column headers');
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:beforeCapture',message:'About to call captureFullPage',data:{quality:0.8},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+      // #endregion
+      // Page was refreshed before recording started, so header row should be visible in viewport
+      // Verify scroll position is at (0, 0) as a safety check
+      const scrollY = window.scrollY || window.pageYOffset || 0;
+      if (scrollY !== 0) {
+        console.warn('📸 GhostWriter: Scroll position not at top, forcing scroll to (0, 0)');
+        window.scrollTo(0, 0);
+        // Wait for scroll to complete before capturing
+        setTimeout(() => {
+          VisualSnapshotService.captureFullPage(0.8).then((fullPage) => {
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:captureSuccess',message:'captureFullPage promise resolved',data:{hasFullPage:!!fullPage,hasScreenshot:!!fullPage?.screenshot,screenshotLength:fullPage?.screenshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+            // #endregion
+            if (fullPage) {
+              this.initialFullPageSnapshot = fullPage.screenshot;
+              console.log('📸 GhostWriter: Initial full page snapshot captured for spreadsheet headers');
+              // #region agent log
+              fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:snapshotStored',message:'Initial snapshot stored',data:{snapshotLength:this.initialFullPageSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+              // #endregion
+            } else {
+              // #region agent log
+              fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:captureReturnedNull',message:'captureFullPage returned null',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'F'})}).catch(()=>{});
+              // #endregion
+            }
+          }).catch((error) => {
+            console.warn('📸 GhostWriter: Failed to capture initial full page snapshot:', error);
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:captureError',message:'captureFullPage promise rejected',data:{error:error?.message,errorString:String(error)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
+            // #endregion
+          });
+        }, 200);
+      } else {
+        VisualSnapshotService.captureFullPage(0.8).then((fullPage) => {
+          // #region agent log
+          fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:captureSuccess',message:'captureFullPage promise resolved',data:{hasFullPage:!!fullPage,hasScreenshot:!!fullPage?.screenshot,screenshotLength:fullPage?.screenshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+          // #endregion
+          if (fullPage) {
+            this.initialFullPageSnapshot = fullPage.screenshot;
+            console.log('📸 GhostWriter: Initial full page snapshot captured for spreadsheet headers');
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:snapshotStored',message:'Initial snapshot stored',data:{snapshotLength:this.initialFullPageSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+            // #endregion
+          } else {
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:captureReturnedNull',message:'captureFullPage returned null',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'F'})}).catch(()=>{});
+            // #endregion
+          }
+        }).catch((error) => {
+          console.warn('📸 GhostWriter: Failed to capture initial full page snapshot:', error);
+          // #region agent log
+          fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:captureError',message:'captureFullPage promise rejected',data:{error:error?.message,errorString:String(error)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
+          // #endregion
+        });
+      }
+    } else {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:notSpreadsheet',message:'Not a spreadsheet domain, skipping snapshot',data:{url:window.location.href},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H'})}).catch(()=>{});
+      // #endregion
+    }
 
     // Setup click handler - use CAPTURE phase to catch events before React/Base UI stops propagation
     // This is critical for dropdown options that might have stopPropagation() called
@@ -207,6 +282,17 @@ export class RecordingManager {
     }
 
     console.log('Recording stopped');
+  }
+
+  /**
+   * Get the initial full page snapshot captured at recording start
+   * Used for spreadsheet column header detection
+   */
+  getInitialFullPageSnapshot(): string | null {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:getInitialFullPageSnapshot',message:'Getting initial snapshot',data:{hasSnapshot:!!this.initialFullPageSnapshot,snapshotLength:this.initialFullPageSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'I'})}).catch(()=>{});
+    // #endregion
+    return this.initialFullPageSnapshot;
   }
 
   /**
@@ -1575,6 +1661,7 @@ export class RecordingManager {
       
       const selectors = SelectorEngine.generateSelectors(element, undefined);
       const label = LabelFinder.findLabel(element);
+      console.log(`[RecordingManager] Label extracted for INPUT step:`, { label, elementTag: element.tagName, elementClass: element.className?.toString().substring(0, 50), ariaLabel: element.getAttribute('aria-label')?.substring(0, 50) });
       
       // Extract value: for contenteditable, use textContent/innerText; for standard inputs, use value
       let value: string;
@@ -1779,6 +1866,9 @@ export class RecordingManager {
       if (!visualSnapshot) {
         try {
           console.log('📸 GhostWriter: Capturing fresh snapshot for input event');
+          
+          // Check if this is a spreadsheet cell - use enhanced capture if so
+          // The capture() method will automatically use spreadsheet capture on spreadsheet domains
           const visuals = await VisualSnapshotService.capture(element);
           if (visuals) {
             visualSnapshot = {
@@ -1836,8 +1926,16 @@ export class RecordingManager {
           uniqueAttributes: Object.keys(disambiguationAttrs).length > 0 ? disambiguationAttrs : undefined,
           formContext: context.formContext,
           // Capture semantic coordinates for AI interpretation (includes decisionSpace)
-          ...ContextScanner.scan(element),
-        } : ContextScanner.scan(element),
+          ...(function() {
+            const scanned = ContextScanner.scan(element);
+            console.log(`[RecordingManager] ContextScanner.scan result for INPUT step:`, { hasGridCoordinates: !!scanned.gridCoordinates, cellReference: scanned.gridCoordinates?.cellReference, columnHeader: scanned.gridCoordinates?.columnHeader, label, labelMatchesCellRef: label === scanned.gridCoordinates?.cellReference });
+            return scanned;
+          })(),
+        } : (function() {
+          const scanned = ContextScanner.scan(element);
+          console.log(`[RecordingManager] ContextScanner.scan result (no context) for INPUT step:`, { hasGridCoordinates: !!scanned.gridCoordinates, cellReference: scanned.gridCoordinates?.cellReference, columnHeader: scanned.gridCoordinates?.columnHeader, label, labelMatchesCellRef: label === scanned.gridCoordinates?.cellReference });
+          return scanned;
+        })(),
         similarity: similarElements.length > 0 ? {
           similarCount: similarElements.length,
           uniquenessScore,

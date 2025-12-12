@@ -26,6 +26,8 @@ interface StepMetadata {
   isSelectableOption?: boolean; // True for dropdowns, radio buttons, etc.
   isDropdown?: boolean;         // Whether this is a dropdown/select
   dropdownOptions?: string[];   // Available options in dropdown (if known from DOM)
+  columnHeader?: string;       // Column header for spreadsheet cells (e.g., "Price", "Quantity")
+  cellReference?: string;      // Cell reference for spreadsheet cells (e.g., "B5", "A1")
 }
 
 interface StepForAnalysis {
@@ -41,6 +43,7 @@ interface DetectVariablesRequest {
     title: string;
     pageType?: string;
   };
+  initialFullPageSnapshot?: string; // Full page snapshot captured at recording start (for spreadsheet column headers)
 }
 
 interface VariableDefinition {
@@ -77,7 +80,10 @@ serve(async (req) => {
   }
 
   try {
-    const payload: DetectVariablesRequest = await req.json();
+    const rawBody = await req.text();
+    console.log('[detect_variables] Request received, body length:', rawBody.length);
+    
+    const payload: DetectVariablesRequest = JSON.parse(rawBody);
 
     if (!GEMINI_API_KEY) {
       console.error('[detect_variables] GEMINI_API_KEY is not set in environment variables');
@@ -95,6 +101,16 @@ serve(async (req) => {
         },
       });
     }
+    
+    // Log payload structure immediately after parsing
+    console.log('[detect_variables] Payload parsed successfully:', {
+      stepsCount: payload.steps?.length || 0,
+      hasPageContext: !!payload.pageContext,
+      hasInitialSnapshot: !!payload.initialFullPageSnapshot,
+      initialSnapshotType: typeof payload.initialFullPageSnapshot,
+      initialSnapshotLength: payload.initialFullPageSnapshot?.length || 0,
+      initialSnapshotPreview: payload.initialFullPageSnapshot?.substring(0, 50) || 'N/A',
+    });
 
     // Initialize Supabase client for caching
     const supabase = createClient(
@@ -102,19 +118,41 @@ serve(async (req) => {
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     );
 
+    // Log initial full page snapshot status BEFORE cache check (so we can see if it's in the payload)
+    console.log('[detect_variables] Initial full page snapshot check (BEFORE cache):', {
+      hasInitialSnapshot: !!payload.initialFullPageSnapshot,
+      snapshotLength: payload.initialFullPageSnapshot?.length || 0,
+      snapshotType: typeof payload.initialFullPageSnapshot,
+      snapshotPreview: payload.initialFullPageSnapshot?.substring(0, 50) || 'N/A',
+      pageType: payload.pageContext?.pageType,
+      pageUrl: payload.pageContext?.url?.substring(0, 80) || 'N/A',
+    });
+
     // Check cache first
-    const cacheKey = generateCacheKey(payload);
-    const cached = await checkCache(supabase, cacheKey);
+    // NOTE: Cache key intentionally excludes initialFullPageSnapshot to allow snapshot usage
+    // even with cached results. We'll skip cache if snapshot is present to ensure it's used.
+    const hasSnapshot = !!payload.initialFullPageSnapshot;
+    const cacheKey = generateCacheKey(payload); // Generate cache key for potential saving later
+    let cached: DetectVariablesResponse | null = null;
     
-    if (cached) {
-      console.log('Cache hit for detect_variables:', cacheKey);
-      return new Response(JSON.stringify(cached), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        },
-      });
+    if (!hasSnapshot) {
+      // Only check cache if no snapshot (snapshot requires fresh analysis)
+      cached = await checkCache(supabase, cacheKey);
+      
+      if (cached) {
+        console.log('[detect_variables] Cache hit for detect_variables:', cacheKey);
+        return new Response(JSON.stringify(cached), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
+    } else {
+      console.log('[detect_variables] Skipping cache check - snapshot present, requires fresh analysis');
     }
+    
+    console.log('[detect_variables] No cache hit, proceeding with AI analysis');
 
     // Analyze each step with snapshots
     const variables: VariableDefinition[] = [];
@@ -192,8 +230,26 @@ serve(async (req) => {
 
       analysisCount++;
 
-      // Analyze this step
-      const result = await analyzeStep(step, payload.pageContext);
+      // Log if this step should get the full page snapshot
+      const isSpreadsheetStep = step.metadata.cellReference || step.metadata.columnHeader;
+      const isDataTablePage = payload.pageContext?.pageType === 'data_table';
+      const shouldGetSnapshot = payload.initialFullPageSnapshot && (isDataTablePage || isSpreadsheetStep);
+      
+      if (payload.initialFullPageSnapshot) {
+        console.log(`[detect_variables] Step ${step.metadata.stepIndex} snapshot eligibility:`, {
+          hasInitialSnapshot: !!payload.initialFullPageSnapshot,
+          snapshotLength: payload.initialFullPageSnapshot.length,
+          pageType: payload.pageContext?.pageType,
+          isDataTablePage,
+          cellReference: step.metadata.cellReference,
+          columnHeader: step.metadata.columnHeader,
+          isSpreadsheetStep,
+          shouldGetSnapshot,
+        });
+      }
+
+      // Analyze this step (pass initial full page snapshot for spreadsheet column header detection)
+      const result = await analyzeStep(step, payload.pageContext, payload.initialFullPageSnapshot);
       
       console.log(`[detect_variables] Step ${step.metadata.stepIndex} analysis result:`, {
         hasResult: !!result,
@@ -221,7 +277,12 @@ serve(async (req) => {
     };
 
     // Cache the result (30 minute TTL - variables don't change often)
-    await saveToCache(supabase, cacheKey, response, 30 * 60);
+    // Only cache if no snapshot was used (to avoid caching results without snapshot analysis)
+    if (!hasSnapshot) {
+      await saveToCache(supabase, cacheKey, response, 30 * 60);
+    } else {
+      console.log('[detect_variables] Skipping cache save - snapshot was used in analysis');
+    }
 
     return new Response(JSON.stringify(response), {
       headers: {
@@ -250,18 +311,173 @@ serve(async (req) => {
 
 /**
  * Analyze a single step to determine if it contains a variable
+ * @param initialFullPageSnapshot - Optional full page snapshot captured at recording start (for spreadsheet column headers)
  */
 async function analyzeStep(
   step: StepForAnalysis,
-  pageContext?: { url: string; title: string; pageType?: string }
+  pageContext?: { url: string; title: string; pageType?: string },
+  initialFullPageSnapshot?: string
 ): Promise<VariableDefinition | null> {
   const { metadata, beforeSnapshot, afterSnapshot } = step;
 
   // Build the prompt based on step type (pass snapshots for context-aware prompts)
-  const prompt = buildVariableDetectionPrompt(metadata, pageContext, beforeSnapshot, afterSnapshot);
+  const prompt = buildVariableDetectionPrompt(metadata, pageContext, beforeSnapshot, afterSnapshot, initialFullPageSnapshot);
 
   // Build Gemini API request with screenshots
   const parts: any[] = [{ text: prompt }];
+
+  // Check if we should include the initial full page snapshot for spreadsheet column header detection
+  // This is critical for identifying column headers when cells are scrolled down
+  // Include snapshot if we have it AND:
+  // 1. Step has spreadsheet context (cellReference or columnHeader) OR
+  // 2. Page is identified as a data table OR
+  // 3. URL indicates it's a spreadsheet domain
+  const isSpreadsheetStep = !!(metadata.cellReference || metadata.columnHeader);
+  const isDataTablePage = pageContext?.pageType === 'data_table';
+  const isSpreadsheetUrl = pageContext?.url ? (
+    pageContext.url.includes('docs.google.com/spreadsheets') ||
+    pageContext.url.includes('excel.office.com') ||
+    pageContext.url.includes('onedrive.live.com') ||
+    pageContext.url.includes('office365.com')
+  ) : false;
+  const shouldIncludeSnapshot = !!(initialFullPageSnapshot && (isDataTablePage || isSpreadsheetStep || isSpreadsheetUrl));
+  
+  console.log(`[detect_variables] analyzeStep for step ${metadata.stepIndex} - Full page snapshot check:`, {
+    hasInitialSnapshot: !!initialFullPageSnapshot,
+    snapshotLength: initialFullPageSnapshot?.substring(0, 50) || 'N/A', // First 50 chars for logging
+    pageType: pageContext?.pageType,
+    pageUrl: pageContext?.url?.substring(0, 80) || 'N/A', // First 80 chars
+    isDataTablePage,
+    isSpreadsheetUrl,
+    cellReference: metadata.cellReference,
+    columnHeader: metadata.columnHeader,
+    isSpreadsheetStep,
+    shouldIncludeSnapshot,
+  });
+  
+  // Add initial full page snapshot FIRST (before cell snapshots) so AI sees headers first
+  // This is critical for identifying column headers when cells are scrolled down
+  if (shouldIncludeSnapshot && initialFullPageSnapshot) {
+    console.log(`[detect_variables] ✅ INCLUDING full page snapshot FIRST for step ${metadata.stepIndex} (spreadsheet cell: ${metadata.cellReference || 'N/A'}, column: ${metadata.columnHeader || 'N/A'})`);
+    const fullPageBase64 = extractBase64Data(initialFullPageSnapshot);
+    const columnLetter = metadata.cellReference ? metadata.cellReference.charAt(0) : 'N/A';
+    const cellRef = metadata.cellReference || 'N/A';
+    
+    // Log base64 data length to verify image is being extracted correctly
+    console.log(`[detect_variables] Full page snapshot base64 length: ${fullPageBase64.length}, original snapshot length: ${initialFullPageSnapshot.length}`);
+    
+    parts.push({
+      text: `\n\n═══════════════════════════════════════════════════════════════════════════════
+📸 SPREADSHEET HEADER DETECTION - INTELLIGENT SEARCH REQUIRED
+═══════════════════════════════════════════════════════════════════════════════
+
+**Cell:** ${cellRef} | **Value:** "${metadata.value || ''}" | **Column:** ${columnLetter}
+
+**IMPORTANT:** The page was refreshed at recording start, so headers are visible in the snapshot. You must INTELLIGENTLY SEARCH for the header row.
+
+**YOUR TASK:**
+1. Examine the entire spreadsheet image below
+2. INTELLIGENTLY find the header row by searching for:
+   - The row with descriptive text labels (not data values)
+   - Rows with different styling (bold, background color, borders)
+   - The topmost row with labels (could be row 1, 2, 3, or any row - FIND IT!)
+   - Headers may be frozen/sticky at the top
+3. Read all headers from left to right (read as many as visible)
+4. Match column ${columnLetter} to its header text
+5. Use that header text as "fieldName"
+
+**STEP-BY-STEP PROCESS:**
+1. Search the entire image for the header row
+2. Identify which row contains headers (could be 1, 2, 3, or any row)
+3. Read all headers left to right (read as many as visible)
+4. Match column ${columnLetter} to its header text
+
+**HANDLING PARTIAL VISIBILITY:**
+- If not all columns are visible in the snapshot, read the headers that ARE visible
+- The header row should be at the top of the image
+- The snapshot may not show all columns if the spreadsheet is wide - that's okay, just read the headers that are visible
+
+**CRITICAL RULES FOR HEADER READING:**
+- READ THE COMPLETE HEADER TEXT - If header says "Marketplace Fee", use "Marketplace Fee" NOT "Marketplace"
+- Headers can be multi-word - read ALL words in the header cell
+- fieldName MUST be the EXACT, COMPLETE header text you see (e.g., "Marketplace Fee", "Store UUID", "ORG ID")
+- fieldName MUST NOT be "${cellRef}" or "${columnLetter}" or "Cell ${cellRef}"
+- fieldName MUST NOT be a partial header (e.g., if header is "Marketplace Fee", don't use just "Marketplace")
+- Do NOT assume headers are in row 1 - SEARCH for them visually
+- If you can't find headers after thorough search, set fieldName to "Unknown Field" AND explain why in imageDescription
+
+**MANDATORY JSON RESPONSE (ALL FIELDS REQUIRED - RESPONSE IS INVALID WITHOUT THESE):**
+{
+  "isVariable": true,
+  "confidence": 0.9,
+  "fieldName": "Marketplace Fee",  // <-- COMPLETE header text for column ${columnLetter} (read ALL words!)
+  "variableName": "marketplaceFee",
+  "imageDescription": "Google Sheets with headers visible at top. Header row is row 1. I can see columns A through F.",  // MANDATORY: Describe what you see
+  "headerRowPosition": "Row 1",  // MANDATORY: Which row contains headers? (1, 2, 3, etc.)
+  "headersFound": "Column A: Store, Column B: Store UUID, Column C: ORG ID, Column D: Marketplace Fee, Column E: Status, Column F: Amount",  // MANDATORY: List ALL visible headers with COMPLETE text
+  "reasoning": "Found header row at row 1. Column ${columnLetter} header is 'Marketplace Fee' (read complete text, not just 'Marketplace')"
+}
+
+**⚠️ CRITICAL REQUIREMENTS - YOUR RESPONSE WILL BE REJECTED IF THESE ARE MISSING:**
+1. **imageDescription** (MANDATORY): Describe the spreadsheet image you see. Example: "Google Sheets with headers visible at top. Header row is row 1. I can see columns A through F."
+2. **headerRowPosition** (MANDATORY): Which row number contains headers? (e.g., "Row 1", "Row 2")
+3. **headersFound** (MANDATORY): List ALL column headers you can see with COMPLETE text. Example: "Column A: Store, Column B: Store UUID, Column C: ORG ID, Column D: Marketplace Fee"
+4. **fieldName** (MANDATORY): The COMPLETE header text with ALL words. If header says "Marketplace Fee", use "Marketplace Fee" NOT just "Marketplace"
+
+**READING COMPLETE HEADER TEXT:**
+- Headers can be multi-word: "Marketplace Fee", "Store UUID", "ORG ID"
+- Read the ENTIRE text in the header cell, not just the first word
+- If you see "Marketplace Fee" in column D, fieldName must be "Marketplace Fee" (both words)
+- If you see "Store UUID" in column B, fieldName must be "Store UUID" (both words)
+
+═══════════════════════════════════════════════════════════════════════════════`
+    });
+    parts.push({
+      inline_data: {
+        mime_type: 'image/jpeg',
+        data: fullPageBase64
+      }
+    });
+    parts.push({
+      text: `\n\n**EXAMINE THE IMAGE ABOVE CAREFULLY**
+
+You must INTELLIGENTLY SEARCH for the header row and read COMPLETE header text:
+
+1. **Search for the header row** - Look for the row with descriptive labels (not data values)
+   - Could be row 1, 2, 3, or any row - FIND IT visually
+   - Headers typically have different styling (bold, colors, borders)
+
+2. **Read ALL visible headers COMPLETELY** - Read from left to right:
+   - Read the ENTIRE text in each header cell (e.g., "Marketplace Fee" not just "Marketplace")
+   - Headers can be multi-word - capture ALL words
+   - List them in headersFound: "Column A: Store, Column B: Store UUID, Column C: ORG ID, Column D: Marketplace Fee"
+
+3. **Match column ${columnLetter}** - Find the COMPLETE header text for column ${columnLetter}
+   - If column D header says "Marketplace Fee", use "Marketplace Fee" (both words!)
+   - If column B header says "Store UUID", use "Store UUID" (both words!)
+
+4. **Use COMPLETE header text as fieldName** - The FULL text you see (e.g., "Marketplace Fee", "Store UUID", "ORG ID")
+
+**MANDATORY: You MUST provide:**
+- imageDescription: What you see in the image
+- headerRowPosition: Which row has headers
+- headersFound: Complete list of ALL visible headers with full text
+- fieldName: The COMPLETE header text (all words, not partial)
+
+**fieldName must be the COMPLETE header text**, NOT "${cellRef}" or "${columnLetter}" or a partial header.
+
+If you can't find headers after thorough search, set fieldName to "Unknown Field" AND explain why in imageDescription.`
+    });
+    console.log(`[detect_variables] Full page snapshot image added FIRST to Gemini request for step ${metadata.stepIndex}`);
+  } else if (initialFullPageSnapshot) {
+    console.log(`[detect_variables] ⚠️ Full page snapshot available but NOT included for step ${metadata.stepIndex}:`, {
+      reason: !isSpreadsheetStep ? 'Not a spreadsheet step (no cellReference/columnHeader)' : 
+              !isDataTablePage ? 'Page not identified as data_table' : 'Unknown reason',
+      cellReference: metadata.cellReference,
+      columnHeader: metadata.columnHeader,
+      pageType: pageContext?.pageType,
+    });
+  }
 
   // Add before snapshot if available (helps see what changed)
   if (beforeSnapshot) {
@@ -290,19 +506,23 @@ async function analyzeStep(
         data: afterBase64
       }
     });
-  } else if (metadata.stepType === 'INPUT' || metadata.stepType === 'KEYBOARD') {
-    // For INPUT steps without snapshots, add a note in the prompt
-    parts[0] = { 
-      text: prompt + '\n\nNOTE: No screenshot available for this input field, but the value entered is: "' + (metadata.value || '') + '". Analyze based on the value, field label, and input type.'
-    };
-  } else if (metadata.stepType === 'CLICK' && metadata.isDropdown) {
-    // For DROPDOWN CLICK steps without snapshots, add a note with available options
-    const optionsNote = metadata.dropdownOptions && metadata.dropdownOptions.length > 0
-      ? `\n\nNOTE: No screenshot available, but you have the dropdown options from the DOM: ${metadata.dropdownOptions.join(', ')}. The selected option is: "${metadata.value || 'unknown'}". Analyze based on the dropdown label, available options, and selected value.`
-      : `\n\nNOTE: No screenshot available. Analyze based on the dropdown label "${metadata.label || 'dropdown'}" and selected value "${metadata.value || 'unknown'}".`;
-    parts[0] = { 
-      text: prompt + optionsNote
-    };
+  }
+
+  if (!afterSnapshot) {
+    if (metadata.stepType === 'INPUT' || metadata.stepType === 'KEYBOARD') {
+      // For INPUT steps without snapshots, add a note in the prompt
+      parts[0] = { 
+        text: prompt + '\n\nNOTE: No screenshot available for this input field, but the value entered is: "' + (metadata.value || '') + '". Analyze based on the value, field label, and input type.'
+      };
+    } else if (metadata.stepType === 'CLICK' && metadata.isDropdown) {
+      // For DROPDOWN CLICK steps without snapshots, add a note with available options
+      const optionsNote = metadata.dropdownOptions && metadata.dropdownOptions.length > 0
+        ? `\n\nNOTE: No screenshot available, but you have the dropdown options from the DOM: ${metadata.dropdownOptions.join(', ')}. The selected option is: "${metadata.value || 'unknown'}". Analyze based on the dropdown label, available options, and selected value.`
+        : `\n\nNOTE: No screenshot available. Analyze based on the dropdown label "${metadata.label || 'dropdown'}" and selected value "${metadata.value || 'unknown'}".`;
+      parts[0] = { 
+        text: prompt + optionsNote
+      };
+    }
   }
 
   const geminiRequest = {
@@ -338,7 +558,7 @@ async function analyzeStep(
     }
 
     const geminiData = await geminiResponse.json();
-    const result = parseVariableResponse(geminiData, metadata);
+    const result = parseVariableResponse(geminiData, metadata, shouldIncludeSnapshot, initialFullPageSnapshot);
     
     console.log(`[detect_variables] After parsing, result for step ${metadata.stepIndex}:`, {
       hasResult: !!result,
@@ -359,6 +579,47 @@ async function analyzeStep(
         return fallbackResult;
       }
       return null;
+    }
+    
+    // VALIDATION: Reject generic field names for spreadsheet steps with full page snapshot
+    // If AI returned a generic name like "Cell X Value" or "Column X Value", it didn't read the header
+    if (result.isVariable && result.fieldName && shouldIncludeSnapshot && initialFullPageSnapshot && metadata.cellReference) {
+      const columnLetter = metadata.cellReference.charAt(0);
+      const genericPatterns = [
+        /^Cell\s+[A-Z]+\d+\s*Value$/i,
+        /^[A-Z]+\d+\s+Cell\s+Value$/i,
+        /^Column\s+[A-Z]+\s+Value$/i,
+        /^[A-Z]+\s+Column\s+Value$/i,
+        /^Cell\s+[A-Z]+\d+$/i,
+        /^Column\s+[A-Z]+$/i,
+        /^[A-Z]+\d+\s+Value$/i,
+        /^[A-Z]+\d+$/i,  // Reject pure cell references like "A66", "B66", "C66"
+      ];
+      
+      // Also reject single-letter field names that match the column letter (e.g., "A", "B", "C")
+      // This means the AI read the column letter label instead of the actual header text
+      const isSingleLetterMatch = result.fieldName.trim().length === 1 && 
+                                  result.fieldName.trim().toUpperCase() === columnLetter.toUpperCase();
+      
+      // Check if fieldName is a cell reference (e.g., "A66", "B65", "C66")
+      const isCellReference = /^[A-Z]+\d+$/i.test(result.fieldName.trim());
+      
+      const isGeneric = genericPatterns.some(pattern => pattern.test(result.fieldName)) || isSingleLetterMatch || isCellReference;
+      if (isGeneric) {
+        let reason = '';
+        if (isCellReference) {
+          reason = `AI returned cell reference "${result.fieldName}" instead of reading actual header text from the snapshot`;
+        } else if (isSingleLetterMatch) {
+          reason = `AI returned column letter "${result.fieldName}" instead of reading actual header text`;
+        } else {
+          reason = `AI did not read column header from snapshot`;
+        }
+        console.log(`[detect_variables] ⚠️ REJECTING generic fieldName "${result.fieldName}" for step ${metadata.stepIndex} - ${reason}`);
+        console.log(`[detect_variables] Cell reference: ${metadata.cellReference}, Expected to read header TEXT from snapshot, not use cell reference "${result.fieldName}"`);
+        // Return null to indicate AI failed to read the header properly
+        // This will trigger fallback or return null
+        return null;
+      }
     }
     
     // AI returned a result - trust it
@@ -383,12 +644,14 @@ async function analyzeStep(
 
 /**
  * Build prompt for variable detection based on step type
+ * @param initialFullPageSnapshot - Optional full page snapshot for spreadsheet column header detection
  */
 function buildVariableDetectionPrompt(
   metadata: StepMetadata,
   pageContext?: { url: string; title: string; pageType?: string },
   beforeSnapshot?: string,
-  afterSnapshot?: string
+  afterSnapshot?: string,
+  initialFullPageSnapshot?: string
 ): string {
   let prompt = `PRODUCT CONTEXT:
 You are analyzing steps from a browser automation tool called "GhostWriter" (also known as Autoflow). 
@@ -425,6 +688,116 @@ ${metadata.elementRole ? `- Element Role: ${metadata.elementRole}` : ''}
 ${metadata.elementTag ? `- Element Tag: ${metadata.elementTag}` : ''}
 
 `;
+
+  // CRITICAL: Include column header for spreadsheet cells
+  // This is the most reliable way to identify what the column represents
+  if (metadata.columnHeader || metadata.cellReference) {
+    prompt += `SPREADSHEET CONTEXT (HIGH PRIORITY):
+${metadata.columnHeader ? `- Column Header: "${metadata.columnHeader}"` : ''}
+${metadata.cellReference ? `- Cell Reference: ${metadata.cellReference}` : ''}
+${metadata.columnHeader ? `- Cell Value: "${metadata.value || ''}"` : ''}
+
+**IMPORTANT: If columnHeader is provided, USE IT as the field name for variable naming.**
+The column header (e.g., "${metadata.columnHeader}") accurately describes what this cell represents.
+For example, if columnHeader is "Price" and value is "100", the variable should be named "price" or "priceAmount".
+
+`;
+  }
+
+  // CRITICAL: Include initial full page snapshot for spreadsheet column header detection
+  // This allows AI to see all column headers even when cells are scrolled down
+  // Check if this is a spreadsheet domain by URL or if step has spreadsheet context
+  const isSpreadsheetUrl = pageContext?.url ? (
+    pageContext.url.includes('docs.google.com/spreadsheets') ||
+    pageContext.url.includes('excel.office.com') ||
+    pageContext.url.includes('onedrive.live.com') ||
+    pageContext.url.includes('office365.com')
+  ) : false;
+  const hasSpreadsheetContext = !!(metadata.cellReference || metadata.columnHeader);
+  const isDataTablePage = pageContext?.pageType === 'data_table';
+  const shouldIncludeFullPageSnapshot = !!(initialFullPageSnapshot && (isSpreadsheetUrl || isDataTablePage || hasSpreadsheetContext));
+  
+  // Define cellRef and columnLetter for use in prompt
+  const cellRef = metadata.cellReference || 'N/A';
+  const columnLetter = metadata.cellReference ? metadata.cellReference.charAt(0) : 'N/A';
+  
+  if (shouldIncludeFullPageSnapshot && initialFullPageSnapshot) {
+    prompt += `\n\n═══════════════════════════════════════════════════════════════
+🎯 CRITICAL: SPREADSHEET COLUMN HEADER DETECTION (HIGHEST PRIORITY)
+═══════════════════════════════════════════════════════════════
+
+A FULL PAGE SNAPSHOT of the spreadsheet (captured at recording start after page refresh) is provided below.
+**The page was refreshed at recording start, so headers are visible in the snapshot.**
+**YOU MUST USE THIS SNAPSHOT TO INTELLIGENTLY SEARCH FOR AND IDENTIFY THE COLUMN HEADER** for the cell being analyzed.
+
+CURRENT CELL BEING ANALYZED:
+- Cell Reference: ${cellRef}
+- Cell Value: "${metadata.value || ''}"
+${metadata.columnHeader ? `- Detected Column Header: "${metadata.columnHeader}" (but verify with snapshot)` : ''}
+
+**STEP-BY-STEP INSTRUCTIONS (MANDATORY):**
+
+1. **LOOK AT THE FULL PAGE SNAPSHOT FIRST** - This shows the entire spreadsheet including column headers
+
+2. **INTELLIGENTLY FIND THE HEADER ROW** - Headers can be in ANY row. Look for:
+   - The row with descriptive text labels (not data values)
+   - Different visual styling (bold, background color, borders)
+   - Typically the topmost row with labels, but could be row 1, 2, 3, or any row
+   - May be frozen/sticky at the top
+
+3. **IDENTIFY ALL COLUMN HEADERS** - Once you find the header row:
+   - Read each column's COMPLETE header text from left to right
+   - Read ALL words in each header (e.g., "Marketplace Fee" not just "Marketplace")
+   - Note which row contains the headers (e.g., "Row 1", "Row 2", etc.)
+   - Headers can be multi-word - capture the FULL text
+
+4. **MATCH THE CELL TO ITS COLUMN** - Cell ${cellRef} is in column ${columnLetter}:
+   - Find the COMPLETE header text for column ${columnLetter} from the header row you identified
+   - Read the ENTIRE header text, including all words (e.g., if it says "Marketplace Fee", use both words)
+   - The header text tells you what this column represents
+
+5. **USE THE COMPLETE HEADER TEXT AS FIELD NAME** - Use the EXACT, FULL text you see:
+   - "Marketplace Fee" (not "Marketplace")
+   - "Store UUID" (not "Store")
+   - "ORG ID" (not "ORG")
+   - "Price per Unit" (not "Price")
+
+**EXAMPLES:**
+- Example 1: Cell reference: "B15", value: "1000"
+  - Examine the image and find the header row (could be row 1, 2, or any row)
+  - If header row is row 1 and column B header says "Price":
+    - headerRowPosition: "Row 1"
+    - headersFound: "Column A: Name, Column B: Price, Column C: Quantity"
+    - fieldName: "Price"
+    - variableName: "price"
+    - confidence: 0.9+
+
+- Example 2: Cell reference: "D43", value: "40%"
+  - Examine the image and find the header row
+  - If header row is row 1 and column D header says "Marketplace Fee" (TWO WORDS):
+    - headerRowPosition: "Row 1"
+    - headersFound: "Column A: Store, Column B: Store UUID, Column C: ORG ID, Column D: Marketplace Fee, Column E: Status"
+    - fieldName: "Marketplace Fee"  // <-- COMPLETE text, not just "Marketplace"
+    - variableName: "marketplaceFee"
+    - confidence: 0.9+
+
+**HANDLING PARTIAL VISIBILITY:**
+- If not all columns are visible in the snapshot, read the headers that ARE visible
+- The header row should be at the top of the image (page was refreshed, so it starts at top)
+- The snapshot may not show all columns if the spreadsheet is wide - that's okay, just read the headers that are visible
+
+**CRITICAL RULES:**
+- ✅ ALWAYS examine the full page snapshot FIRST
+- ✅ INTELLIGENTLY SEARCH for the header row - don't assume it's row 1
+- ✅ Headers can be in ANY row - find them by visual inspection
+- ✅ Use the ACTUAL header text you see in the image
+- ✅ The header text is the most accurate field name
+- ❌ DO NOT hardcode "row 1" or "A1/B1" - SEARCH for headers intelligently
+- ❌ DO NOT use generic names like "Cell ${cellRef}" or "Column ${columnLetter}"
+- ❌ DO NOT use cell references like "${cellRef}" as field names
+
+═══════════════════════════════════════════════════════════════\n\n`;
+  }
 
   if (metadata.stepType === 'INPUT' || metadata.stepType === 'KEYBOARD') {
     prompt += `ANALYZE THIS INPUT FIELD USING VISUAL CONTEXT:
@@ -585,8 +958,58 @@ CRITICAL INSTRUCTIONS:
   "reasoning": "<brief explanation of why this is/isn't a variable>"
 }
 
-IMPORTANT:
-- Focus on what a human would recognize as "user data" vs "system data"
+CRITICAL INSTRUCTIONS FOR FIELD NAMING:
+${metadata.columnHeader 
+  ? `- **USE THE COLUMN HEADER "${metadata.columnHeader}" AS THE FIELD NAME**` 
+  : ''}
+${metadata.columnHeader 
+  ? `- fieldName should be "${metadata.columnHeader}" or a variation of it` 
+  : ''}
+${metadata.columnHeader 
+  ? `- variableName should be camelCase version of "${metadata.columnHeader}" (e.g., "${metadata.columnHeader.toLowerCase().replace(/\s+/g, '')}")` 
+  : ''}
+${initialFullPageSnapshot && (pageContext?.pageType === 'data_table' || metadata.cellReference)
+  ? `
+🎯 **SPREADSHEET MODE: FULL PAGE SNAPSHOT PROVIDED**
+- **The page was refreshed at recording start, so headers are visible in the snapshot**
+- **YOU MUST EXAMINE THE FULL PAGE SNAPSHOT IMAGE TO INTELLIGENTLY SEARCH FOR THE COLUMN HEADER**
+- The snapshot shows the entire spreadsheet including column headers
+- INTELLIGENTLY find the header row (could be row 1, 2, 3, or any row - SEARCH for it visually)
+- Identify which row contains headers by looking for descriptive labels (not data values)
+- Extract column ${metadata.cellReference ? metadata.cellReference.charAt(0) : 'N/A'} header text from the header row you found
+- Read the COMPLETE, ACTUAL header text from the image (e.g., "Marketplace Fee", "Store UUID", "ORG ID", "Price per Unit")
+- Read ALL words in the header - if header says "Marketplace Fee", use "Marketplace Fee" NOT just "Marketplace"
+- Use that EXACT, COMPLETE header text as the fieldName - DO NOT use "Cell ${metadata.cellReference || 'N/A'}" or "Column ${metadata.cellReference ? metadata.cellReference.charAt(0) : 'N/A'}"
+- DO NOT truncate multi-word headers - read the FULL text
+- The column header text from the snapshot is MORE ACCURATE than any other metadata
+- If not all columns are visible, read the headers that ARE visible with their COMPLETE text
+`
+  : ''}
+${initialFullPageSnapshot && (pageContext?.pageType === 'data_table' || metadata.cellReference)
+  ? `\n🎯 **SPREADSHEET MODE: FULL PAGE SNAPSHOT PROVIDED**\n`
+  : ''}
+${initialFullPageSnapshot && (pageContext?.pageType === 'data_table' || metadata.cellReference)
+  ? `- **YOU MUST EXAMINE THE FULL PAGE SNAPSHOT IMAGE TO INTELLIGENTLY FIND THE COLUMN HEADER**\n`
+  : ''}
+${initialFullPageSnapshot && (pageContext?.pageType === 'data_table' || metadata.cellReference)
+  ? `- Look at the full page snapshot and INTELLIGENTLY find the header row (could be any row, not just row 1)\n`
+  : ''}
+${initialFullPageSnapshot && (pageContext?.pageType === 'data_table' || metadata.cellReference)
+  ? `- Identify which row contains headers by looking for descriptive labels (not data values)\n`
+  : ''}
+${initialFullPageSnapshot && (pageContext?.pageType === 'data_table' || metadata.cellReference)
+  ? `- Extract the header text for column ${metadata.cellReference ? metadata.cellReference.charAt(0) : 'N/A'} from the header row you found\n`
+  : ''}
+${initialFullPageSnapshot && (pageContext?.pageType === 'data_table' || metadata.cellReference)
+  ? `- Use the actual header text as the field name - it takes HIGHEST PRIORITY over all other metadata\n`
+  : ''}
+${initialFullPageSnapshot && (pageContext?.pageType === 'data_table' || metadata.cellReference)
+  ? `- Remember: Page was refreshed, so headers are visible. SEARCH for them intelligently, don't assume row 1.\n`
+  : ''}
+${!metadata.columnHeader && !initialFullPageSnapshot
+  ? '- If columnHeader is not provided and no full page snapshot, use field label or visual analysis'
+  : ''}
+- If columnHeader is provided, prioritize it over field label or placeholder
 - Higher confidence (0.8+) for clear cases like email, password, name fields
 - Medium confidence (0.5-0.8) for ambiguous cases
 - Lower confidence (<0.5) if unsure - lean toward NOT marking as variable
@@ -601,7 +1024,9 @@ IMPORTANT:
  */
 function parseVariableResponse(
   geminiData: any,
-  metadata: StepMetadata
+  metadata: StepMetadata,
+  shouldIncludeSnapshot: boolean = false,
+  initialFullPageSnapshot?: string
 ): VariableDefinition | null {
   try {
     const text = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -733,27 +1158,52 @@ function parseVariableResponse(
                   // We need to find the LAST comma that's followed by an incomplete property
                   // Pattern: , "key": "value (no closing quote, extends to end)
                   
-                  // First, try to find all commas and check which one starts an incomplete property
-                  let lastIncompleteCommaIdx = -1;
+                  // First, try to find the incomplete property by looking for patterns like: "key": "value (no closing quote)
+                  // We want to preserve all complete properties and only remove the incomplete one
+                  let lastIncompletePropStart = -1;
                   let lastIncompletePropName = '';
                   
-                  // Find all commas, then check backwards from the end
+                  // Look for pattern: , "key": "value (incomplete - no closing quote before end or })
+                  // Search backwards from the end
                   for (let i = jsonText.length - 1; i >= 0; i--) {
                     if (jsonText[i] === ',') {
                       // Check if this comma starts an incomplete property
-                      const afterComma = jsonText.substring(i).trim();
-                      const propMatch = afterComma.match(/^,\s*"([^"]+)":\s*"([\s\S]*)$/);
-                      if (propMatch) {
-                        lastIncompleteCommaIdx = i;
-                        lastIncompletePropName = propMatch[1];
-                        break;
+                      const afterComma = jsonText.substring(i + 1).trim();
+                      // Match incomplete property: "key": "value (no closing quote)
+                      const incompleteMatch = afterComma.match(/^"([^"]+)":\s*"([^"]*)$/);
+                      if (incompleteMatch) {
+                        // Check if this property is incomplete (no closing quote before } or end)
+                        const propValue = incompleteMatch[2];
+                        // If the value doesn't have a closing quote and extends to the end, it's incomplete
+                        if (!propValue.includes('"') || jsonText.substring(i + 1).trim().endsWith('"')) {
+                          // This might be complete, check if there's a closing quote after the value
+                          const fullProp = jsonText.substring(i + 1);
+                          if (!fullProp.match(/^"([^"]+)":\s*"[^"]*"\s*[,}]/)) {
+                            // No closing quote before comma or }, so it's incomplete
+                            lastIncompletePropStart = i + 1;
+                            lastIncompletePropName = incompleteMatch[1];
+                            break;
+                          }
+                        } else {
+                          // Has quotes but might still be incomplete if it extends to end
+                          const remaining = jsonText.substring(i + 1);
+                          if (!remaining.match(/^"([^"]+)":\s*"[^"]*"\s*[,}]/)) {
+                            lastIncompletePropStart = i + 1;
+                            lastIncompletePropName = incompleteMatch[1];
+                            break;
+                          }
+                        }
                       }
                     }
                   }
                   
-                  if (lastIncompleteCommaIdx >= 0) {
-                    // Remove the incomplete property (everything from the comma to the end)
-                    jsonText = jsonText.substring(0, lastIncompleteCommaIdx) + '}';
+                  if (lastIncompletePropStart >= 0) {
+                    // Remove only the incomplete property, preserve everything before it
+                    // Find the comma before the incomplete property
+                    const beforeProp = jsonText.substring(0, lastIncompletePropStart).trim();
+                    // Remove trailing comma if present
+                    const cleaned = beforeProp.replace(/,\s*$/, '');
+                    jsonText = cleaned + '}';
                     console.log(`[detect_variables] Removed incomplete property "${lastIncompletePropName}" for step ${metadata.stepIndex}`);
                   } else {
                     // Try other patterns
@@ -787,26 +1237,38 @@ function parseVariableResponse(
               // The incomplete property is the one that extends to the end without a closing quote
               // We need to find the LAST comma that's followed by an incomplete property
               
-              // Find all commas, then check backwards from the end
-              let lastIncompleteCommaIdx = -1;
+              // Find the incomplete property by looking for patterns like: "key": "value (no closing quote)
+              // We want to preserve all complete properties and only remove the incomplete one
+              let lastIncompletePropStart = -1;
               let lastIncompletePropName = '';
               
+              // Look for pattern: , "key": "value (incomplete - no closing quote before end or })
+              // Search backwards from the end
               for (let i = jsonText.length - 1; i >= 0; i--) {
                 if (jsonText[i] === ',') {
                   // Check if this comma starts an incomplete property
-                  const afterComma = jsonText.substring(i).trim();
-                  const propMatch = afterComma.match(/^,\s*"([^"]+)":\s*"([\s\S]*)$/);
-                  if (propMatch) {
-                    lastIncompleteCommaIdx = i;
-                    lastIncompletePropName = propMatch[1];
-                    break;
+                  const afterComma = jsonText.substring(i + 1).trim();
+                  // Match incomplete property: "key": "value (no closing quote)
+                  const incompleteMatch = afterComma.match(/^"([^"]+)":\s*"([^"]*)$/);
+                  if (incompleteMatch) {
+                    // Check if this property is incomplete (no closing quote before } or end)
+                    const remaining = jsonText.substring(i + 1);
+                    if (!remaining.match(/^"([^"]+)":\s*"[^"]*"\s*[,}]/)) {
+                      lastIncompletePropStart = i + 1;
+                      lastIncompletePropName = incompleteMatch[1];
+                      break;
+                    }
                   }
                 }
               }
               
-              if (lastIncompleteCommaIdx >= 0) {
-                // Remove the incomplete property (everything from the comma to the end)
-                jsonText = jsonText.substring(0, lastIncompleteCommaIdx) + '}';
+              if (lastIncompletePropStart >= 0) {
+                // Remove only the incomplete property, preserve everything before it
+                // Find the comma before the incomplete property
+                const beforeProp = jsonText.substring(0, lastIncompletePropStart).trim();
+                // Remove trailing comma if present
+                const cleaned = beforeProp.replace(/,\s*$/, '');
+                jsonText = cleaned + '}';
                 console.log(`[detect_variables] Removed incomplete property "${lastIncompletePropName}" (fallback) for step ${metadata.stepIndex}`);
               } else {
                 // Try other patterns
@@ -844,7 +1306,20 @@ function parseVariableResponse(
     } catch (parseError) {
       console.error(`[detect_variables] Failed to parse JSON for step ${metadata.stepIndex}:`, parseError);
       console.error(`[detect_variables] JSON text (first 500 chars):`, jsonText.substring(0, 500));
-      return null;
+      
+      // Try to extract fieldName from raw text as fallback
+      const fieldNameMatch = text.match(/"fieldName":\s*"([^"]+)"/);
+      if (fieldNameMatch && fieldNameMatch[1]) {
+        console.log(`[detect_variables] Extracted fieldName from raw text: "${fieldNameMatch[1]}"`);
+        parsed = {
+          isVariable: text.includes('"isVariable":\s*true'),
+          confidence: parseFloat(text.match(/"confidence":\s*([\d.]+)/)?.[1] || '0.5'),
+          fieldName: fieldNameMatch[1],
+          reasoning: text.match(/"reasoning":\s*"([^"]+)"/)?.[1],
+        };
+      } else {
+        return null;
+      }
     }
 
     // Log the AI response for debugging
@@ -861,19 +1336,64 @@ function parseVariableResponse(
     const isVariable = parsed.isVariable === true;
     const confidence = parseFloat(parsed.confidence) || 0;
 
+    // Check if diagnostic fields are missing (indicates AI may not have read snapshot properly)
+    const hasDiagnostics = !!(parsed.imageDescription && parsed.headerRowPosition && parsed.headersFound);
+    if (!hasDiagnostics && shouldIncludeSnapshot && initialFullPageSnapshot) {
+      console.warn(`[detect_variables] ⚠️ Step ${metadata.stepIndex}: Diagnostic fields missing! AI may not have read snapshot properly.`, {
+        hasImageDescription: !!parsed.imageDescription,
+        hasHeaderRowPosition: !!parsed.headerRowPosition,
+        hasHeadersFound: !!parsed.headersFound,
+        fieldName: parsed.fieldName,
+      });
+    }
+
+    // Post-processing: Check if fieldName is a partial header (e.g., "Marketplace" when it should be "Marketplace Fee")
+    let finalFieldName = parsed.fieldName || metadata.label || 'Unknown Field';
+    if (parsed.headersFound && parsed.fieldName && shouldIncludeSnapshot && metadata.cellReference) {
+      const columnLetter = metadata.cellReference.charAt(0);
+      const headersFound = parsed.headersFound.toLowerCase();
+      const fieldNameLower = parsed.fieldName.toLowerCase();
+      
+      // Look for column header in headersFound that starts with fieldName but is longer
+      // Pattern: "Column X: [header text]" where header text starts with fieldName
+      const columnPattern = new RegExp(`column\\s+${columnLetter.toLowerCase()}\\s*:\\s*([^,]+)`, 'i');
+      const match = parsed.headersFound.match(columnPattern);
+      
+      if (match && match[1]) {
+        const fullHeaderText = match[1].trim();
+        const fullHeaderLower = fullHeaderText.toLowerCase();
+        
+        // If full header starts with fieldName but is longer, use the full header
+        if (fullHeaderLower.startsWith(fieldNameLower) && fullHeaderText.length > parsed.fieldName.length) {
+          console.log(`[detect_variables] 🔧 Step ${metadata.stepIndex}: Detected partial header. Fixing "${parsed.fieldName}" → "${fullHeaderText}"`);
+          finalFieldName = fullHeaderText;
+        } else if (fullHeaderLower !== fieldNameLower && fullHeaderText.length > 0) {
+          // If headersFound has a different (likely complete) header, use it
+          console.log(`[detect_variables] 🔧 Step ${metadata.stepIndex}: Using complete header from headersFound: "${fullHeaderText}" (was: "${parsed.fieldName}")`);
+          finalFieldName = fullHeaderText;
+        }
+      }
+    }
+
     console.log(`[detect_variables] Parsed AI response for step ${metadata.stepIndex}:`, {
       parsedIsVariable: parsed.isVariable,
       parsedConfidence: parsed.confidence,
       isVariable,
       confidence,
       fieldName: parsed.fieldName,
+      finalFieldName,
+      imageDescription: parsed.imageDescription || 'NOT PROVIDED',
+      rowsVisible: parsed.rowsVisible || 'NOT PROVIDED',
+      headerRowPosition: parsed.headerRowPosition || 'NOT PROVIDED',
+      headersFound: parsed.headersFound || 'NOT PROVIDED',
       reasoning: parsed.reasoning,
+      hasDiagnostics,
     });
 
     const result: VariableDefinition = {
       stepIndex: metadata.stepIndex,
       stepId: metadata.stepId,
-      fieldName: parsed.fieldName || metadata.label || 'Unknown Field',
+      fieldName: finalFieldName,
       fieldLabel: metadata.label,
       variableName: parsed.variableName || generateVariableName(parsed.fieldName || metadata.label),
       defaultValue: metadata.value || '',
@@ -1023,11 +1543,16 @@ function generateVariableName(fieldName: string): string {
  */
 function generateCacheKey(payload: DetectVariablesRequest): string {
   // Create a hash based on step metadata and page context
+  // NOTE: We intentionally EXCLUDE initialFullPageSnapshot from cache key
+  // because the snapshot is large and we want to cache based on steps only
+  // The snapshot will be used during analysis even if cache is hit
   const keyData = {
     type: 'detect_variables',
     stepCount: payload.steps.length,
     stepIds: payload.steps.map(s => s.metadata.stepId).join(','),
     pageUrl: payload.pageContext?.url?.substring(0, 100),
+    // Intentionally NOT including initialFullPageSnapshot in cache key
+    // to allow snapshot to be used even with cached results
   };
   
   const str = JSON.stringify(keyData);

@@ -49,6 +49,74 @@ chrome.runtime.onMessage.addListener(
       return true; // Keep channel open for async
     }
 
+    // Handle GET_ZOOM request
+    if (message.type === 'GET_ZOOM') {
+      const targetTabId = (message.payload?.tabId) || sender.tab?.id;
+      if (!targetTabId) {
+        sendResponse({
+          success: false,
+          error: 'No tab ID available'
+        });
+        return false;
+      }
+
+      chrome.tabs.getZoom(targetTabId, (zoomFactor) => {
+        if (chrome.runtime.lastError) {
+          console.error('📸 Service Worker: Get zoom failed:', chrome.runtime.lastError.message);
+          sendResponse({
+            success: false,
+            error: chrome.runtime.lastError.message
+          });
+        } else {
+          console.log(`📸 Service Worker: Current zoom for tab ${targetTabId}:`, zoomFactor);
+          sendResponse({
+            success: true,
+            data: { zoomFactor }
+          });
+        }
+      });
+      return true; // Keep channel open for async
+    }
+
+    // Handle SET_ZOOM request
+    if (message.type === 'SET_ZOOM') {
+      const targetTabId = (message.payload?.tabId) || sender.tab?.id;
+      const zoomFactor = message.payload?.zoomFactor;
+      
+      if (!targetTabId) {
+        sendResponse({
+          success: false,
+          error: 'No tab ID available'
+        });
+        return false;
+      }
+
+      if (typeof zoomFactor !== 'number' || zoomFactor < 0.25 || zoomFactor > 5.0) {
+        sendResponse({
+          success: false,
+          error: 'Invalid zoom factor. Must be between 0.25 and 5.0'
+        });
+        return false;
+      }
+
+      chrome.tabs.setZoom(targetTabId, zoomFactor, () => {
+        if (chrome.runtime.lastError) {
+          console.error('📸 Service Worker: Set zoom failed:', chrome.runtime.lastError.message);
+          sendResponse({
+            success: false,
+            error: chrome.runtime.lastError.message
+          });
+        } else {
+          console.log(`📸 Service Worker: Zoom set to ${zoomFactor} for tab ${targetTabId}`);
+          sendResponse({
+            success: true,
+            data: { zoomFactor }
+          });
+        }
+      });
+      return true; // Keep channel open for async
+    }
+
     // If message comes from content script, forward to sidepanel
     if (sender.tab) {
       // Message from content script - could forward to sidepanel if needed

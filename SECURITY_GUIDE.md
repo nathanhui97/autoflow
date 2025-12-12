@@ -207,3 +207,5 @@ If you have security concerns or questions:
 1. Review this guide
 2. Check Supabase documentation: https://supabase.com/docs/guides/functions/secrets
 3. Review Google Cloud API key security: https://cloud.google.com/docs/authentication/api-keys
+
+

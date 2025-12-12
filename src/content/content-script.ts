@@ -79,9 +79,17 @@ function handleFullMessage(
         (async () => {
           try {
             await recordingManager.stop();
+            // Include initial full page snapshot if available (for spreadsheet column headers)
+            const initialSnapshot = recordingManager.getInitialFullPageSnapshot();
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content-script.ts:STOP_RECORDING:beforeResponse',message:'Preparing STOP_RECORDING response',data:{hasSnapshot:!!initialSnapshot,snapshotLength:initialSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'J'})}).catch(()=>{});
+            // #endregion
             sendResponse({
               success: true,
-              data: { message: 'Recording stopped' },
+              data: { 
+                message: 'Recording stopped',
+                initialFullPageSnapshot: initialSnapshot || undefined,
+              },
             });
           } catch (error) {
             sendResponse({
@@ -91,6 +99,65 @@ function handleFullMessage(
           }
         })();
         return true; // Keep channel open for async response
+      }
+
+      case 'GET_INITIAL_SNAPSHOT': {
+        if (!recordingManager) {
+          sendResponse({
+            success: false,
+            error: 'RecordingManager not initialized',
+          });
+          return false;
+        }
+        const snapshot = recordingManager.getInitialFullPageSnapshot();
+        sendResponse({
+          success: true,
+          data: { initialFullPageSnapshot: snapshot || null },
+        });
+        return false;
+      }
+
+      case 'REFRESH_PAGE': {
+        // Check if current page is a spreadsheet domain
+        const isSpreadsheet = VisualSnapshotService.isSpreadsheetDomain();
+        
+        if (!isSpreadsheet) {
+          sendResponse({
+            success: false,
+            error: 'Refresh is only available for spreadsheet domains',
+          });
+          return false;
+        }
+
+        try {
+          console.log('📸 GhostWriter: Refreshing page to capture headers...');
+          
+          // Set flag in sessionStorage to auto-start recording after refresh
+          sessionStorage.setItem('ghostwriter_auto_start_recording', 'true');
+          
+          // Ensure scroll is at (0, 0) before refresh
+          window.scrollTo(0, 0);
+          
+          // Small delay to ensure scroll completes, then refresh
+          setTimeout(() => {
+            window.location.reload();
+          }, 100);
+          
+          // Send immediate response (page will reload, so async response won't work)
+          sendResponse({
+            success: true,
+            data: { message: 'Page refresh initiated' },
+          });
+        } catch (error) {
+          console.error('📸 GhostWriter: Refresh failed:', error);
+          sessionStorage.removeItem('ghostwriter_auto_start_recording');
+          sendResponse({
+            success: false,
+            error: error instanceof Error ? error.message : 'Failed to refresh page',
+          });
+        }
+        
+        return false;
       }
 
       case 'EXECUTE_STEP': {
@@ -270,6 +337,53 @@ try {
 try {
   recordingManager = new RecordingManager();
   console.log('GhostWriter: RecordingManager initialized successfully');
+  
+  // Check if we should auto-start recording after page refresh
+  const shouldAutoStart = sessionStorage.getItem('ghostwriter_auto_start_recording') === 'true';
+  if (shouldAutoStart) {
+    console.log('📸 GhostWriter: Auto-starting recording after page refresh');
+    sessionStorage.removeItem('ghostwriter_auto_start_recording');
+    
+    // Wait for page to fully load and spreadsheet to render
+    const startRecording = async () => {
+      // Wait for page to be fully loaded
+      if (document.readyState !== 'complete') {
+        await new Promise(resolve => {
+          if (document.readyState === 'complete') {
+            resolve(undefined);
+          } else {
+            window.addEventListener('load', () => resolve(undefined), { once: true });
+          }
+        });
+      }
+      
+      // Additional wait for spreadsheet to fully render
+      await new Promise(resolve => setTimeout(resolve, 300));
+      
+      // Ensure scroll is at (0, 0) to guarantee header row is visible
+      window.scrollTo(0, 0);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Verify scroll position
+      const scrollY = window.scrollY || window.pageYOffset || 0;
+      if (scrollY !== 0) {
+        console.warn('📸 GhostWriter: Scroll position not at top after refresh, forcing scroll');
+        window.scrollTo(0, 0);
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+      
+      console.log('📸 GhostWriter: Page refreshed, scroll position:', { x: window.scrollX, y: window.scrollY });
+      
+      // Start recording
+      if (recordingManager) {
+        recordingManager.start();
+      }
+    };
+    
+    startRecording().catch((error) => {
+      console.error('📸 GhostWriter: Failed to auto-start recording after refresh:', error);
+    });
+  }
 } catch (error) {
   console.error('GhostWriter: Failed to initialize RecordingManager:', error);
   if (error instanceof Error) {

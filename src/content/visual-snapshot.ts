@@ -37,11 +37,92 @@ export class VisualSnapshotService {
   private static readonly CACHE_TTL = 500; // 500ms cache for rapid captures
 
   /**
+   * Check if current page is a spreadsheet domain (Google Sheets or Excel Online)
+   */
+  static isSpreadsheetDomain(): boolean {
+    const url = window.location.href.toLowerCase();
+    const hostname = window.location.hostname.toLowerCase();
+    
+    // Google Sheets
+    if (hostname.includes('docs.google.com') && url.includes('/spreadsheets')) {
+      return true;
+    }
+    
+    // Excel Online / Office 365
+    if (hostname.includes('office.com') || 
+        hostname.includes('excel.office.com') || 
+        hostname.includes('onedrive.live.com') ||
+        hostname.includes('office365.com')) {
+      return true;
+    }
+    
+    return false;
+  }
+
+  /**
+   * Check if element is a spreadsheet cell
+   * Only returns true if on spreadsheet domain AND element is in spreadsheet context
+   */
+  static isSpreadsheetCell(element: Element): boolean {
+    // First check domain - must be on spreadsheet domain
+    if (!this.isSpreadsheetDomain()) {
+      return false;
+    }
+    
+    // Import ContextScanner dynamically to avoid circular dependencies
+    // Check for spreadsheet container
+    const className = element.className?.toString().toLowerCase() || '';
+    
+    // Google Sheets indicators
+    if (className.includes('input-box') || 
+        className.includes('cell-input') ||
+        className.includes('waffle') ||
+        className.includes('grid-container') ||
+        className.includes('grid-table-container')) {
+      return true;
+    }
+    
+    // Excel Online indicators
+    if (className.includes('excel') || 
+        className.includes('office-grid')) {
+      return true;
+    }
+    
+    // Check if element is in a spreadsheet container
+    let current: Element | null = element;
+    let level = 0;
+    while (current && level < 10) {
+      const currentClass = current.className?.toString().toLowerCase() || '';
+      const currentId = current.id?.toLowerCase() || '';
+      
+      if (currentClass.includes('grid-container') ||
+          currentClass.includes('grid-table-container') ||
+          currentClass.includes('waffle') ||
+          currentClass.includes('spreadsheet') ||
+          currentId.includes('spreadsheet') ||
+          currentId.includes('grid')) {
+        return true;
+      }
+      
+      current = current.parentElement;
+      level++;
+    }
+    
+    return false;
+  }
+
+  /**
    * Capture viewport and element snippet using Chrome API + Canvas crop
    * This avoids html2canvas limitations with Google Sheets canvas elements
    */
   static async capture(element: Element): Promise<CaptureResult | null> {
     try {
+      // First check domain - use spreadsheet capture on spreadsheet domains
+      if (this.isSpreadsheetDomain() && this.isSpreadsheetCell(element)) {
+        console.log('📸 GhostWriter: Detected spreadsheet cell, using enhanced capture');
+        return await this.captureSpreadsheetCell(element);
+      }
+
       // Step A: Get Coordinates BEFORE the async call (in case DOM shifts)
       const rect = element.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) {
@@ -76,10 +157,237 @@ export class VisualSnapshotService {
   }
 
   /**
+   * Capture spreadsheet cell with enhanced header detection
+   * Only activates on spreadsheet domains
+   * Ensures column headers are included in snapshot even when scrolled
+   */
+  static async captureSpreadsheetCell(element: Element): Promise<CaptureResult | null> {
+    try {
+      // Only activate on spreadsheet domains
+      if (!this.isSpreadsheetDomain()) {
+        console.log('📸 GhostWriter: Not on spreadsheet domain, using standard capture');
+        return await this.capture(element);
+      }
+
+      // Get element coordinates
+      const rect = element.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) {
+        console.warn('📸 GhostWriter: Spreadsheet cell has zero dimensions, skipping snapshot');
+        return null;
+      }
+
+      console.log('📸 GhostWriter: Capturing spreadsheet cell with header detection');
+      
+      // Get viewport screenshot
+      const response = await chrome.runtime.sendMessage({ type: 'CAPTURE_VIEWPORT' });
+      if (!response || !response.data?.snapshot) {
+        console.warn('📸 GhostWriter: No snapshot received from service worker');
+        return null;
+      }
+      
+      const fullScreenshot = response.data.snapshot;
+      console.log('📸 GhostWriter: Viewport screenshot captured for spreadsheet cell');
+
+      // Calculate crop region that includes header row
+      // Use larger vertical padding (up to 500px) to ensure header is captured
+      const headerBounds = await this.calculateSpreadsheetCropRegion(element, rect);
+      const extendedRect = headerBounds || rect;
+      
+      // Use larger padding for spreadsheet cells to ensure headers are visible
+      const verticalPadding = headerBounds ? 0 : 500; // If we found header bounds, use them; otherwise use large padding
+      const horizontalPadding = 200;
+      
+      const snippet = await this.cropImageWithHeader(
+        fullScreenshot, 
+        rect, 
+        extendedRect,
+        horizontalPadding, 
+        verticalPadding
+      );
+      
+      console.log('📸 GhostWriter: Spreadsheet cell snippet cropped with header context');
+
+      return {
+        viewport: fullScreenshot,
+        elementSnippet: snippet
+      };
+    } catch (err) {
+      console.warn("📸 GhostWriter Spreadsheet Cell Capture Failed:", err);
+      // Fallback to standard capture
+      return await this.capture(element);
+    }
+  }
+
+  /**
+   * Calculate optimal crop region for spreadsheet cell including header
+   * Returns extended bounds that ensure header visibility
+   */
+  private static async calculateSpreadsheetCropRegion(
+    element: Element, 
+    cellRect: DOMRect
+  ): Promise<DOMRect | null> {
+    try {
+      // Try to find header row element
+      // Import ContextScanner to use its methods
+      // For now, we'll use a simple heuristic: look for header row above the cell
+      
+      // Find spreadsheet container
+      let container: Element | null = element;
+      let level = 0;
+      while (container && level < 10) {
+        const className = container.className?.toString().toLowerCase() || '';
+        if (className.includes('grid-container') ||
+            className.includes('grid-table-container') ||
+            className.includes('waffle')) {
+          break;
+        }
+        container = container.parentElement;
+        level++;
+      }
+      
+      if (!container) {
+        return null;
+      }
+      
+      // Try to find header row (usually row 0 or 1)
+      const headerRow = container.querySelector('[role="rowheader"], thead tr, [data-row="0"], [data-row="1"]');
+      if (headerRow) {
+        const headerRect = headerRow.getBoundingClientRect();
+        // If header is above the cell, include it in crop region
+        if (headerRect.top < cellRect.top && headerRect.bottom < cellRect.top) {
+          // Calculate extended rect that includes both header and cell
+          const extendedTop = Math.min(headerRect.top, cellRect.top);
+          const extendedBottom = cellRect.bottom;
+          const extendedLeft = Math.min(headerRect.left, cellRect.left);
+          const extendedRight = Math.max(headerRect.right, cellRect.right);
+          
+          return new DOMRect(
+            extendedLeft,
+            extendedTop,
+            extendedRight - extendedLeft,
+            extendedBottom - extendedTop
+          );
+        }
+      }
+      
+      return null;
+    } catch (err) {
+      console.warn('📸 GhostWriter: Failed to calculate spreadsheet crop region:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Crop image with optional header bounds
+   * When header bounds are provided, ensures header is included in crop
+   */
+  private static async cropImageWithHeader(
+    base64: string, 
+    cellRect: DOMRect, 
+    headerBounds: DOMRect | null,
+    horizontalPadding: number = 200,
+    verticalPadding: number = 200
+  ): Promise<string> {
+    return new Promise((resolve) => {
+      const image = new Image();
+      image.onload = () => {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        if (!ctx) {
+          resolve(base64);
+          return;
+        }
+        
+        const dpr = window.devicePixelRatio || 1;
+        
+        // Use header bounds if available, otherwise use cell rect with padding
+        const cropRect = headerBounds || cellRect;
+        const paddingX = headerBounds ? 0 : horizontalPadding;
+        const paddingY = headerBounds ? 0 : verticalPadding;
+        
+        const sourceX = Math.max(0, (cropRect.left - paddingX) * dpr);
+        const sourceY = Math.max(0, (cropRect.top - paddingY) * dpr);
+        const sourceWidth = Math.min(
+          (cropRect.width + (paddingX * 2)) * dpr,
+          image.width - sourceX
+        );
+        const sourceHeight = Math.min(
+          (cropRect.height + (paddingY * 2)) * dpr,
+          image.height - sourceY
+        );
+        
+        if (sourceWidth <= 0 || sourceHeight <= 0) {
+          resolve(base64);
+          return;
+        }
+        
+        canvas.width = sourceWidth;
+        canvas.height = sourceHeight;
+        
+        ctx.drawImage(
+          image,
+          sourceX, sourceY, sourceWidth, sourceHeight,
+          0, 0, sourceWidth, sourceHeight
+        );
+        
+        resolve(canvas.toDataURL('image/jpeg', 0.6));
+      };
+      image.onerror = () => resolve(base64);
+      image.src = base64;
+    });
+  }
+
+  /**
+   * Get current zoom level of the tab
+   */
+  static async getZoomLevel(): Promise<number> {
+    try {
+      const response = await chrome.runtime.sendMessage({ type: 'GET_ZOOM' });
+      if (response?.success && typeof response.data?.zoomFactor === 'number') {
+        return response.data.zoomFactor;
+      }
+      console.warn('📸 GhostWriter: Failed to get zoom level, defaulting to 1.0');
+      return 1.0;
+    } catch (err) {
+      console.warn('📸 GhostWriter: Error getting zoom level:', err);
+      return 1.0;
+    }
+  }
+
+  /**
+   * Set zoom level of the tab
+   */
+  static async setZoomLevel(zoomFactor: number): Promise<boolean> {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: 'SET_ZOOM',
+        payload: { zoomFactor }
+      });
+      if (response?.success) {
+        // Wait a bit for zoom to apply
+        await new Promise(resolve => setTimeout(resolve, 200));
+        return true;
+      }
+      console.warn('📸 GhostWriter: Failed to set zoom level');
+      return false;
+    } catch (err) {
+      console.warn('📸 GhostWriter: Error setting zoom level:', err);
+      return false;
+    }
+  }
+
+  /**
    * Capture full page screenshot (optimized for AI analysis)
    * Uses compression to keep size manageable while preserving visual clarity
+   * Note: For spreadsheets, page is refreshed before recording starts, so headers are visible
+   * For spreadsheets, zooms out to 33% to capture more columns, then restores original zoom
    */
   static async captureFullPage(quality: number = 0.7): Promise<FullPageResult | null> {
+    // CRITICAL: Only apply zoom for spreadsheets (Google Sheets/Excel)
+    const isSpreadsheet = this.isSpreadsheetDomain();
+    let originalZoom = 1.0;
+
     try {
       // Check cache first
       const now = Date.now();
@@ -94,6 +402,27 @@ export class VisualSnapshotService {
           },
           timestamp: this.lastFullPageCapture.timestamp,
         };
+      }
+
+      // For spreadsheets, zoom out to capture more columns
+      if (isSpreadsheet) {
+        try {
+          // 1. Get current zoom level
+          originalZoom = await this.getZoomLevel();
+          console.log(`📸 GhostWriter: Current zoom level: ${originalZoom}`);
+
+          // 2. Set zoom to 33% (0.33) - safer than 25% to avoid pixel mush
+          // 33% triples visible columns while keeping text readable
+          await this.setZoomLevel(0.33);
+          console.log('📸 GhostWriter: Zoomed out to 33% for spreadsheet capture');
+
+          // 3. CRITICAL: Wait 600ms for Google Sheets Canvas to repaint
+          // Google Sheets needs time to fetch virtualized rows/cols after zoom
+          await new Promise(resolve => setTimeout(resolve, 600));
+        } catch (zoomErr) {
+          console.warn('📸 GhostWriter: Zoom operation failed, continuing with current zoom:', zoomErr);
+          // Continue with capture at current zoom if zoom fails
+        }
       }
 
       console.log('📸 GhostWriter: Capturing full page screenshot...');
@@ -129,6 +458,18 @@ export class VisualSnapshotService {
     } catch (err) {
       console.warn('📸 GhostWriter: Full page capture failed:', err);
       return null;
+    } finally {
+      // RESTORE ZOOM NO MATTER WHAT (even if capture errors)
+      // Only restore if we're on a spreadsheet (where we may have changed zoom)
+      if (isSpreadsheet) {
+        try {
+          await this.setZoomLevel(originalZoom);
+          await new Promise(resolve => setTimeout(resolve, 100)); // Smooth transition
+          console.log(`📸 GhostWriter: Restored zoom to ${originalZoom}`);
+        } catch (restoreErr) {
+          console.error('📸 GhostWriter: Failed to restore zoom level:', restoreErr);
+        }
+      }
     }
   }
 

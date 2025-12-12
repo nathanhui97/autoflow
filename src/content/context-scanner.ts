@@ -543,8 +543,20 @@ export class ContextScanner {
     const rowIndex = this.extractRowIndex(element, spreadsheetContainer);
     const columnIndex = this.extractColumnIndex(element);
     
-    // Try to find column header
+    // Try to find column header (always attempt, even if coordinates are missing)
+    // The findColumnHeader method will try multiple strategies in priority order:
+    // 1. Cell reference method (most accurate: B5 → B1)
+    // 2. Column index method
+    // 3. Aria-label method
+    // 4. Frozen header detection
     const columnHeader = this.findColumnHeader(element, spreadsheetContainer, columnIndex);
+    
+    // Log detection result
+    if (columnHeader) {
+      console.log(`🔍 ContextScanner: Column header detected: "${columnHeader}" for cell ${cellRef || 'unknown'}`);
+    } else {
+      console.log(`🔍 ContextScanner: No column header detected for cell ${cellRef || 'unknown'}`);
+    }
     
     // Try to find row header
     const rowHeader = this.findRowHeader(spreadsheetContainer, rowIndex);
@@ -695,6 +707,7 @@ export class ContextScanner {
     // Strategy 0: Check Google Sheets Name Box first (most reliable for active cell)
     // This works because clicking a cell makes it active, so Name Box updates
     const nameBoxRef = this.getGoogleSheetsNameBox();
+    console.log(`[ContextScanner] Name Box check for extractCellReference:`, { nameBoxRef, elementTag: element.tagName, elementClass: element.className?.toString().substring(0, 50), ariaLabel: element.getAttribute('aria-label')?.substring(0, 50) });
     if (nameBoxRef) {
       console.log('🔍 ContextScanner: Using Name Box as cell reference source:', nameBoxRef);
       return nameBoxRef;
@@ -933,28 +946,377 @@ export class ContextScanner {
   }
 
   /**
-   * Find column header for a cell
+   * Find column header for a cell using multiple strategies (in priority order)
+   * 1. Cell Reference Method (Highest Accuracy): B5 → B1 header lookup
+   * 2. Column Index Method: Match columnIndex to header row cell
+   * 3. Aria-Label Method: Parse verbose aria-labels for header text
+   * 4. Frozen Header Detection: Find frozen header rows
    */
   private static findColumnHeader(element: Element, container: Element, columnIndex?: number): string | null {
-    // Look for header row
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findColumnHeader:entry',message:'Finding column header',data:{columnIndex,elementTag:element.tagName},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
+    
+    // Strategy 1: Cell Reference Method (Highest Accuracy)
+    // If cell reference is "B5", look for header in "B1" (row 1, same column)
+    const cellRef = this.extractCellReference(element);
+    
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findColumnHeader:cellRef',message:'Extracted cell reference',data:{cellRef,hasCellRef:!!cellRef},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
+    
+    if (cellRef) {
+      const headerFromRef = this.findHeaderByCellReference(cellRef, container);
+      
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findColumnHeader:strategy1Result',message:'Strategy 1 result',data:{cellRef,headerFromRef,found:!!headerFromRef},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+      // #endregion
+      
+      if (headerFromRef) {
+        console.log(`🔍 ContextScanner: Found column header using cell reference method: "${headerFromRef}" from ${cellRef}`);
+        return headerFromRef;
+      }
+    }
+
+    // Strategy 2: Column Index Method
+    // Use columnIndex to find header cell at same position in header row
+    if (columnIndex !== undefined) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findColumnHeader:strategy2',message:'Trying strategy 2',data:{columnIndex},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+      // #endregion
+      
+      const headerRow = this.findSpreadsheetHeaderRow(container);
+      if (headerRow) {
+        const headerCells = headerRow.element.querySelectorAll('[role="columnheader"], th, [role="cell"]');
+        
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findColumnHeader:strategy2Cells',message:'Strategy 2 header cells',data:{columnIndex,cellCount:headerCells.length,hasCellAtIndex:!!headerCells[columnIndex]},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+        // #endregion
+        
+        if (headerCells[columnIndex]) {
+          const headerText = headerCells[columnIndex].textContent?.trim();
+          
+          // #region agent log
+          fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findColumnHeader:strategy2Result',message:'Strategy 2 result',data:{columnIndex,headerText,hasText:!!headerText},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+          // #endregion
+          
+          if (headerText) {
+            console.log(`🔍 ContextScanner: Found column header using column index method: "${headerText}" at index ${columnIndex}`);
+            return headerText;
+          }
+        }
+      }
+    }
+
+    // Strategy 3: Aria-Label Method (Google Sheets)
+    // Check element aria-label for column context
+    // Example: "Cell B5, Column B, Price" → extract "Price"
+    const ariaLabel = element.getAttribute('aria-label');
+    if (ariaLabel) {
+      // Try to extract header from verbose aria-labels
+      // Pattern: "Cell B5, Column B, Price" or "Column B: Price"
+      const headerMatch = ariaLabel.match(/(?:column\s+[a-z]+,?\s*|,\s*)([^,]+?)(?:\s*\(|$)/i);
+      if (headerMatch && headerMatch[1]) {
+        const extracted = headerMatch[1].trim();
+        // Filter out common non-header text
+        if (extracted && 
+            !extracted.toLowerCase().includes('cell') &&
+            !extracted.toLowerCase().includes('row') &&
+            !extracted.toLowerCase().includes('column') &&
+            extracted.length < 50) {
+          console.log(`🔍 ContextScanner: Found column header using aria-label method: "${extracted}"`);
+          return extracted;
+        }
+      }
+      
+      // Check parent elements for column information
+      let current: Element | null = element.parentElement;
+      let level = 0;
+      while (current && level < 3) {
+        const parentAria = current.getAttribute('aria-label');
+        if (parentAria) {
+          const parentHeaderMatch = parentAria.match(/(?:column\s+[a-z]+,?\s*|,\s*)([^,]+?)(?:\s*\(|$)/i);
+          if (parentHeaderMatch && parentHeaderMatch[1]) {
+            const extracted = parentHeaderMatch[1].trim();
+            if (extracted && 
+                !extracted.toLowerCase().includes('cell') &&
+                !extracted.toLowerCase().includes('row') &&
+                !extracted.toLowerCase().includes('column') &&
+                extracted.length < 50) {
+              console.log(`🔍 ContextScanner: Found column header using parent aria-label method: "${extracted}"`);
+              return extracted;
+            }
+          }
+        }
+        current = current.parentElement;
+        level++;
+      }
+    }
+
+    // Strategy 4: Frozen Header Detection
+    // Detect frozen header rows (always visible)
+    const frozenHeader = this.findFrozenHeaderRow(container);
+    if (frozenHeader && columnIndex !== undefined) {
+      const headerCells = frozenHeader.element.querySelectorAll('[role="columnheader"], th, [role="cell"]');
+      if (headerCells[columnIndex]) {
+        const headerText = headerCells[columnIndex].textContent?.trim();
+        if (headerText) {
+          console.log(`🔍 ContextScanner: Found column header using frozen header method: "${headerText}"`);
+          return headerText;
+        }
+      }
+    }
+
+    // Fallback: Try standard header row lookup (original method)
     const headerRow = container.querySelector('[role="rowheader"], thead tr, [data-row="0"], [data-row="1"]');
     if (headerRow && columnIndex !== undefined) {
       const headerCells = headerRow.querySelectorAll('[role="columnheader"], th, [role="cell"]');
       if (headerCells[columnIndex]) {
         const headerText = headerCells[columnIndex].textContent?.trim();
         if (headerText) {
+          console.log(`🔍 ContextScanner: Found column header using fallback method: "${headerText}"`);
           return headerText;
         }
       }
     }
 
-    // Try aria-label on column
-    const columnLabel = element.getAttribute('aria-label');
-    if (columnLabel && columnLabel.includes('column')) {
-      return columnLabel;
-    }
-
+    console.log('🔍 ContextScanner: No column header found using any method');
     return null;
+  }
+
+  /**
+   * Find header by cell reference (e.g., "B5" → find header in "B1")
+   * This is the most accurate method for Google Sheets
+   */
+  private static findHeaderByCellReference(cellRef: string, container: Element): string | null {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:entry',message:'Finding header by cell reference',data:{cellRef,containerTag:container.tagName,containerId:container.id},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
+    try {
+      // Extract column letter from cell reference (e.g., "B5" → "B")
+      const colMatch = cellRef.match(/^([A-Z]+)/i);
+      if (!colMatch) {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:noMatch',message:'No column letter match',data:{cellRef},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+        // #endregion
+        return null;
+      }
+      
+      const columnLetter = colMatch[1].toUpperCase();
+      const headerCellRef = `${columnLetter}1`;
+      
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:strategy1',message:'Strategy 1: Looking for aria-label cells',data:{columnLetter,headerCellRef},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+      // #endregion
+      
+      // Try multiple strategies to find the header cell
+      // Strategy 1: Look for element with aria-label containing the header cell reference
+      // Also try to find cells with data-row="1" or data-row="0" for header row
+      const allCells = container.querySelectorAll('[aria-label*="' + headerCellRef + '"], [aria-label*="' + columnLetter + '1"], [data-row="1"][data-col], [data-row="0"][data-col]');
+      
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:strategy1Results',message:'Strategy 1 results',data:{cellsFound:allCells.length,headerCellRef,columnLetter},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+      // #endregion
+      
+      // Also try to find row 1 cells directly
+      const row1Cells = container.querySelectorAll('[data-row="1"], [data-row="0"]');
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:row1Cells',message:'Row 1 cells found',data:{row1CellCount:row1Cells.length,sampleAriaLabels:Array.from(row1Cells).slice(0,3).map(c=>c.getAttribute('aria-label')?.substring(0,50))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+      // #endregion
+      
+      for (const cell of Array.from(allCells)) {
+        const ariaLabel = cell.getAttribute('aria-label') || '';
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:checkingCell',message:'Checking cell aria-label',data:{ariaLabel,cellText:cell.textContent?.trim()?.substring(0,50)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+        // #endregion
+        // Check if this is row 1 (header row)
+        if (ariaLabel.includes(headerCellRef) || ariaLabel.includes(`${columnLetter}1`)) {
+          // Try to extract header text from aria-label
+          // Pattern: "Cell B1, Column B, Price" or "B1: Price"
+          const headerMatch = ariaLabel.match(/(?:column\s+[a-z]+,?\s*|,\s*|:\s*)([^,()]+?)(?:\s*\(|$)/i);
+          if (headerMatch && headerMatch[1]) {
+            const extracted = headerMatch[1].trim();
+            if (extracted && extracted.length < 50) {
+              // #region agent log
+              fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:foundAria',message:'Found header from aria-label',data:{extracted,cellRef},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+              // #endregion
+              return extracted;
+            }
+          }
+          // Fallback: use cell text content
+          const cellText = cell.textContent?.trim();
+          if (cellText && cellText.length > 0 && cellText.length < 50) {
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:foundText',message:'Found header from cell text',data:{cellText,cellRef},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+            // #endregion
+            return cellText;
+          }
+        }
+      }
+      
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:strategy2',message:'Strategy 2: Finding header row',data:{columnLetter},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+      // #endregion
+      
+      // Strategy 2: Find header row and get cell at same column index
+      const headerRow = this.findSpreadsheetHeaderRow(container);
+      
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:headerRowResult',message:'Header row search result',data:{found:!!headerRow,rowIndex:headerRow?.rowIndex,elementTag:headerRow?.element.tagName},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+      // #endregion
+      
+      if (headerRow) {
+        // Convert column letter to index (A=1, B=2, etc.)
+        let colIndex = 0;
+        for (let i = 0; i < columnLetter.length; i++) {
+          colIndex = colIndex * 26 + (columnLetter.charCodeAt(i) - 64);
+        }
+        // Convert to 0-indexed
+        colIndex = colIndex - 1;
+        
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:colIndex',message:'Calculated column index',data:{columnLetter,colIndex,headerCellRef},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+        // #endregion
+        
+        const headerCells = headerRow.element.querySelectorAll('[role="columnheader"], th, [role="cell"]');
+        
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:headerCells',message:'Header cells found',data:{cellCount:headerCells.length,colIndex,cellTexts:Array.from(headerCells).slice(0,5).map(c=>c.textContent?.trim()?.substring(0,30))},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+        // #endregion
+        
+        if (headerCells[colIndex]) {
+          const headerText = headerCells[colIndex].textContent?.trim();
+          // #region agent log
+          fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:headerText',message:'Header text at index',data:{headerText,colIndex,hasText:!!headerText},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+          // #endregion
+          if (headerText) {
+            return headerText;
+          }
+        }
+      }
+      
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:notFound',message:'Header not found',data:{cellRef,columnLetter},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+      // #endregion
+      
+      return null;
+    } catch (err) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findHeaderByCellReference:error',message:'Error finding header',data:{error:String(err),cellRef},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+      // #endregion
+      console.warn('🔍 ContextScanner: Error finding header by cell reference:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Find spreadsheet header row
+   * Detects header row position (often row 0 or 1)
+   * Handles frozen headers that stay visible when scrolling
+   */
+  private static findSpreadsheetHeaderRow(container: Element): { element: Element; rowIndex: number } | null {
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findSpreadsheetHeaderRow:entry',message:'Finding spreadsheet header row',data:{containerTag:container.tagName,containerId:container.id},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+    // #endregion
+    try {
+      // Strategy 1: Look for standard header row selectors
+      const headerRow = container.querySelector('[role="rowheader"], thead tr, [data-row="0"], [data-row="1"]');
+      
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findSpreadsheetHeaderRow:strategy1',message:'Strategy 1 result',data:{found:!!headerRow,dataRow:headerRow?.getAttribute('data-row'),role:headerRow?.getAttribute('role')},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+      // #endregion
+      
+      if (headerRow) {
+        const rowIndex = parseInt(headerRow.getAttribute('data-row') || '1', 10);
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findSpreadsheetHeaderRow:found1',message:'Found header row strategy 1',data:{rowIndex,cellCount:headerRow.querySelectorAll('[role="columnheader"], th, [role="cell"]').length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+        // #endregion
+        return { element: headerRow, rowIndex };
+      }
+      
+      // Strategy 2: Look for frozen header (often has specific classes)
+      const frozenHeader = container.querySelector('[class*="frozen"], [class*="header-row"], [class*="row-header"]');
+      
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findSpreadsheetHeaderRow:strategy2',message:'Strategy 2 result',data:{found:!!frozenHeader,className:frozenHeader?.className?.toString().substring(0,50)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+      // #endregion
+      
+      if (frozenHeader) {
+        const rowIndex = parseInt(frozenHeader.getAttribute('data-row') || '1', 10);
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findSpreadsheetHeaderRow:found2',message:'Found header row strategy 2',data:{rowIndex},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+        // #endregion
+        return { element: frozenHeader, rowIndex };
+      }
+      
+      // Strategy 3: Find first row and check if it looks like a header
+      // (has header cells or is at top of container)
+      const firstRow = container.querySelector('[role="row"], tr, [data-row]');
+      
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findSpreadsheetHeaderRow:strategy3',message:'Strategy 3 result',data:{found:!!firstRow,dataRow:firstRow?.getAttribute('data-row')},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+      // #endregion
+      
+      if (firstRow) {
+        const rect = firstRow.getBoundingClientRect();
+        const containerRect = container.getBoundingClientRect();
+        const hasHeaderCells = firstRow.querySelectorAll('[role="columnheader"], th').length > 0;
+        
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findSpreadsheetHeaderRow:strategy3Check',message:'Strategy 3 position check',data:{rectTop:rect.top,containerTop:containerRect.top,diff:rect.top-containerRect.top,hasHeaderCells,isNearTop:rect.top <= containerRect.top + 50},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+        // #endregion
+        
+        // If first row is near top of container, it's likely a header
+        if (rect.top <= containerRect.top + 50) {
+          if (hasHeaderCells) {
+            const rowIndex = parseInt(firstRow.getAttribute('data-row') || '1', 10);
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findSpreadsheetHeaderRow:found3',message:'Found header row strategy 3',data:{rowIndex},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+            // #endregion
+            return { element: firstRow, rowIndex };
+          }
+        }
+      }
+      
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findSpreadsheetHeaderRow:notFound',message:'Header row not found',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+      // #endregion
+      
+      return null;
+    } catch (err) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'context-scanner.ts:findSpreadsheetHeaderRow:error',message:'Error finding header row',data:{error:String(err)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+      // #endregion
+      console.warn('🔍 ContextScanner: Error finding spreadsheet header row:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Find frozen header row (always visible when scrolling)
+   */
+  private static findFrozenHeaderRow(container: Element): { element: Element; rowIndex: number } | null {
+    try {
+      // Look for frozen header indicators
+      const frozenHeader = container.querySelector('[class*="frozen"], [class*="sticky"], [class*="fixed"]');
+      if (frozenHeader) {
+        const rect = frozenHeader.getBoundingClientRect();
+        const containerRect = container.getBoundingClientRect();
+        // Check if it's at the top (frozen headers stay at top)
+        if (rect.top <= containerRect.top + 10) {
+          const hasHeaderCells = frozenHeader.querySelectorAll('[role="columnheader"], th').length > 0;
+          if (hasHeaderCells) {
+            const rowIndex = parseInt(frozenHeader.getAttribute('data-row') || '1', 10);
+            return { element: frozenHeader, rowIndex };
+          }
+        }
+      }
+      
+      return null;
+    } catch (err) {
+      console.warn('🔍 ContextScanner: Error finding frozen header row:', err);
+      return null;
+    }
   }
 
   /**

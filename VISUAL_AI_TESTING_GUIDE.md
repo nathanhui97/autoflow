@@ -314,3 +314,5 @@ chrome.storage.local.get('ghostwriter_ai_config', console.log);
    - Adjust timeout values if needed
    - Optimize screenshot quality/compression
    - Batch requests where possible
+
+

@@ -17,7 +17,11 @@ export type MessageType =
   | 'CAPTURE_VIEWPORT'
   | 'CORRECTION_SAVED'
   | 'ELEMENT_FIND_FAILED'
-  | 'CANCEL_CORRECTION';
+  | 'CANCEL_CORRECTION'
+  | 'GET_INITIAL_SNAPSHOT'
+  | 'REFRESH_PAGE'
+  | 'GET_ZOOM'
+  | 'SET_ZOOM';
 
 /**
  * Base message interface for all extension messages
@@ -190,5 +194,32 @@ export interface ElementFindFailedMessage extends ExtensionMessage {
 export interface CancelCorrectionMessage extends ExtensionMessage {
   type: 'CANCEL_CORRECTION';
   payload?: {};
+}
+
+/**
+ * REFRESH_PAGE message - sent to refresh the page (for spreadsheets to capture headers)
+ */
+export interface RefreshPageMessage extends ExtensionMessage {
+  type: 'REFRESH_PAGE';
+  payload?: {};
+}
+
+/**
+ * GET_ZOOM message - get current zoom level of the tab
+ */
+export interface GetZoomMessage extends ExtensionMessage {
+  type: 'GET_ZOOM';
+  payload?: {};
+}
+
+/**
+ * SET_ZOOM message - set zoom level of the tab
+ */
+export interface SetZoomMessage extends ExtensionMessage {
+  type: 'SET_ZOOM';
+  payload: {
+    zoomFactor: number;
+    tabId?: number;
+  };
 }
 

@@ -170,3 +170,5 @@ CREATE TRIGGER update_visual_patterns_confidence
 COMMENT ON TABLE correction_memory IS 'Stores user corrections for element finding to enable learning';
 COMMENT ON TABLE visual_patterns IS 'Stores learned visual patterns that can be applied to improve element finding';
 COMMENT ON TABLE workflow_intents IS 'Stores analyzed workflow intents for smarter execution';
+
+

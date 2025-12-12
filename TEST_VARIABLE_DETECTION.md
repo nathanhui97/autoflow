@@ -90,3 +90,5 @@ Once testing confirms everything works:
 2. ✅ Users can see detected variables in UI
 3. ✅ Variables can be customized during workflow execution
 4. ✅ Fallback ensures reliability even if AI fails
+
+

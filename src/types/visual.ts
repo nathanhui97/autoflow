@@ -329,3 +329,5 @@ export interface AnalyzeIntentResponse {
   confidence: number;
   suggestions?: string[]; // Suggestions for improving the workflow
 }
+
+
