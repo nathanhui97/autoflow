@@ -156,6 +156,9 @@ export class VariableDetector {
       
       // Filter to only confirmed variables
       const confirmedVariables = response.variables.filter(v => v.isVariable && v.confidence >= 0.5);
+      
+      // Store steps reference for deduplication
+      const stepsRef = steps;
 
       console.log(`[VariableDetector] Edge Function response:`, {
         totalVariables: response.variables.length,
@@ -168,8 +171,17 @@ export class VariableDetector {
         })),
       });
 
+      // Deduplicate variables - merge variables that refer to the same field
+      const deduplicatedVariables = this.deduplicateVariables(confirmedVariables, stepsRef);
+
+      console.log(`[VariableDetector] After deduplication:`, {
+        before: confirmedVariables.length,
+        after: deduplicatedVariables.length,
+        removed: confirmedVariables.length - deduplicatedVariables.length,
+      });
+
       return {
-        variables: confirmedVariables,
+        variables: deduplicatedVariables,
         detectedAt: Date.now(),
         analysisCount: response.analysisCount,
       };
@@ -480,6 +492,165 @@ export class VariableDetector {
       beforeSnapshot,
       afterSnapshot,
     };
+  }
+
+  /**
+   * Deduplicate variables that refer to the same field
+   * Groups by: cellReference (for spreadsheets), selector, or fieldLabel
+   * Merges duplicates keeping the best fieldName, highest confidence, and most recent value
+   */
+  private static deduplicateVariables(
+    variables: VariableDefinition[],
+    steps: WorkflowStep[]
+  ): VariableDefinition[] {
+    if (variables.length === 0) {
+      return variables;
+    }
+
+    // Create a map to group variables by field identifier
+    const variableMap = new Map<string, VariableDefinition[]>();
+
+    for (const variable of variables) {
+      // Get the original step to access cellReference/selector
+      const originalStep = steps[variable.stepIndex];
+      const payload = originalStep?.payload;
+
+      // Determine the field identifier key
+      let fieldKey: string;
+
+      // For spreadsheets, use cellReference as the key (most reliable)
+      const cellReference = payload?.context?.gridCoordinates?.cellReference;
+      if (cellReference) {
+        fieldKey = `cell:${cellReference}`;
+      } else if (variable.fieldLabel && /^[A-Z]+\d+$/.test(variable.fieldLabel)) {
+        // If fieldLabel is a cell reference (like "B15"), use it
+        fieldKey = `cell:${variable.fieldLabel}`;
+      } else if (payload?.selector) {
+        // For regular fields, use selector (normalized)
+        // Normalize selector by removing dynamic parts (like indices, timestamps)
+        const normalizedSelector = this.normalizeSelector(payload.selector);
+        fieldKey = `selector:${normalizedSelector}`;
+      } else if (variable.fieldLabel) {
+        // Fallback to fieldLabel (normalized)
+        const normalizedLabel = variable.fieldLabel.toLowerCase().trim();
+        fieldKey = `label:${normalizedLabel}`;
+      } else {
+        // Last resort: use fieldName (but this is less reliable)
+        // Only use this if fieldName is not generic
+        const normalizedFieldName = variable.fieldName.toLowerCase().trim();
+        const isGeneric = /^(unknown|field|cell|column|value|input|step)/i.test(variable.fieldName);
+        if (!isGeneric) {
+          fieldKey = `field:${normalizedFieldName}`;
+        } else {
+          // Can't reliably deduplicate generic names, keep as separate
+          fieldKey = `unique:${variable.stepIndex}`;
+        }
+      }
+
+      // Group variables by field key
+      if (!variableMap.has(fieldKey)) {
+        variableMap.set(fieldKey, []);
+      }
+      variableMap.get(fieldKey)!.push(variable);
+    }
+
+    // Merge variables in each group
+    const mergedVariables: VariableDefinition[] = [];
+
+    for (const [fieldKey, group] of variableMap.entries()) {
+      if (group.length === 1) {
+        // No duplicates, keep as is
+        mergedVariables.push(group[0]);
+        continue;
+      }
+
+      // Multiple variables for the same field - merge them
+      console.log(`[VariableDetector] Merging ${group.length} duplicate variables for field: ${fieldKey}`, {
+        variables: group.map(v => ({
+          stepIndex: v.stepIndex,
+          fieldName: v.fieldName,
+          defaultValue: v.defaultValue,
+          confidence: v.confidence,
+        })),
+      });
+
+      // Sort by stepIndex (most recent last) to get the latest value
+      group.sort((a, b) => a.stepIndex - b.stepIndex);
+
+      // Find the best variable (highest confidence, best fieldName)
+      let bestVariable = group[0];
+      for (const variable of group) {
+        // Prefer non-generic field names
+        const isGeneric = /^(unknown|field|cell|column|value|input)/i.test(variable.fieldName);
+        const bestIsGeneric = /^(unknown|field|cell|column|value|input)/i.test(bestVariable.fieldName);
+        
+        if (variable.confidence > bestVariable.confidence) {
+          bestVariable = variable;
+        } else if (variable.confidence === bestVariable.confidence && !isGeneric && bestIsGeneric) {
+          // Same confidence, but this one has a better (non-generic) name
+          bestVariable = variable;
+        }
+      }
+
+      // Merge: use best fieldName, highest confidence, most recent value
+      const merged: VariableDefinition = {
+        ...bestVariable,
+        // Use the most recent value (last step)
+        defaultValue: group[group.length - 1].defaultValue,
+        // Use the highest confidence
+        confidence: Math.max(...group.map(v => v.confidence)),
+        // Combine options if any are dropdowns
+        options: this.mergeOptions(group),
+        // Use the stepIndex of the first occurrence (for reference)
+        stepIndex: group[0].stepIndex,
+      };
+
+      console.log(`[VariableDetector] Merged variable:`, {
+        fieldName: merged.fieldName,
+        defaultValue: merged.defaultValue,
+        confidence: merged.confidence,
+        mergedFrom: group.length,
+      });
+
+      mergedVariables.push(merged);
+    }
+
+    return mergedVariables;
+  }
+
+  /**
+   * Normalize selector by removing dynamic parts (indices, timestamps, etc.)
+   * This helps identify the same field even if DOM structure changes slightly
+   */
+  private static normalizeSelector(selector: string): string {
+    if (!selector) return '';
+
+    // Remove array indices like [0], [1], etc.
+    let normalized = selector.replace(/\[\d+\]/g, '');
+    
+    // Remove common dynamic attributes (ids with timestamps, etc.)
+    normalized = normalized.replace(/id="[^"]*"/gi, '');
+    normalized = normalized.replace(/id='[^']*'/gi, '');
+    
+    // Normalize whitespace
+    normalized = normalized.replace(/\s+/g, ' ').trim();
+    
+    return normalized.toLowerCase();
+  }
+
+  /**
+   * Merge options from multiple dropdown variables
+   */
+  private static mergeOptions(variables: VariableDefinition[]): string[] | undefined {
+    const allOptions = new Set<string>();
+    
+    for (const variable of variables) {
+      if (variable.options && variable.options.length > 0) {
+        variable.options.forEach(opt => allOptions.add(opt));
+      }
+    }
+    
+    return allOptions.size > 0 ? Array.from(allOptions).sort() : undefined;
   }
 
   /**
