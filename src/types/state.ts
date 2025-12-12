@@ -5,6 +5,7 @@ export type ExtensionState =
   | 'IDLE'
   | 'CONNECTING'
   | 'RECORDING'
+  | 'PAUSED'
   | 'PROCESSING_AI'
   | 'EXECUTING';
 
@@ -26,6 +27,7 @@ export interface ExtensionStateData {
   error: string | null;
   lastPingTime: number | null;
 }
+
 
 
 

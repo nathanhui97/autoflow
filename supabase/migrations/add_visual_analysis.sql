@@ -172,3 +172,4 @@ COMMENT ON TABLE visual_patterns IS 'Stores learned visual patterns that can be 
 COMMENT ON TABLE workflow_intents IS 'Stores analyzed workflow intents for smarter execution';
 
 
+

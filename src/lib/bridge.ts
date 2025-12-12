@@ -243,6 +243,30 @@ export class RuntimeBridge {
   }
 
   /**
+   * Broadcast message to multiple tabs
+   * @param tabIds - Array of tab IDs to send message to
+   * @param message - The message to send
+   * @returns Promise resolving to array of responses (some may fail)
+   */
+  async broadcastToTabs(tabIds: number[], message: ExtensionMessage): Promise<MessageResponse[]> {
+    const responses: MessageResponse[] = [];
+    
+    for (const tabId of tabIds) {
+      try {
+        const response = await this.sendMessage(message, tabId);
+        responses.push(response);
+      } catch (error) {
+        responses.push({
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+    
+    return responses;
+  }
+
+  /**
    * Utility delay function
    */
   private delay(ms: number): Promise<void> {

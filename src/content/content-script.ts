@@ -67,6 +67,57 @@ function handleFullMessage(
         return false;
       }
 
+      case 'START_RECORDING_IN_TAB': {
+        // Internal message from service worker to start recording in this tab
+        if (!recordingManager) {
+          sendResponse({
+            success: false,
+            error: 'RecordingManager not initialized. Please wait a moment and try again.',
+          });
+          return false;
+        }
+        try {
+          recordingManager.start();
+          sendResponse({
+            success: true,
+            data: { message: 'Recording started in tab' },
+          });
+        } catch (error) {
+          sendResponse({
+            success: false,
+            error: error instanceof Error ? error.message : 'Failed to start recording in tab',
+          });
+        }
+        return false;
+      }
+
+      case 'STOP_RECORDING_IN_TAB': {
+        // Internal message from service worker to stop recording in this tab
+        if (!recordingManager) {
+          sendResponse({
+            success: false,
+            error: 'RecordingManager not initialized',
+          });
+          return false;
+        }
+        // Handle async stop() method
+        (async () => {
+          try {
+            await recordingManager.stop();
+            sendResponse({
+              success: true,
+              data: { message: 'Recording stopped in tab' },
+            });
+          } catch (error) {
+            sendResponse({
+              success: false,
+              error: error instanceof Error ? error.message : 'Failed to stop recording in tab',
+            });
+          }
+        })();
+        return true; // Keep channel open for async response
+      }
+
       case 'STOP_RECORDING': {
         if (!recordingManager) {
           sendResponse({

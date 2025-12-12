@@ -21,7 +21,12 @@ export type MessageType =
   | 'GET_INITIAL_SNAPSHOT'
   | 'REFRESH_PAGE'
   | 'GET_ZOOM'
-  | 'SET_ZOOM';
+  | 'SET_ZOOM'
+  | 'TAB_SWITCHED'
+  | 'START_RECORDING_IN_TAB'
+  | 'STOP_RECORDING_IN_TAB'
+  | 'ADD_TAB'
+  | 'RESUME_RECORDING';
 
 /**
  * Base message interface for all extension messages
@@ -99,6 +104,8 @@ export interface RecordedStepMessage extends ExtensionMessage {
   type: 'RECORDED_STEP';
   payload: {
     step: import('./workflow').WorkflowStep;
+    tabUrl?: string; // Tab URL where step was recorded (not tabId)
+    tabTitle?: string; // Tab title for context
   };
 }
 
@@ -220,6 +227,64 @@ export interface SetZoomMessage extends ExtensionMessage {
   payload: {
     zoomFactor: number;
     tabId?: number;
+  };
+}
+
+/**
+ * TAB_SWITCHED message - sent from service worker to sidepanel when user switches tabs during recording
+ */
+export interface TabSwitchedMessage extends ExtensionMessage {
+  type: 'TAB_SWITCHED';
+  payload: {
+    fromUrl: string;
+    toUrl: string;
+    fromTitle?: string;
+    toTitle?: string;
+    timestamp: number;
+  };
+}
+
+/**
+ * START_RECORDING_IN_TAB message - internal message for service worker to coordinate recording in specific tab
+ */
+export interface StartRecordingInTabMessage extends ExtensionMessage {
+  type: 'START_RECORDING_IN_TAB';
+  payload: {
+    tabId: number; // Runtime-only, not persisted
+    tabUrl: string;
+    tabTitle?: string;
+  };
+}
+
+/**
+ * STOP_RECORDING_IN_TAB message - internal message for service worker to stop recording in specific tab
+ */
+export interface StopRecordingInTabMessage extends ExtensionMessage {
+  type: 'STOP_RECORDING_IN_TAB';
+  payload: {
+    tabId: number; // Runtime-only, not persisted
+  };
+}
+
+/**
+ * ADD_TAB message - sent from sidepanel to service worker to pause recording and open new tab
+ */
+export interface AddTabMessage extends ExtensionMessage {
+  type: 'ADD_TAB';
+}
+
+/**
+ * RESUME_RECORDING message - sent from sidepanel to service worker to resume recording in current tab
+ */
+export interface ResumeRecordingMessage extends ExtensionMessage {
+  type: 'RESUME_RECORDING';
+  payload: {
+    tabId: number;
+    tabUrl: string;
+    tabTitle?: string;
+    fromUrl: string; // Last recorded tab URL
+    fromTabIndex?: number; // Logical index of source tab
+    toTabIndex?: number; // Logical index of target tab (will be assigned)
   };
 }
 

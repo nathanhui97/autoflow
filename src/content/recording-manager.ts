@@ -17,7 +17,8 @@ import { VisualAnalysisService } from '../lib/visual-analysis';
 import { DOMDistiller } from '../lib/dom-distiller';
 import { PIIScrubber } from '../lib/pii-scrubber';
 import { aiConfig } from '../lib/ai-config';
-import type { WorkflowStep } from '../types/workflow';
+import type { WorkflowStep, WorkflowStepPayload } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 import type { PageAnalysis, PageType } from '../types/visual';
 
 export class RecordingManager {
@@ -33,6 +34,8 @@ export class RecordingManager {
   private scrollDebounceTimer: number | null = null;
   private lastScrollStep: { scrollX: number; scrollY: number; timestamp: number } | null = null;
   private currentUrl: string = window.location.href;
+  private currentTabUrl: string | null = null; // Tab URL (stable identifier, not tabId)
+  private currentTabTitle: string | null = null; // Tab title for context
   private readonly DEBOUNCE_DELAY = 500; // 500ms debounce for input events
   private readonly SCROLL_DEBOUNCE_DELAY = 300; // 300ms debounce for scroll events
   private readonly CLICK_DEDUP_WINDOW = 500; // 500ms - ignore duplicate clicks on same element within this window (reduced from 2s to allow rapid different clicks)
@@ -66,6 +69,8 @@ export class RecordingManager {
 
     this.isRecording = true;
     this.currentUrl = window.location.href;
+    this.currentTabUrl = window.location.href;
+    this.currentTabTitle = document.title;
 
     // Add visual indicator
     if (document.body) {
@@ -443,6 +448,7 @@ export class RecordingManager {
 
     // Strategy 1: Use elementsFromPoint to get ALL elements at click coordinates
     // This is more reliable than elementFromPoint (singular) which might return the overlay
+    // PRIORITY: Prefer smaller, more specific elements (buttons, menu items) over large containers (widgets)
     try {
       const elementsAtPoint = document.elementsFromPoint(event.clientX, event.clientY);
       
@@ -460,33 +466,93 @@ export class RecordingManager {
         return this.isInteractiveElement(el); // Must be interactive
       });
       
-      // Return the first valid element (topmost visible, interactive, non-overlay element)
       if (visibleElements.length > 0) {
-        return visibleElements[0];
+        // PRIORITY: Prefer smaller, more specific elements over large containers
+        // Sort by: buttons/menu items first, then by size (smaller = more specific)
+        const sorted = visibleElements.sort((a, b) => {
+          const aTag = a.tagName.toLowerCase();
+          const bTag = b.tagName.toLowerCase();
+          const aRole = a.getAttribute('role');
+          const bRole = b.getAttribute('role');
+          
+          // Prioritize buttons, menu items, links
+          const aIsSpecific = aTag === 'button' || aTag === 'a' || aRole === 'button' || aRole === 'menuitem' || aRole === 'option';
+          const bIsSpecific = bTag === 'button' || bTag === 'a' || bRole === 'button' || bRole === 'menuitem' || bRole === 'option';
+          
+          if (aIsSpecific && !bIsSpecific) return -1;
+          if (!aIsSpecific && bIsSpecific) return 1;
+          
+          // If both are specific or both are not, prefer smaller elements (more specific)
+          const aRect = a.getBoundingClientRect();
+          const bRect = b.getBoundingClientRect();
+          const aSize = aRect.width * aRect.height;
+          const bSize = bRect.width * bRect.height;
+          
+          // Prefer smaller elements (they're more specific)
+          return aSize - bSize;
+        });
+        
+        const selected = sorted[0];
+        const selectedTag = selected.tagName.toLowerCase();
+        const selectedRole = selected.getAttribute('role');
+        console.log('GhostWriter: Selected element from elementsFromPoint:', selectedTag, 'Role:', selectedRole, 'Size:', selected.getBoundingClientRect().width, 'x', selected.getBoundingClientRect().height);
+        
+        return selected;
       }
     } catch (error) {
       console.warn('GhostWriter: Error using elementsFromPoint:', error);
     }
 
-    // Strategy 2: Traverse up the DOM to find a parent widget/container element
-    const widgetTags = ['gs-report-widget-element', 'gs-widget', 'widget', 'gridster-item'];
+    // Strategy 2: Traverse up the DOM to find interactive elements (buttons, menu items) FIRST
+    // Only fall back to widget containers if no interactive element is found
     let current: Element | null = element.parentElement;
     let level = 0;
     const maxLevels = 10;
+    let foundInteractiveElement: Element | null = null;
+    const widgetTags = ['gs-report-widget-element', 'gs-widget', 'widget', 'gridster-item'];
 
     while (current && level < maxLevels && current !== document.body) {
       const tagName = current.tagName.toLowerCase();
+      const role = current.getAttribute('role');
       
-      // Check if this is a widget/container element
-      if (widgetTags.some(wt => tagName.includes(wt))) {
+      // PRIORITY: Look for actual interactive elements (buttons, menu items, etc.)
+      // These should be preferred over widget containers
+      const isInteractive = this.isInteractiveElement(current);
+      const isButton = tagName === 'button' || role === 'button' || role === 'menuitem';
+      const isMenuItem = role === 'menuitem' || role === 'option' || role === 'listitem';
+      const isLink = tagName === 'a' || role === 'link';
+      
+      if (isInteractive && (isButton || isMenuItem || isLink)) {
+        // Found an actual interactive element - prefer this over widget containers
+        if (ElementStateCapture.isElementVisible(current)) {
+          foundInteractiveElement = current;
+          // Continue searching to see if there's a more specific element (closer to click)
+        }
+      }
+      
+      // Only check for widget containers if we haven't found an interactive element yet
+      if (!foundInteractiveElement && widgetTags.some(wt => tagName.includes(wt))) {
         // Check if it's visible and interactive
         if (ElementStateCapture.isElementVisible(current) && this.isInteractiveElement(current)) {
-          return current;
+          // Only use widget as fallback if no interactive element was found
+          if (level < 3) {
+            // Widget is close to the element, might be the actual target
+            // But prefer interactive elements found later
+            current = current.parentElement;
+            level++;
+            continue;
+          }
         }
       }
 
       current = current.parentElement;
       level++;
+    }
+    
+    // Return the interactive element if found, otherwise continue to Strategy 3
+    if (foundInteractiveElement) {
+      console.log('GhostWriter: Found interactive element in parent hierarchy:', foundInteractiveElement.tagName, 'Role:', foundInteractiveElement.getAttribute('role'));
+      return foundInteractiveElement;
     }
 
     // Strategy 3: If element is an overlay, search for widget elements in parent hierarchy
@@ -620,13 +686,13 @@ export class RecordingManager {
         let isListItemOrOption = this.isListItemOrOption(actualElement);
         
         // CRITICAL: Check if the last step was a dropdown trigger - if so, this click is likely a dropdown item
-        const wasDropdownTrigger = this.lastStep?.payload?.waitConditions?.some(
-          wc => wc.type === 'element' && 
+        const wasDropdownTrigger = (this.lastStep && isWorkflowStepPayload(this.lastStep.payload) && this.lastStep.payload.waitConditions?.some(
+          (wc: { type: string; selector?: string }) => wc.type === 'element' && 
           (wc.selector?.includes('[role="listbox"]') || 
            wc.selector?.includes('[role="menu"]') ||
            wc.selector?.includes('listbox') ||
            wc.selector?.includes('menu'))
-        ) || false;
+        )) || false;
         
         // If last step was a dropdown trigger and this click is within 2 seconds, treat it as a dropdown item
         const timeSinceLastStep = this.lastStep ? (Date.now() - this.lastStep.payload.timestamp) : Infinity;
@@ -754,7 +820,7 @@ export class RecordingManager {
         } else {
           // IMPROVED: Check both selector AND element text to avoid false positives
           // Different elements might have similar selectors, so we need to check element text too
-          const lastElementText = this.lastStep?.payload?.elementText;
+          const lastElementText = (this.lastStep && isWorkflowStepPayload(this.lastStep.payload)) ? this.lastStep.payload.elementText : undefined;
           
           console.log('GhostWriter: Checking deduplication - Last click selector:', this.lastClickStep?.selector, 'Current selector:', selectors.primary);
           console.log('GhostWriter: Last element text:', lastElementText, 'Current element text:', elementText);
@@ -936,7 +1002,7 @@ export class RecordingManager {
               (checkTimestamp - this.lastClickStep.timestamp) < this.CLICK_DEDUP_WINDOW) {
             // IMPROVED: Also check element text to avoid false positives
             const currentElementText = elementText;
-            const lastElementText = this.lastStep?.payload?.elementText;
+            const lastElementText = (this.lastStep && isWorkflowStepPayload(this.lastStep.payload)) ? this.lastStep.payload.elementText : undefined;
             
             // Only skip if BOTH selector AND element text match
             if (currentElementText === lastElementText) {
@@ -1003,17 +1069,17 @@ export class RecordingManager {
           // Resolve the snapshot started on mousedown (Guardrail 3: Prevent race condition)
           // CRITICAL: For dropdown items, capture a FRESH snapshot on click to ensure we capture the dropdown item,
           // not the three-dot button that was clicked on mousedown
-          let visualSnapshot: WorkflowStep['payload']['visualSnapshot'] | undefined;
+          let visualSnapshot: WorkflowStepPayload['visualSnapshot'] | undefined;
           
           // RE-CHECK: Verify if this is a dropdown item (check again in async context)
           // Also check if previous step was a dropdown trigger
-          const wasDropdownTrigger = this.lastStep?.payload?.waitConditions?.some(
-            wc => wc.type === 'element' && 
+          const wasDropdownTrigger = (this.lastStep && isWorkflowStepPayload(this.lastStep.payload) && this.lastStep.payload.waitConditions?.some(
+            (wc: { type: string; selector?: string }) => wc.type === 'element' && 
             (wc.selector?.includes('[role="listbox"]') || 
              wc.selector?.includes('[role="menu"]') ||
              wc.selector?.includes('listbox') ||
              wc.selector?.includes('menu'))
-          ) || false;
+          )) || false;
           
           const timeSinceLastStep = this.lastStep ? (Date.now() - this.lastStep.payload.timestamp) : Infinity;
           const shouldTreatAsDropdownItem = finalIsListItemOrOption || 
@@ -1105,6 +1171,9 @@ export class RecordingManager {
             xpath: selectors.xpath,
             timestamp: Date.now(),
             url: isNavigation ? this.currentUrl : url,
+            tabUrl: this.currentTabUrl || undefined,
+            tabTitle: this.currentTabTitle || undefined,
+            tabInfo: this.currentTabUrl ? { url: this.currentTabUrl, title: this.currentTabTitle || '' } : undefined,
             shadowPath: selectors.shadowPath,
             elementState: elementState || undefined,
             elementText: elementText,
@@ -1196,6 +1265,9 @@ export class RecordingManager {
 
           if (isNavigation) {
             this.currentUrl = newUrl;
+            this.currentTabUrl = newUrl;
+            // Update tab title if available
+            this.currentTabTitle = document.title;
           }
         }, 100);
       } catch (error) {
@@ -1469,7 +1541,7 @@ export class RecordingManager {
       }
 
       // Capture visual snapshot for keyboard events (for AI description generation)
-      let visualSnapshot: WorkflowStep['payload']['visualSnapshot'] | undefined;
+      let visualSnapshot: WorkflowStepPayload['visualSnapshot'] | undefined;
       try {
         console.log('📸 GhostWriter: Capturing snapshot for keyboard event');
         const visuals = await VisualSnapshotService.capture(actualElement);
@@ -1502,6 +1574,9 @@ export class RecordingManager {
         xpath: selectors.xpath,
         timestamp: stepTimestamp,
         url: url,
+        tabUrl: this.currentTabUrl || undefined,
+        tabTitle: this.currentTabTitle || undefined,
+        tabInfo: this.currentTabUrl ? { url: this.currentTabUrl, title: this.currentTabTitle || '' } : undefined,
         shadowPath: selectors.shadowPath,
         // Phase 2: Important fixes
         keyboardDetails,
@@ -1574,7 +1649,7 @@ export class RecordingManager {
         const url = window.location.href;
 
         // Capture viewport snapshot for scroll (shows what's visible after scrolling)
-        let visualSnapshot: WorkflowStep['payload']['visualSnapshot'] | undefined;
+        let visualSnapshot: WorkflowStepPayload['visualSnapshot'] | undefined;
         try {
           console.log('📸 GhostWriter: Capturing snapshot for scroll event');
           // Capture viewport snapshot (no specific element, just the viewport)
@@ -1617,6 +1692,9 @@ export class RecordingManager {
           xpath: '/html/body',
           timestamp: stepTimestamp,
           url: url,
+          tabUrl: this.currentTabUrl || undefined,
+          tabTitle: this.currentTabTitle || undefined,
+          tabInfo: this.currentTabUrl ? { url: this.currentTabUrl, title: this.currentTabTitle || '' } : undefined,
           viewport,
           timing,
           visualSnapshot, // Visual snapshot for AI description generation
@@ -1838,7 +1916,7 @@ export class RecordingManager {
 
       // ALWAYS capture snapshot for input events (for AI context)
       // Try pending snapshot first (from mousedown), but capture fresh if not available
-      let visualSnapshot: WorkflowStep['payload']['visualSnapshot'] | undefined;
+      let visualSnapshot: WorkflowStepPayload['visualSnapshot'] | undefined;
       if (this.pendingSnapshot) {
         try {
           const visuals = await this.pendingSnapshot;
@@ -1897,6 +1975,9 @@ export class RecordingManager {
         value: value,
         timestamp: stepTimestamp,
         url: url,
+        tabUrl: this.currentTabUrl || undefined,
+        tabTitle: this.currentTabTitle || undefined,
+        tabInfo: this.currentTabUrl ? { url: this.currentTabUrl, title: this.currentTabTitle || '' } : undefined,
         shadowPath: selectors.shadowPath,
         elementState: elementState || undefined,
         // Phase 2: Important fixes
@@ -1988,22 +2069,28 @@ export class RecordingManager {
   private sendStep(step: WorkflowStep): void {
     try {
       // Debug: Verify visualSnapshot is in the step before sending
-      const hasVisualSnapshot = !!step.payload.visualSnapshot;
-      if (hasVisualSnapshot && step.payload.visualSnapshot) {
-        const snapshot = step.payload.visualSnapshot;
-        console.log('📸 GhostWriter: Sending step with visualSnapshot - viewport:', snapshot.viewport?.substring(0, 50) || 'missing', '...');
-      } else {
-        console.warn('📸 GhostWriter: Sending step WITHOUT visualSnapshot');
-      }
+      if (isWorkflowStepPayload(step.payload)) {
+        const hasVisualSnapshot = !!step.payload.visualSnapshot;
+        if (hasVisualSnapshot && step.payload.visualSnapshot) {
+          const snapshot = step.payload.visualSnapshot;
+          console.log('📸 GhostWriter: Sending step with visualSnapshot - viewport:', snapshot.viewport?.substring(0, 50) || 'missing', '...');
+        } else {
+          console.warn('📸 GhostWriter: Sending step WITHOUT visualSnapshot');
+        }
 
-      // Phase 4: Add page type to step if available
-      if (this.currentPageAnalysis?.pageType) {
-        step.payload.pageType = this.currentPageAnalysis.pageType;
+        // Phase 4: Add page type to step if available
+        if (this.currentPageAnalysis?.pageType) {
+          step.payload.pageType = this.currentPageAnalysis.pageType;
+        }
       }
 
       chrome.runtime.sendMessage({
         type: 'RECORDED_STEP',
-        payload: { step },
+        payload: { 
+          step,
+          tabUrl: this.currentTabUrl || undefined,
+          tabTitle: this.currentTabTitle || undefined,
+        },
       } as import('../types/messages').RecordedStepMessage);
       
       // Generate description asynchronously (non-blocking)
@@ -2109,6 +2196,11 @@ export class RecordingManager {
     }
     
     try {
+      if (!isWorkflowStepPayload(step.payload)) {
+        console.warn('🤖 GhostWriter: Cannot enhance TAB_SWITCH step with AI');
+        return;
+      }
+      
       console.log('🤖 GhostWriter: enhanceStepWithAI started for selector:', step.payload.selector);
       
       // Extract context

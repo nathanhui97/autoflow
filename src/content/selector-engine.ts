@@ -415,6 +415,40 @@ export class SelectorEngine {
       return meaningfulChars >= 3;
     };
 
+    // SPECIAL CASE: If the element itself is a widget element (gs-report-widget-element, etc.),
+    // look for gridster-item parent first, as that's the actual widget container
+    const elementTagName = element.tagName.toLowerCase();
+    const isWidgetElement = elementTagName.includes('widget') || 
+                            elementTagName === 'gs-report-widget-element' ||
+                            elementTagName === 'gs-widget-element';
+    
+    if (isWidgetElement) {
+      // Look for gridster-item parent (the actual widget container)
+      let parent = element.parentElement;
+      let level = 0;
+      while (parent && level < 5 && parent !== document.body) {
+        const parentTag = parent.tagName.toLowerCase();
+        if (parentTag === 'gridster-item' || parentTag.includes('gridster')) {
+          // Found gridster-item - this is the widget container
+          // Check if it has widget title inside the widget element
+          const widgetTitle = this.extractHeaderTextFromElement(element);
+          if (widgetTitle && widgetTitle.length > 10) {
+            // Widget element itself has a title - use gridster-item as container
+            console.log('GhostWriter: Found gridster-item parent for widget element, widget has title:', widgetTitle);
+            return parent;
+          }
+          // Try to find title inside widget element using specific search
+          const titleInWidget = this.findWidgetTitleInElement(element);
+          if (titleInWidget && titleInWidget.length > 10) {
+            console.log('GhostWriter: Found gridster-item parent for widget element, found title in widget:', titleInWidget);
+            return parent;
+          }
+        }
+        parent = parent.parentElement;
+        level++;
+      }
+    }
+
     // NEVER use the clicked element as its own container - always find a parent
     // This prevents selectors like //gs-report-widget-element[...]//gs-report-widget-element
     // We always want a parent container (gridster-item, div, etc.)
@@ -483,37 +517,15 @@ export class SelectorEngine {
   /**
    * Extract header text from a container element
    * Aggressively searches for widget title using multiple strategies
-   * Also searches inside widget elements (gs-report-widget-element, etc.) and siblings
-   * Also searches in parent containers that might have the title
+   * PRIORITY: Widget-specific title > Container title > Parent title
+   * This ensures we get "OFFERS EXPIRING IN NEXT 28 DAYS" instead of "Demand Gen"
    */
   private static extractHeaderText(container: Element): string | null {
-    // First, try to find title in the container itself
-    const containerTitle = this.extractHeaderTextFromElement(container);
-    if (containerTitle) {
-      return containerTitle;
-    }
-
-    // If container is gridster-item or doesn't have text, look in parent containers
     const tagName = container.tagName.toLowerCase();
-    if (tagName === 'gridster-item' || tagName.includes('gridster') || !container.textContent?.trim()) {
-      // Look in parent elements for text (broader search)
-      let parent = container.parentElement;
-      let parentLevel = 0;
-      const maxParentLevels = 5;
-      
-      while (parent && parentLevel < maxParentLevels && parent !== document.body) {
-        const parentTitle = this.extractHeaderTextFromElement(parent);
-        if (parentTitle) {
-          // Found text in parent - use it
-          console.log('GhostWriter: Found title in parent container:', parentTitle);
-          return parentTitle;
-        }
-        parent = parent.parentElement;
-        parentLevel++;
-      }
-    }
-
-    // If container is gridster-item, look inside widget elements
+    
+    // PRIORITY 1: If container is gridster-item, look INSIDE widget elements FIRST
+    // This finds the specific widget title (e.g., "OFFERS EXPIRING IN NEXT 28 DAYS")
+    // before looking at parent containers (which might have section headers like "Demand Gen")
     if (tagName === 'gridster-item' || tagName.includes('gridster')) {
       // Look inside gs-report-widget-element, gs-widget-element, etc.
       const widgetSelectors = [
@@ -528,9 +540,21 @@ export class SelectorEngine {
         try {
           const widgetEl = container.querySelector(selector);
           if (widgetEl) {
+            // Look for widget title within the widget element itself
             const widgetTitle = this.extractHeaderTextFromElement(widgetEl);
-            if (widgetTitle) {
+            if (widgetTitle && widgetTitle.length > 10) {
+              // Only use if it's a substantial title (not just "Report" or short text)
+              // This filters out generic titles and prefers specific widget titles
+              console.log('GhostWriter: ✅ Found widget-specific title:', widgetTitle);
               return widgetTitle;
+            }
+            
+            // Also check for title elements within the widget (more specific search)
+            // Look for common widget title patterns within the widget element
+            const titleInWidget = this.findWidgetTitleInElement(widgetEl);
+            if (titleInWidget && titleInWidget.length > 10) {
+              console.log('GhostWriter: ✅ Found widget title using specific search:', titleInWidget);
+              return titleInWidget;
             }
           }
         } catch (e) {
@@ -538,28 +562,71 @@ export class SelectorEngine {
           continue;
         }
       }
-
-      // Look at previous sibling (title might be before the widget)
-      let sibling = container.previousElementSibling;
-      let siblingCount = 0;
-      while (sibling && siblingCount < 3) {
-        const siblingTitle = this.extractHeaderTextFromElement(sibling);
-        if (siblingTitle) {
-          return siblingTitle;
-        }
-        sibling = sibling.previousElementSibling;
-        siblingCount++;
+    }
+    
+    // PRIORITY 1.5: If container is a widget element itself (gs-report-widget-element), look inside it
+    // This handles the case where findAnchorContainer returns the widget element
+    if (tagName.includes('widget') || tagName === 'gs-report-widget-element' || tagName === 'gs-widget-element') {
+      // Look for widget title within this widget element
+      const widgetTitle = this.extractHeaderTextFromElement(container);
+      if (widgetTitle && widgetTitle.length > 10) {
+        console.log('GhostWriter: ✅ Found widget title in widget element itself:', widgetTitle);
+        return widgetTitle;
       }
+      
+      const titleInWidget = this.findWidgetTitleInElement(container);
+      if (titleInWidget && titleInWidget.length > 10) {
+        console.log('GhostWriter: ✅ Found widget title in widget element using specific search:', titleInWidget);
+        return titleInWidget;
+      }
+    }
+    
+    // PRIORITY 2: Try to find title in the container itself
+    const containerTitle = this.extractHeaderTextFromElement(container);
+    if (containerTitle) {
+      return containerTitle;
+    }
 
-      // Look at parent's first child (title might be at parent level)
-      const parent = container.parentElement;
-      if (parent) {
-        const firstChild = parent.firstElementChild;
-        if (firstChild && firstChild !== container) {
-          const firstChildTitle = this.extractHeaderTextFromElement(firstChild);
-          if (firstChildTitle) {
-            return firstChildTitle;
-          }
+    // PRIORITY 3: If container is gridster-item or doesn't have text, look in parent containers
+    // BUT: Only if we haven't found a widget-specific title above
+    if (tagName === 'gridster-item' || tagName.includes('gridster') || !container.textContent?.trim()) {
+      // Look in parent elements for text (broader search)
+      let parent = container.parentElement;
+      let parentLevel = 0;
+      const maxParentLevels = 5;
+      
+      while (parent && parentLevel < maxParentLevels && parent !== document.body) {
+        const parentTitle = this.extractHeaderTextFromElement(parent);
+        if (parentTitle) {
+          // Found text in parent - use it (but log that it's a parent, not widget-specific)
+          console.log('GhostWriter: ⚠️ Found title in parent container (may be section header):', parentTitle);
+          return parentTitle;
+        }
+        parent = parent.parentElement;
+        parentLevel++;
+      }
+    }
+
+    // Look at previous sibling (title might be before the widget)
+    let sibling = container.previousElementSibling;
+    let siblingCount = 0;
+    while (sibling && siblingCount < 3) {
+      const siblingTitle = this.extractHeaderTextFromElement(sibling);
+      if (siblingTitle) {
+        return siblingTitle;
+      }
+      sibling = sibling.previousElementSibling;
+      siblingCount++;
+    }
+
+    // Look at parent's first child (title might be at parent level)
+    const parent = container.parentElement;
+    if (parent) {
+      const firstChild = parent.firstElementChild;
+      if (firstChild && firstChild !== container) {
+        const firstChildTitle = this.extractHeaderTextFromElement(firstChild);
+        if (firstChildTitle) {
+          return firstChildTitle;
         }
       }
     }
@@ -603,6 +670,68 @@ export class SelectorEngine {
       }
     }
 
+    return null;
+  }
+
+  /**
+   * Find widget title within a widget element using widget-specific patterns
+   * Looks for titles that are typically at the top of widget cards/reports
+   */
+  private static findWidgetTitleInElement(widgetElement: Element): string | null {
+    // Strategy 1: Look for title in widget header/header section
+    const headerSelectors = [
+      '[class*="header"]',
+      '[class*="title"]',
+      '[class*="widget-header"]',
+      '[class*="widget-title"]',
+      '[class*="report-title"]',
+      '[class*="card-title"]',
+      'header',
+      '.header',
+      '.title',
+    ];
+    
+    for (const selector of headerSelectors) {
+      try {
+        const headerEl = widgetElement.querySelector(selector);
+        if (headerEl) {
+          const text = headerEl.textContent?.trim();
+          // Look for longer text (widget titles are usually longer than section headers)
+          // Widget titles like "OFFERS EXPIRING IN NEXT 28 DAYS" are typically 20+ chars
+          if (text && text.length > 15 && text.length < 200) {
+            // Prefer all-caps or title-case text (common for widget titles)
+            if (/^[A-Z]/.test(text) || text === text.toUpperCase()) {
+              console.log('GhostWriter: Found widget title in header:', text);
+              return text;
+            }
+          }
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+    
+    // Strategy 2: Look for first large text block (widget titles are usually prominent)
+    // Get all text nodes and find the longest one that's likely a title
+    const allText = widgetElement.textContent?.trim() || '';
+    if (allText) {
+      // Split by newlines and find the longest line that looks like a title
+      const lines = allText.split(/\n+/).map(l => l.trim()).filter(l => l.length > 10);
+      if (lines.length > 0) {
+        // Prefer longer lines (widget titles are usually longer)
+        const sorted = lines.sort((a, b) => b.length - a.length);
+        const candidate = sorted[0];
+        // Widget titles are usually 15-100 chars, all caps or title case
+        if (candidate.length >= 15 && candidate.length < 200) {
+          // Check if it looks like a title (starts with capital, not just numbers)
+          if (/^[A-Z]/.test(candidate) && !/^\d+$/.test(candidate)) {
+            console.log('GhostWriter: Found widget title from text content:', candidate);
+            return candidate.substring(0, 100); // Limit length
+          }
+        }
+      }
+    }
+    
     return null;
   }
 

@@ -22,6 +22,7 @@
  */
 
 import type { WorkflowStep, SavedWorkflow } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 import type { AIAnalysisPayload, AIWorkflowPayload, SemanticContext, ElementContext, PageContext } from '../types/ai';
 
 export class AIDataBuilder {
@@ -38,9 +39,11 @@ export class AIDataBuilder {
       const payload = this.buildStepAnalysisPayload(step, previousStep);
       
       console.group(`Step ${index + 1}: ${step.type}`);
-      console.log('Original has gridCoordinates?', !!step.payload.context?.gridCoordinates);
-      console.log('Original has formCoordinates?', !!step.payload.context?.formCoordinates);
-      console.log('Original has decisionSpace?', !!step.payload.context?.decisionSpace);
+      if (isWorkflowStepPayload(step.payload)) {
+        console.log('Original has gridCoordinates?', !!step.payload.context?.gridCoordinates);
+        console.log('Original has formCoordinates?', !!step.payload.context?.formCoordinates);
+        console.log('Original has decisionSpace?', !!step.payload.context?.decisionSpace);
+      }
       console.log('Transformed Payload:', payload);
       console.log('Has Semantic Context?', !!payload.semanticContext);
       if (payload.semanticContext) {
@@ -62,12 +65,30 @@ export class AIDataBuilder {
     step: WorkflowStep,
     previousStep?: WorkflowStep
   ): AIAnalysisPayload {
+    // Skip TAB_SWITCH steps - they don't need AI analysis
+    if (step.type === 'TAB_SWITCH' || !isWorkflowStepPayload(step.payload)) {
+      return {
+        action: {
+          type: 'NAVIGATION' as const,
+          url: 'tab-switch',
+        },
+        pageContext: {
+          title: document.title,
+          url: 'tab-switch',
+        },
+      };
+    }
+
+    const pageContext = this.buildPageContext(step);
     const payload: AIAnalysisPayload = {
       action: {
-        type: step.type,
+        type: step.type as 'INPUT' | 'CLICK' | 'KEYBOARD' | 'NAVIGATION' | 'SCROLL',
         url: step.payload.url,
       },
-      pageContext: this.buildPageContext(step),
+      pageContext: pageContext || {
+        title: document.title,
+        url: step.payload.url,
+      },
     };
 
     // PRIORITY 1: Semantic Context (what AI cares about most)
@@ -179,6 +200,9 @@ export class AIDataBuilder {
    * Build semantic context (prioritized for AI understanding)
    */
   private static buildSemanticContext(step: WorkflowStep): SemanticContext | null {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return null;
+    }
     const context = step.payload.context;
     if (!context) {
       return null;
@@ -245,6 +269,9 @@ export class AIDataBuilder {
    * Build element context (simplified for AI)
    */
   private static buildElementContext(step: WorkflowStep): ElementContext | null {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return null;
+    }
     const payload = step.payload;
     const context = payload.context;
 
@@ -298,7 +325,10 @@ export class AIDataBuilder {
   /**
    * Build page context (simplified - removed coordinates)
    */
-  private static buildPageContext(step: WorkflowStep): PageContext {
+  private static buildPageContext(step: WorkflowStep): PageContext | undefined {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return undefined;
+    }
     return {
       title: document.title,
       url: step.payload.url,

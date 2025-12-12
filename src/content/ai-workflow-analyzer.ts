@@ -4,6 +4,7 @@
  */
 
 import type { WorkflowStep, WorkflowIntent, Pattern } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 import { AIDataBuilder } from './ai-data-builder';
 
 /**
@@ -62,9 +63,11 @@ export class AIWorkflowAnalyzer {
       if (index === 0) {
         console.group('🔍 Phase 1 Test - AI Data Builder');
         console.log('Original Step Type:', step.type);
-        console.log('Original has gridCoordinates?', !!step.payload.context?.gridCoordinates);
-        console.log('Original has formCoordinates?', !!step.payload.context?.formCoordinates);
-        console.log('Original has decisionSpace?', !!step.payload.context?.decisionSpace);
+        if (isWorkflowStepPayload(step.payload)) {
+          console.log('Original has gridCoordinates?', !!step.payload.context?.gridCoordinates);
+          console.log('Original has formCoordinates?', !!step.payload.context?.formCoordinates);
+          console.log('Original has decisionSpace?', !!step.payload.context?.decisionSpace);
+        }
         console.log('Transformed Payload:', payload);
         console.log('Has Semantic Context?', !!payload.semanticContext);
         if (payload.semanticContext) {

@@ -4,6 +4,7 @@
  */
 
 import type { SavedWorkflow, WorkflowStep } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 import { AICache } from './ai-cache';
 import { aiConfig } from './ai-config';
 import { AIDataBuilder } from '../content/ai-data-builder';
@@ -45,7 +46,7 @@ export class IntentAnalyzer {
         type: 'workflow_intent',
         workflowId: workflow.id,
         stepCount: workflow.steps.length,
-        firstStepUrl: workflow.steps[0]?.payload.url,
+        firstStepUrl: (workflow.steps[0] && isWorkflowStepPayload(workflow.steps[0].payload)) ? workflow.steps[0].payload.url : undefined,
         lastStepType: workflow.steps[workflow.steps.length - 1]?.type,
       });
 
@@ -109,7 +110,7 @@ export class IntentAnalyzer {
       
       // Extract field labels as sub-goals
       steps.forEach(step => {
-        if (step.type === 'INPUT' && step.payload.label) {
+        if (step.type === 'INPUT' && isWorkflowStepPayload(step.payload) && step.payload.label) {
           subGoals.push(`Enter ${step.payload.label}`);
         }
       });
@@ -120,12 +121,12 @@ export class IntentAnalyzer {
     }
     
     // Data entry pattern (spreadsheet)
-    else if (inputCount >= 1 && steps.some(s => s.payload.context?.gridCoordinates)) {
+    else if (inputCount >= 1 && steps.some(s => isWorkflowStepPayload(s.payload) && s.payload.context?.gridCoordinates)) {
       primaryGoal = 'Enter data into spreadsheet';
       expectedOutcome = 'Data saved in cells';
       
       steps.forEach(step => {
-        if (step.type === 'INPUT' && step.payload.context?.gridCoordinates) {
+        if (step.type === 'INPUT' && isWorkflowStepPayload(step.payload) && step.payload.context?.gridCoordinates) {
           const cell = step.payload.context.gridCoordinates.cellReference;
           subGoals.push(`Enter data in cell ${cell || 'unknown'}`);
         }
@@ -143,12 +144,12 @@ export class IntentAnalyzer {
     }
     
     // Selection pattern
-    else if (clickCount >= 2 && steps.some(s => s.payload.context?.decisionSpace)) {
+    else if (clickCount >= 2 && steps.some(s => isWorkflowStepPayload(s.payload) && s.payload.context?.decisionSpace)) {
       primaryGoal = 'Select options from menus';
       expectedOutcome = 'Options selected successfully';
       
       steps.forEach(step => {
-        if (step.payload.context?.decisionSpace) {
+        if (isWorkflowStepPayload(step.payload) && step.payload.context?.decisionSpace) {
           subGoals.push(`Select "${step.payload.context.decisionSpace.selectedText}"`);
         }
       });
@@ -189,6 +190,7 @@ export class IntentAnalyzer {
     // Check for form submission patterns
     const hasSubmitButton = steps.some(s => 
       s.type === 'CLICK' && 
+      isWorkflowStepPayload(s.payload) &&
       (s.payload.elementText?.toLowerCase().includes('submit') ||
        s.payload.elementText?.toLowerCase().includes('save') ||
        s.payload.elementText?.toLowerCase().includes('send') ||
@@ -205,7 +207,7 @@ export class IntentAnalyzer {
     }
 
     // Check for selection patterns
-    if (lastStep.payload.context?.decisionSpace) {
+    if (isWorkflowStepPayload(lastStep.payload) && lastStep.payload.context?.decisionSpace) {
       return 'Selection applied and UI updated';
     }
 
@@ -229,7 +231,7 @@ export class IntentAnalyzer {
 
     // Check for form inputs
     const hasFormInputs = steps.some(s => 
-      s.type === 'INPUT' && s.payload.context?.formCoordinates
+      s.type === 'INPUT' && isWorkflowStepPayload(s.payload) && s.payload.context?.formCoordinates
     );
     
     if (hasFormInputs) {
@@ -243,6 +245,7 @@ export class IntentAnalyzer {
     // Check for button clicks
     const hasButtonClicks = steps.some(s => 
       s.type === 'CLICK' && 
+      isWorkflowStepPayload(s.payload) &&
       (s.payload.elementRole === 'button' || s.payload.context?.buttonContext)
     );
     
@@ -255,7 +258,7 @@ export class IntentAnalyzer {
     }
 
     // Check for dropdown selections
-    const hasDropdowns = steps.some(s => s.payload.context?.decisionSpace);
+    const hasDropdowns = steps.some(s => isWorkflowStepPayload(s.payload) && s.payload.context?.decisionSpace);
     
     if (hasDropdowns) {
       patterns.push({
@@ -383,16 +386,27 @@ export class IntentAnalyzer {
    */
   private static generateStepDescription(step: WorkflowStep): string {
     switch (step.type) {
+      case 'TAB_SWITCH':
+        return 'Switch to different tab';
       case 'CLICK':
-        const clickText = step.payload.elementText || step.payload.label || 'element';
-        return `Click "${clickText.substring(0, 30)}"`;
+        if (isWorkflowStepPayload(step.payload)) {
+          const clickText = step.payload.elementText || step.payload.label || 'element';
+          return `Click "${clickText.substring(0, 30)}"`;
+        }
+        return 'Click element';
       case 'INPUT':
-        const inputLabel = step.payload.label || 'field';
-        return `Enter value in "${inputLabel.substring(0, 30)}"`;
+        if (isWorkflowStepPayload(step.payload)) {
+          const inputLabel = step.payload.label || 'field';
+          return `Enter value in "${inputLabel.substring(0, 30)}"`;
+        }
+        return 'Enter value';
       case 'NAVIGATION':
         return 'Navigate to page';
       case 'KEYBOARD':
-        return `Press ${step.payload.keyboardDetails?.key || 'key'}`;
+        if (isWorkflowStepPayload(step.payload)) {
+          return `Press ${step.payload.keyboardDetails?.key || 'key'}`;
+        }
+        return 'Press key';
       case 'SCROLL':
         return 'Scroll page';
       default:

@@ -12,7 +12,7 @@ import type {
 } from './visual';
 import type { WorkflowVariables } from '../lib/variable-detector';
 
-export type WorkflowStepType = 'CLICK' | 'INPUT' | 'NAVIGATION' | 'KEYBOARD' | 'SCROLL';
+export type WorkflowStepType = 'CLICK' | 'INPUT' | 'NAVIGATION' | 'KEYBOARD' | 'SCROLL' | 'TAB_SWITCH';
 
 export interface ElementState {
   visible: boolean;
@@ -117,6 +117,16 @@ export interface FocusEvents {
   needsBlur?: boolean;
 }
 
+export interface TabSwitchPayload {
+  fromUrl: string;
+  toUrl: string;
+  fromTitle?: string;
+  toTitle?: string;
+  fromTabIndex?: number; // Logical index (Tab 0, Tab 1, etc.)
+  toTabIndex?: number; // Logical index
+  timestamp: number;
+}
+
 export interface WorkflowStepPayload {
   selector: string; // The best stable selector
   fallbackSelectors: string[]; // List of backup selectors
@@ -125,6 +135,9 @@ export interface WorkflowStepPayload {
   value?: string; // "Acme Corp"
   timestamp: number;
   url: string;
+  tabUrl?: string; // Tab URL where this step was recorded (stable identifier, not tabId)
+  tabTitle?: string; // Tab title for additional context
+  tabInfo?: { url: string; title: string }; // Tab context (URL-based, not ID-based)
   shadowPath?: ShadowPath[]; // Path through shadow boundaries
   elementState?: ElementState; // Element state at time of recording
   elementText?: string; // Exact text content of the element (for buttons, links, labels)
@@ -259,8 +272,15 @@ export interface WorkflowIntent {
 
 export interface WorkflowStep {
   type: WorkflowStepType;
-  payload: WorkflowStepPayload;
+  payload: WorkflowStepPayload | TabSwitchPayload; // TabSwitchPayload for TAB_SWITCH steps
   description?: string; // AI-generated natural language description
+}
+
+/**
+ * Type guard to check if payload is WorkflowStepPayload (not TabSwitchPayload)
+ */
+export function isWorkflowStepPayload(payload: WorkflowStepPayload | TabSwitchPayload): payload is WorkflowStepPayload {
+  return 'selector' in payload && 'url' in payload;
 }
 
 export interface SavedWorkflow {

@@ -4,6 +4,7 @@
  */
 
 import type { WorkflowStep, Pattern } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 
 export class PatternDetector {
   /**
@@ -64,7 +65,7 @@ export class PatternDetector {
    * Detect grid-based repetition (spreadsheet rows/columns)
    */
   private static detectGridRepetition(steps: WorkflowStep[]): Pattern | null {
-    const gridSteps = steps.filter(s => s.payload.context?.gridCoordinates);
+    const gridSteps = steps.filter(s => isWorkflowStepPayload(s.payload) && s.payload.context?.gridCoordinates);
     if (gridSteps.length < 2) {
       return null;
     }
@@ -75,6 +76,7 @@ export class PatternDetector {
     const values: string[] = [];
 
     for (const step of gridSteps) {
+      if (!isWorkflowStepPayload(step.payload)) continue;
       const coords = step.payload.context?.gridCoordinates;
       if (coords?.rowIndex !== undefined) {
         rowIndices.push(coords.rowIndex);
@@ -82,7 +84,7 @@ export class PatternDetector {
       if (coords?.columnIndex !== undefined) {
         columnIndices.push(coords.columnIndex);
       }
-      if (step.payload.value) {
+      if (isWorkflowStepPayload(step.payload) && step.payload.value) {
         values.push(step.payload.value);
       }
     }
@@ -123,13 +125,20 @@ export class PatternDetector {
    */
   private static detectClickRepetition(steps: WorkflowStep[]): Pattern | null {
     // Check if clicks have similar selectors but different coordinates
-    const selectors = steps.map(s => s.payload.selector);
+    const validSteps = steps.filter(s => isWorkflowStepPayload(s.payload));
+    if (validSteps.length < 2) return null;
+    const selectors: string[] = [];
+    for (const s of validSteps) {
+      if (isWorkflowStepPayload(s.payload)) {
+        selectors.push(s.payload.selector);
+      }
+    }
     const isSimilarSelectors = this.areSimilarSelectors(selectors);
 
     if (isSimilarSelectors && steps.length >= 2) {
       const values: string[] = [];
       for (const step of steps) {
-        if (step.payload.elementText) {
+        if (isWorkflowStepPayload(step.payload) && step.payload.elementText) {
           values.push(step.payload.elementText);
         }
       }
@@ -153,30 +162,45 @@ export class PatternDetector {
    */
   private static detectSequentialPattern(steps: WorkflowStep[]): Pattern | null {
     // Check for form field sequence
-    const formSteps = steps.filter(s => s.payload.context?.formCoordinates);
+    const formSteps = steps.filter(s => isWorkflowStepPayload(s.payload) && s.payload.context?.formCoordinates);
     if (formSteps.length >= 2) {
-      const fieldOrders = formSteps
-        .map(s => s.payload.context?.formCoordinates?.fieldOrder)
-        .filter((order): order is number => order !== undefined);
+      const fieldOrders: number[] = [];
+      for (const s of formSteps) {
+        if (isWorkflowStepPayload(s.payload)) {
+          const order = s.payload.context?.formCoordinates?.fieldOrder;
+          if (order !== undefined) {
+            fieldOrders.push(order);
+          }
+        }
+      }
 
       if (fieldOrders.length >= 2 && this.isSequential(fieldOrders)) {
         return {
           type: 'sequential',
           sequenceType: 'none',
           stepCount: formSteps.length,
-          dataVariation: formSteps.map(s => s.payload.value || '').filter(v => v),
+          dataVariation: (() => {
+            const values: string[] = [];
+            for (const s of formSteps) {
+              if (isWorkflowStepPayload(s.payload) && s.payload.value) {
+                values.push(s.payload.value);
+              }
+            }
+            return values;
+          })(),
           confidence: 0.7,
         };
       }
     }
 
     // Check for table cell sequence
-    const tableSteps = steps.filter(s => s.payload.context?.tableCoordinates);
+    const tableSteps = steps.filter(s => isWorkflowStepPayload(s.payload) && s.payload.context?.tableCoordinates);
     if (tableSteps.length >= 2) {
       const rowIndices: number[] = [];
       const colIndices: number[] = [];
 
       for (const step of tableSteps) {
+        if (!isWorkflowStepPayload(step.payload)) continue;
         const coords = step.payload.context?.tableCoordinates;
         if (coords?.rowIndex !== undefined) {
           rowIndices.push(coords.rowIndex);
@@ -191,7 +215,15 @@ export class PatternDetector {
           type: 'sequential',
           sequenceType: 'row',
           stepCount: tableSteps.length,
-          dataVariation: tableSteps.map(s => s.payload.value || '').filter(v => v),
+          dataVariation: (() => {
+            const values: string[] = [];
+            for (const s of tableSteps) {
+              if (isWorkflowStepPayload(s.payload) && s.payload.value) {
+                values.push(s.payload.value);
+              }
+            }
+            return values;
+          })(),
           confidence: 0.7,
         };
       }
@@ -201,7 +233,15 @@ export class PatternDetector {
           type: 'sequential',
           sequenceType: 'column',
           stepCount: tableSteps.length,
-          dataVariation: tableSteps.map(s => s.payload.value || '').filter(v => v),
+          dataVariation: (() => {
+            const values: string[] = [];
+            for (const s of tableSteps) {
+              if (isWorkflowStepPayload(s.payload) && s.payload.value) {
+                values.push(s.payload.value);
+              }
+            }
+            return values;
+          })(),
           confidence: 0.7,
         };
       }
@@ -225,15 +265,30 @@ export class PatternDetector {
 
     // If all steps are same type and have different values
     if (uniqueTypes.size === 1) {
-      const values = steps.map(s => s.payload.value || s.payload.elementText || '').filter(v => v);
+      const validSteps = steps.filter(s => isWorkflowStepPayload(s.payload));
+      if (validSteps.length < 3) return null;
+      
+      const values: string[] = [];
+      for (const s of validSteps) {
+        if (isWorkflowStepPayload(s.payload)) {
+          const value = s.payload.value || s.payload.elementText || '';
+          if (value) values.push(value);
+        }
+      }
       if (values.length >= 3 && this.hasDataVariation(values)) {
         // Check if selectors are similar
-        const selectors = steps.map(s => s.payload.selector);
+        // validSteps is already filtered to only WorkflowStepPayload, so we can safely access selector
+        const selectors: string[] = [];
+        for (const s of validSteps) {
+          if (isWorkflowStepPayload(s.payload)) {
+            selectors.push(s.payload.selector);
+          }
+        }
         if (this.areSimilarSelectors(selectors)) {
           return {
             type: 'template',
             sequenceType: 'none',
-            stepCount: steps.length,
+            stepCount: validSteps.length,
             dataVariation: values,
             confidence: 0.6,
           };

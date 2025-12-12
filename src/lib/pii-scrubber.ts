@@ -4,6 +4,7 @@
  */
 
 import type { WorkflowStep } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 import type { FailureSnapshot } from './dom-distiller';
 
 export class PIIScrubber {
@@ -72,6 +73,11 @@ export class PIIScrubber {
   static scrubStep(step: WorkflowStep): WorkflowStep {
     const scrubbed = { ...step };
     
+    // Only scrub WorkflowStepPayload, not TabSwitchPayload
+    if (!isWorkflowStepPayload(scrubbed.payload)) {
+      return scrubbed;
+    }
+    
     // Scrub value but keep label
     if (scrubbed.payload.value) {
       scrubbed.payload.value = this.scrub(scrubbed.payload.value);
@@ -105,22 +111,29 @@ export class PIIScrubber {
     
     // Scrub ancestor text
     if (scrubbed.payload.context?.ancestors) {
-      scrubbed.payload.context.ancestors = scrubbed.payload.context.ancestors.map(ancestor => ({
-        ...ancestor,
-        text: ancestor.text ? this.scrub(ancestor.text) : undefined,
-      }));
+      scrubbed.payload.context.ancestors = scrubbed.payload.context.ancestors.map((ancestor) => {
+        if (!ancestor.selector) {
+          // If no selector, return as-is (invalid ancestor)
+          return ancestor;
+        }
+        return {
+          selector: ancestor.selector,
+          text: ancestor.text ? this.scrub(ancestor.text) : undefined,
+          role: ancestor.role,
+        };
+      });
     }
     
     // Scrub sibling text
     if (scrubbed.payload.context?.siblings) {
       if (scrubbed.payload.context.siblings.before) {
         scrubbed.payload.context.siblings.before = scrubbed.payload.context.siblings.before.map(
-          text => this.scrub(text)
+          (text: string) => this.scrub(text)
         );
       }
       if (scrubbed.payload.context.siblings.after) {
         scrubbed.payload.context.siblings.after = scrubbed.payload.context.siblings.after.map(
-          text => this.scrub(text)
+          (text: string) => this.scrub(text)
         );
       }
     }

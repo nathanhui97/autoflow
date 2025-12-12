@@ -11,12 +11,15 @@ import { VisualWait } from '../lib/visual-wait';
 import { visualFlowTracker } from '../lib/visual-flow';
 import { aiConfig } from '../lib/ai-config';
 import type { WorkflowStep, WorkflowIntent } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 import type { WorkflowVariables } from '../lib/variable-detector';
 
 export class ExecutionEngine {
   // Store variable values for the current execution
   private variableValues: Record<string, string> | undefined;
   private workflowVariables: WorkflowVariables | undefined;
+  // Track current tab URL for multi-tab execution
+  private currentTabUrl: string | null = null;
 
   /**
    * Execute a workflow (backward compatible - defaults to exact replay)
@@ -34,6 +37,8 @@ export class ExecutionEngine {
     // Store variable values for use in executeInput
     this.variableValues = variableValues;
     this.workflowVariables = workflowVariables;
+    // Initialize current tab URL
+    this.currentTabUrl = window.location.href;
 
     try {
       // Determine execution mode
@@ -50,6 +55,7 @@ export class ExecutionEngine {
       // Clear variable values after execution
       this.variableValues = undefined;
       this.workflowVariables = undefined;
+      this.currentTabUrl = null;
     }
   }
 
@@ -88,7 +94,7 @@ export class ExecutionEngine {
       }
 
       // Wait between steps if needed
-      if (step.payload.timing?.delayAfter) {
+      if (isWorkflowStepPayload(step.payload) && step.payload.timing?.delayAfter) {
         await this.delay(step.payload.timing.delayAfter);
       }
     }
@@ -206,7 +212,7 @@ export class ExecutionEngine {
 
     // For each INPUT step, find the cell in the next row
     for (const step of steps) {
-      if (step.type === 'INPUT') {
+      if (step.type === 'INPUT' && isWorkflowStepPayload(step.payload)) {
         const columnIndex = step.payload.context?.gridCoordinates?.columnIndex;
         if (columnIndex !== undefined) {
           // Find cell at (nextRow, columnIndex)
@@ -255,7 +261,7 @@ export class ExecutionEngine {
 
     // Execute steps with column adaptation
     for (const step of steps) {
-      if (step.type === 'INPUT') {
+      if (step.type === 'INPUT' && isWorkflowStepPayload(step.payload)) {
         const rowIndex = step.payload.context?.gridCoordinates?.rowIndex;
         if (rowIndex !== undefined) {
           const cell = ExecutionTools.findTableCell({
@@ -358,6 +364,27 @@ export class ExecutionEngine {
    * Execute a single step
    */
   private async executeStep(step: WorkflowStep): Promise<void> {
+    // Check if tab switch is needed
+    if (step.type === 'TAB_SWITCH') {
+      const tabSwitchPayload = step.payload as import('../types/workflow').TabSwitchPayload;
+      await this.switchToTabByUrl(tabSwitchPayload.toUrl);
+      // Update current tab URL
+      this.currentTabUrl = tabSwitchPayload.toUrl;
+      // Wait for page to be ready
+      await this.waitForPageReady();
+      return;
+    }
+
+    // Check if step requires a different tab
+    const stepTabUrl = 'tabUrl' in step.payload ? step.payload.tabUrl : undefined;
+    if (stepTabUrl && stepTabUrl !== this.currentTabUrl) {
+      // Switch to the required tab
+      await this.switchToTabByUrl(stepTabUrl);
+      this.currentTabUrl = stepTabUrl;
+      // Wait for page to be ready after tab switch
+      await this.waitForPageReady();
+    }
+
     // Wait for conditions
     await this.waitForConditions(step);
 
@@ -378,6 +405,9 @@ export class ExecutionEngine {
         break;
       case 'NAVIGATION':
         // Navigation is handled by URL changes, not explicit execution
+        break;
+      case 'SCROLL':
+        // Scroll steps are handled implicitly during execution
         break;
       default:
         console.warn(`GhostWriter: Unknown step type: ${(step as any).type}`);
@@ -404,6 +434,7 @@ export class ExecutionEngine {
     
     // For clicks on buttons that might trigger modals/dropdowns, wait briefly
     if (step.type === 'CLICK' && 
+        isWorkflowStepPayload(step.payload) &&
         (step.payload.elementRole === 'button' || step.payload.context?.buttonContext)) {
       await VisualWait.waitForAnimationComplete(1000, 100, 50);
     }
@@ -413,6 +444,9 @@ export class ExecutionEngine {
    * Wait for conditions before executing step
    */
   private async waitForConditions(step: WorkflowStep): Promise<void> {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return; // TAB_SWITCH steps handle their own waiting
+    }
     const conditions = step.payload.waitConditions || [];
 
     for (const condition of conditions) {
@@ -446,6 +480,9 @@ export class ExecutionEngine {
     const element = await ElementFinder.findElement(step);
     
     if (!element) {
+      if (!isWorkflowStepPayload(step.payload)) {
+        throw new Error(`GhostWriter: Cannot execute ${step.type} step - invalid payload`);
+      }
       throw new Error(
         `GhostWriter: Could not find element for ${step.type} step. ` +
         `Tried ${step.payload.fallbackSelectors?.length || 0} selectors and AI recovery (single multimodal request via Supabase). ` +
@@ -458,6 +495,9 @@ export class ExecutionEngine {
     await this.delay(100); // Small delay after scroll
 
     // Dispatch full event sequence for React/Angular compatibility
+    if (!isWorkflowStepPayload(step.payload)) {
+      throw new Error(`GhostWriter: Cannot execute ${step.type} step - invalid payload`);
+    }
     const eventDetails = step.payload.eventDetails;
     const mouseButton = eventDetails?.mouseButton || 'left';
     const modifiers = eventDetails?.modifiers || {};
@@ -503,7 +543,7 @@ export class ExecutionEngine {
    * Matches by step timestamp (stepId)
    */
   private getVariableValueForStep(step: WorkflowStep): string | undefined {
-    if (!this.variableValues || !this.workflowVariables) {
+    if (!this.variableValues || !this.workflowVariables || !isWorkflowStepPayload(step.payload)) {
       return undefined;
     }
 
@@ -528,11 +568,18 @@ export class ExecutionEngine {
     const element = await ElementFinder.findElement(step);
     
     if (!element) {
+      if (!isWorkflowStepPayload(step.payload)) {
+        throw new Error(`GhostWriter: Cannot execute ${step.type} step - invalid payload`);
+      }
       throw new Error(
         `GhostWriter: Could not find element for ${step.type} step. ` +
         `Tried ${step.payload.fallbackSelectors?.length || 0} selectors and AI recovery (single multimodal request via Supabase). ` +
         `Selector: ${step.payload.selector}`
       );
+    }
+
+    if (!isWorkflowStepPayload(step.payload)) {
+      throw new Error(`GhostWriter: Cannot execute ${step.type} step - invalid payload`);
     }
 
     // Check if element is contenteditable
@@ -587,7 +634,7 @@ export class ExecutionEngine {
       
       // Dispatch Enter key if it was recorded to commit the cell
       // This is the only way to make the cell "Save" in Google Sheets
-      if (step.payload.keyboardDetails?.key === 'Enter') {
+      if (isWorkflowStepPayload(step.payload) && step.payload.keyboardDetails?.key === 'Enter') {
         const enterEvent = new KeyboardEvent('keydown', {
           key: 'Enter',
           code: 'Enter',
@@ -626,7 +673,7 @@ export class ExecutionEngine {
     }
 
     // Blur if needed
-    if (step.payload.focusEvents?.needsBlur) {
+    if (isWorkflowStepPayload(step.payload) && step.payload.focusEvents?.needsBlur) {
       (element as HTMLElement).blur();
     }
   }
@@ -638,7 +685,14 @@ export class ExecutionEngine {
     const element = await ElementFinder.findElement(step);
     
     if (!element) {
+      if (!isWorkflowStepPayload(step.payload)) {
+        throw new Error(`GhostWriter: Cannot execute ${step.type} step - invalid payload`);
+      }
       throw new Error(`GhostWriter: Could not find element for keyboard step: ${step.payload.selector}`);
+    }
+
+    if (!isWorkflowStepPayload(step.payload)) {
+      throw new Error(`GhostWriter: Cannot execute ${step.type} step - invalid payload`);
     }
 
     // Focus element
@@ -738,6 +792,173 @@ export class ExecutionEngine {
     }
     
     throw new Error(`GhostWriter: Timeout waiting for URL: ${urlPattern}`);
+  }
+
+  /**
+   * Switch to a tab by URL
+   * Uses URL matching to find the correct tab (handles tab ID volatility)
+   */
+  private async switchToTabByUrl(targetUrl: string): Promise<void> {
+    try {
+      // Query all tabs
+      const tabs = await chrome.tabs.query({});
+      
+      // Try exact URL match first
+      let matchingTab = tabs.find(tab => tab.url === targetUrl);
+      
+      // If no exact match, try base URL match (ignore query params and hash)
+      if (!matchingTab) {
+        const targetBaseUrl = this.getBaseUrl(targetUrl);
+        matchingTab = tabs.find(tab => {
+          if (!tab.url) return false;
+          const tabBaseUrl = this.getBaseUrl(tab.url);
+          return tabBaseUrl === targetBaseUrl;
+        });
+      }
+      
+      // If still no match, try pattern matching (for dynamic query parameters)
+      if (!matchingTab) {
+        const targetPattern = this.getUrlPattern(targetUrl);
+        matchingTab = tabs.find(tab => {
+          if (!tab.url) return false;
+          return this.matchesUrlPattern(tab.url, targetPattern);
+        });
+      }
+      
+      if (!matchingTab || !matchingTab.id) {
+        throw new Error(`GhostWriter: No tab found matching URL: ${targetUrl}`);
+      }
+      
+      // Switch to the matching tab
+      await chrome.tabs.update(matchingTab.id, { active: true });
+      
+      // Wait for tab to become active
+      await this.waitForTabActive(matchingTab.id);
+      
+      // Wait for content script to be ready
+      await this.waitForContentScriptReady(matchingTab.id);
+      
+      console.log(`GhostWriter: Switched to tab ${matchingTab.id} (${targetUrl})`);
+    } catch (error) {
+      console.error('GhostWriter: Error switching tabs:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get base URL (without query params and hash)
+   */
+  private getBaseUrl(url: string): string {
+    try {
+      const urlObj = new URL(url);
+      return `${urlObj.protocol}//${urlObj.host}${urlObj.pathname}`;
+    } catch {
+      // If URL parsing fails, return original
+      return url.split('?')[0].split('#')[0];
+    }
+  }
+
+  /**
+   * Get URL pattern for matching (extracts domain and path)
+   */
+  private getUrlPattern(url: string): { domain: string; path: string } {
+    try {
+      const urlObj = new URL(url);
+      return {
+        domain: urlObj.host,
+        path: urlObj.pathname,
+      };
+    } catch {
+      // Fallback parsing
+      const match = url.match(/^(https?:\/\/[^\/]+)(\/.*)?/);
+      if (match) {
+        return {
+          domain: match[1],
+          path: match[2] || '/',
+        };
+      }
+      return { domain: '', path: '' };
+    }
+  }
+
+  /**
+   * Check if URL matches pattern (domain and path must match)
+   */
+  private matchesUrlPattern(url: string, pattern: { domain: string; path: string }): boolean {
+    try {
+      const urlObj = new URL(url);
+      return urlObj.host === pattern.domain && urlObj.pathname === pattern.path;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Wait for tab to become active
+   */
+  private async waitForTabActive(tabId: number, timeout: number = 5000): Promise<void> {
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < timeout) {
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.active) {
+          return;
+        }
+      } catch (error) {
+        // Tab might not exist, continue waiting
+      }
+      
+      await this.delay(100);
+    }
+    
+    throw new Error(`GhostWriter: Timeout waiting for tab ${tabId} to become active`);
+  }
+
+  /**
+   * Wait for content script to be ready in the target tab
+   */
+  private async waitForContentScriptReady(tabId: number, timeout: number = 10000): Promise<void> {
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < timeout) {
+      try {
+        const response = await chrome.tabs.sendMessage(tabId, {
+          type: 'PING',
+          payload: { timestamp: Date.now() },
+        });
+        
+        if (response?.success && response.data?.type === 'PONG') {
+          return;
+        }
+      } catch (error) {
+        // Content script might not be ready yet, continue waiting
+      }
+      
+      await this.delay(200);
+    }
+    
+    throw new Error(`GhostWriter: Timeout waiting for content script in tab ${tabId}`);
+  }
+
+  /**
+   * Wait for page to be ready after tab switch
+   */
+  private async waitForPageReady(timeout: number = 5000): Promise<void> {
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < timeout) {
+      if (document.readyState === 'complete') {
+        // Additional wait for dynamic content
+        await this.delay(500);
+        return;
+      }
+      
+      await this.delay(100);
+    }
+    
+    // Don't throw error, just log warning
+    console.warn('GhostWriter: Page ready state timeout, continuing anyway');
   }
 
   /**

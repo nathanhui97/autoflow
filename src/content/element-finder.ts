@@ -11,6 +11,7 @@ import { VisualAnalysisService } from '../lib/visual-analysis';
 import { CorrectionMemory } from '../lib/correction-memory';
 import { aiConfig } from '../lib/ai-config';
 import type { WorkflowStep } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 import type { VisualCandidate, PageAnalysis } from '../types/visual';
 
 export class ElementFinder {
@@ -22,6 +23,11 @@ export class ElementFinder {
     step: WorkflowStep,
     doc: Document = document
   ): Promise<Element | null> {
+    // Skip TAB_SWITCH steps - they don't have elements to find
+    if (step.type === 'TAB_SWITCH' || !isWorkflowStepPayload(step.payload)) {
+      return null;
+    }
+
     // Strategy 1: Try all recorded selectors
     for (const selector of [step.payload.selector, ...(step.payload.fallbackSelectors || [])]) {
       try {
@@ -167,7 +173,7 @@ export class ElementFinder {
     }
 
     // Must have visual snapshot from recording
-    if (!step.payload.visualSnapshot?.elementSnippet) {
+    if (!isWorkflowStepPayload(step.payload) || !step.payload.visualSnapshot?.elementSnippet) {
       return false;
     }
 
@@ -182,6 +188,9 @@ export class ElementFinder {
     step: WorkflowStep,
     doc: Document
   ): Promise<Element | null> {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return null;
+    }
     const targetScreenshot = step.payload.visualSnapshot?.elementSnippet;
     if (!targetScreenshot) return null;
 
@@ -249,7 +258,7 @@ export class ElementFinder {
       // Weight by text match if we have target text
       let score = importance.overallImportance;
       
-      if (step.payload.elementText) {
+      if (isWorkflowStepPayload(step.payload) && step.payload.elementText) {
         const candidateText = candidate.textContent?.trim() || 
                              candidate.getAttribute('aria-label') || '';
         const textSimilarity = TextMatcher.similarityScore(
@@ -281,6 +290,9 @@ export class ElementFinder {
     step: WorkflowStep,
     doc: Document
   ): Promise<Element | null> {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return null;
+    }
     // Get recorded visual context
     const recordedContext = step.payload.context;
     if (!recordedContext) return null;
@@ -335,7 +347,7 @@ export class ElementFinder {
       }
 
       // Weight by text match
-      if (step.payload.elementText) {
+      if (isWorkflowStepPayload(step.payload) && step.payload.elementText) {
         const candidateText = candidate.textContent?.trim() || '';
         const textMatch = TextMatcher.similarityScore(
           step.payload.elementText,
@@ -518,6 +530,9 @@ export class ElementFinder {
     }
 
     // Must have some identifying information
+    if (!isWorkflowStepPayload(step.payload)) {
+      return false;
+    }
     if (!step.payload.elementText && !step.payload.label && !step.payload.selector) {
       return false;
     }
@@ -556,7 +571,7 @@ export class ElementFinder {
    */
   private static getSearchScope(step: WorkflowStep, doc: Document): Element {
     // If container context exists, try to find the container first
-    if (step.payload.context?.container) {
+    if (isWorkflowStepPayload(step.payload) && step.payload.context?.container) {
       const container = step.payload.context.container;
       
       // Try container selector first
@@ -669,6 +684,9 @@ export class ElementFinder {
    * Find element within the recorded container
    */
   private static findByContainer(step: WorkflowStep, doc: Document): Element | null {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return null;
+    }
     const container = step.payload.context?.container;
     if (!container) return null;
     
@@ -697,6 +715,10 @@ export class ElementFinder {
     }
     
     if (!containerElement) return null;
+    
+    if (!isWorkflowStepPayload(step.payload)) {
+      return null;
+    }
     
     // Search within container using element text or other attributes
     if (step.payload.elementText) {
@@ -731,6 +753,9 @@ export class ElementFinder {
    * Build path from ancestors, then find element within
    */
   private static findByParentHierarchy(step: WorkflowStep, doc: Document): Element | null {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return null;
+    }
     const ancestors = step.payload.context?.ancestors;
     if (!ancestors || ancestors.length === 0) return null;
     
@@ -753,6 +778,10 @@ export class ElementFinder {
     }
     
     if (!currentContainer) return null;
+    
+    if (!isWorkflowStepPayload(step.payload)) {
+      return null;
+    }
     
     // Search within the found container
     if (step.payload.elementText) {
@@ -777,6 +806,9 @@ export class ElementFinder {
    * Try matching by role, aria-label, name even if not exact
    */
   private static findByAttributes(step: WorkflowStep, doc: Document): Element | null {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return null;
+    }
     const scope = this.getSearchScope(step, doc);
     const tagSelectors = this.getTagSelectorsForStep(step);
     
@@ -875,6 +907,9 @@ export class ElementFinder {
    * Use sibling context to find element
    */
   private static findBySiblings(step: WorkflowStep, doc: Document): Element | null {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return null;
+    }
     const siblings = step.payload.context?.siblings;
     if (!siblings) return null;
     

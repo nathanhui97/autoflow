@@ -7,6 +7,7 @@ import { VariableDetector } from '../lib/variable-detector';
 import { VariableInputForm } from './VariableInputForm';
 import type { ExtensionState } from '../types/state';
 import type { WorkflowStep, SavedWorkflow } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 import type { 
   RecordedStepMessage, 
   UpdateStepMessage,
@@ -53,6 +54,7 @@ function App() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
   const [showRefreshDialog, setShowRefreshDialog] = useState(false);
   const [pendingTabId, setPendingTabId] = useState<number | null>(null);
+  const [isPaused, setIsPaused] = useState(false);
   // Correction learning state
   const [showCorrections, setShowCorrections] = useState(false);
   const [storedCorrections, setStoredCorrections] = useState<CorrectionEntry[]>([]);
@@ -154,7 +156,7 @@ function App() {
       } else if (message.type === 'UPDATE_STEP' && message.payload?.stepId && message.payload?.step) {
         updateWorkflowStep(message.payload.stepId, message.payload.step);
         // Mark as enhanced when step is updated with AI suggestions
-        if (message.payload.step.payload.fallbackSelectors?.length > 0) {
+        if (isWorkflowStepPayload(message.payload.step.payload) && message.payload.step.payload.fallbackSelectors?.length > 0) {
           setStepEnhanced(message.payload.stepId);
         }
       } else if (message.type === 'AI_VALIDATION_STARTED' && message.payload?.stepId) {
@@ -231,16 +233,14 @@ function App() {
         setPendingTabId(tab.id);
         setShowRefreshDialog(true);
       } else {
-        // For non-spreadsheet pages, start recording directly
+        // For non-spreadsheet pages, start recording through service worker (for multi-tab coordination)
         setIsRecording(true);
         setState('RECORDING');
         
-        const response = await runtimeBridge.sendMessage(
-          {
-            type: 'START_RECORDING',
-          },
-          tab.id
-        );
+        // Send to service worker, which will coordinate starting recording in active tab
+        const response = await runtimeBridge.sendMessage({
+          type: 'START_RECORDING',
+        });
         
         if (!response.success) {
           throw new Error(response.error || 'Failed to start recording');
@@ -307,33 +307,107 @@ function App() {
     setShowRefreshDialog(false);
     setPendingTabId(null);
     setIsRecording(false);
+    setIsPaused(false);
     setState('IDLE');
+  };
+
+  const handleAddTab = async () => {
+    try {
+      // 1. Update UI immediately (optimistic update)
+      setIsPaused(true);
+      setState('PAUSED');
+      
+      // 2. Send ADD_TAB message to service worker
+      // Service worker will handle pausing (without finalizing) and open new tab
+      const response = await runtimeBridge.sendMessage({
+        type: 'ADD_TAB',
+      });
+      
+      if (!response.success) {
+        throw new Error(response.error || 'Failed to add tab');
+      }
+      
+      // Service worker will:
+      // - Pause recording in all tabs (without finalizing)
+      // - Store last recorded tab info
+      // - Open new tab
+    } catch (err) {
+      console.error('Add tab error:', err);
+      setError(err instanceof Error ? err.message : 'Failed to add tab');
+      // Revert UI state if failed
+      setIsPaused(false);
+      setState('RECORDING'); // Revert to recording state
+    }
+  };
+
+  const handleResumeRecording = async () => {
+    try {
+      // Get current active tab
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id || !tab.url) {
+        throw new Error('No active tab found');
+      }
+      
+      // Check if it's a restricted page
+      if (tab.url.startsWith('chrome://') || 
+          tab.url.startsWith('chrome-extension://') || 
+          tab.url.startsWith('about:') ||
+          tab.url.startsWith('edge://')) {
+        throw new Error('Cannot record on this page type. Please navigate to a regular website.');
+      }
+      
+      // Service worker tracks lastRecordedTabUrl and lastRecordedTabIndex
+      // We don't need to pass fromUrl/fromTabIndex - service worker has it
+      // But we can pass it for clarity
+      
+      // Send RESUME_RECORDING message
+      // Service worker will use stored lastRecordedTabUrl and lastRecordedTabIndex
+      const response = await runtimeBridge.sendMessage({
+        type: 'RESUME_RECORDING',
+        payload: {
+          tabId: tab.id,
+          tabUrl: tab.url,
+          tabTitle: tab.title,
+          fromUrl: '', // Service worker will use stored value
+          // fromTabIndex and toTabIndex will be handled by service worker
+        },
+      });
+      
+      if (!response.success) {
+        throw new Error(response.error || 'Failed to resume recording');
+      }
+      
+      // Update UI state
+      setIsPaused(false);
+      setIsRecording(true);
+      setState('RECORDING');
+    } catch (err) {
+      console.error('Resume recording error:', err);
+      setError(err instanceof Error ? err.message : 'Failed to resume recording');
+    }
   };
 
   const handleStopRecording = async () => {
     console.log('[App] handleStopRecording called, workflowSteps.length:', workflowSteps.length);
     try {
       setIsRecording(false);
+      setIsPaused(false);
       setState('IDLE');
       
-      // Get the active tab to send message to its content script
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tab?.id) {
-        throw new Error('No active tab found');
-      }
-      
-      console.log('[App] Sending STOP_RECORDING message to content script');
-      const response = await runtimeBridge.sendMessage(
-        {
-          type: 'STOP_RECORDING',
-        },
-        tab.id
-      );
+      // Send to service worker, which will stop recording in all active tabs
+      console.log('[App] Sending STOP_RECORDING message to service worker');
+      const response = await runtimeBridge.sendMessage({
+        type: 'STOP_RECORDING',
+      });
       
       if (!response.success) {
         throw new Error(response.error || 'Failed to stop recording');
       }
       console.log('[App] STOP_RECORDING message sent successfully');
+      
+      // Get initial full page snapshot from response if available
+      // Note: This may not be available when stopping multi-tab recording
+      // We'll need to collect snapshots from all tabs if needed
 
       // Get initial full page snapshot from response (captured at recording start for spreadsheet headers)
       const initialFullPageSnapshot = response.data?.initialFullPageSnapshot || null;
@@ -366,9 +440,9 @@ function App() {
         console.log('[App] ✅ Starting variable detection for', currentSteps.length, 'steps');
         console.log('[App] Step types:', currentSteps.map(s => ({ 
           type: s.type, 
-          hasValue: !!s.payload.value,
-          hasLabel: !!s.payload.label,
-          hasSnapshot: !!(s.payload.visualSnapshot?.viewport || s.payload.visualSnapshot?.elementSnippet)
+          hasValue: isWorkflowStepPayload(s.payload) ? !!s.payload.value : false,
+          hasLabel: isWorkflowStepPayload(s.payload) ? !!s.payload.label : false,
+          hasSnapshot: isWorkflowStepPayload(s.payload) ? !!(s.payload.visualSnapshot?.viewport || s.payload.visualSnapshot?.elementSnippet) : false
         })));
         
         // Show loading state immediately
@@ -449,7 +523,7 @@ function App() {
       
       // Detect variables using AI vision analysis
       console.log('[SaveWorkflow] Starting variable detection for', workflowSteps.length, 'steps');
-      console.log('[SaveWorkflow] Step types:', workflowSteps.map(s => ({ type: s.type, hasSnapshot: !!s.payload.visualSnapshot })));
+      console.log('[SaveWorkflow] Step types:', workflowSteps.map(s => ({ type: s.type, hasSnapshot: isWorkflowStepPayload(s.payload) ? !!s.payload.visualSnapshot : false })));
       // For saved workflows, we don't have the initial snapshot, so pass null
       const variables = await VariableDetector.detectVariables(workflowSteps, null);
       console.log('[SaveWorkflow] Detected variables result:', JSON.stringify(variables, null, 2));
@@ -720,6 +794,15 @@ function App() {
           )}
         </div>
 
+        {/* Paused State Indicator */}
+        {isPaused && (
+          <div className="mb-4 p-4 bg-yellow-100 dark:bg-yellow-900 rounded-lg border border-yellow-300 dark:border-yellow-700">
+            <p className="text-sm text-yellow-800 dark:text-yellow-200">
+              Recording paused. Navigate to your target site, then click "Resume Recording".
+            </p>
+          </div>
+        )}
+
         {/* Actions */}
         <div className="mb-6 p-4 bg-card rounded-lg border border-border">
           <h2 className="text-lg font-semibold mb-4 text-card-foreground">Actions</h2>
@@ -727,14 +810,30 @@ function App() {
             <button
               onClick={handleStartRecording}
               className="w-full px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
-              disabled={state === 'RECORDING' || state === 'CONNECTING'}
+              disabled={state === 'RECORDING' || state === 'CONNECTING' || isPaused}
             >
               Start Recording
             </button>
+            {isRecording && !isPaused && (
+              <button
+                onClick={handleAddTab}
+                className="w-full px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Add Tab
+              </button>
+            )}
+            {isPaused && (
+              <button
+                onClick={handleResumeRecording}
+                className="w-full px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Resume Recording
+              </button>
+            )}
             <button
               onClick={handleStopRecording}
               className="w-full px-4 py-2 bg-secondary text-secondary-foreground rounded-md hover:bg-secondary/90 disabled:opacity-50 disabled:cursor-not-allowed"
-              disabled={state !== 'RECORDING'}
+              disabled={state !== 'RECORDING' && !isPaused}
             >
               Stop Recording
             </button>
@@ -773,9 +872,9 @@ function App() {
                 const stepId = step.payload.timestamp.toString();
                 const isPending = pendingAIValidations.has(stepId);
                 const isEnhanced = enhancedSteps.has(stepId);
-                const aiFallbackCount = step.payload.fallbackSelectors?.filter((s: string) => 
+                const aiFallbackCount = isWorkflowStepPayload(step.payload) ? step.payload.fallbackSelectors?.filter((s: string) => 
                   !s.includes('nth-of-type') && !s.includes('ng-star-inserted')
-                ).length || 0;
+                ).length || 0 : 0;
                 
                 // Check if this step is a detected variable
                 const variableDef = currentWorkflowVariables?.variables.find(
@@ -805,7 +904,7 @@ function App() {
                               ✨ {variableDef.variableName}
                             </span>
                           )}
-                          {!isVariable && step.type === 'INPUT' && step.payload.value && !currentWorkflowVariables && (
+                          {!isVariable && step.type === 'INPUT' && isWorkflowStepPayload(step.payload) && step.payload.value && !currentWorkflowVariables && (
                             <span 
                               className="px-1.5 py-0.5 text-xs bg-gray-100 text-gray-500 rounded"
                               title="May be detected as a variable when workflow is saved"
@@ -840,10 +939,10 @@ function App() {
                         )}
                       </div>
                     </div>
-                    {step.payload.label && (
+                    {isWorkflowStepPayload(step.payload) && step.payload.label && (
                       <div className="text-muted-foreground">Label: {step.payload.label}</div>
                     )}
-                    {step.payload.value && (
+                    {isWorkflowStepPayload(step.payload) && step.payload.value && (
                       <div className="text-muted-foreground">
                         Value: {step.payload.value}
                         {isVariable && variableDef && (
@@ -853,9 +952,11 @@ function App() {
                         )}
                       </div>
                     )}
-                    <div className="text-muted-foreground text-xs mt-1">
-                      Selector: {step.payload.selector}
-                    </div>
+                    {isWorkflowStepPayload(step.payload) && (
+                      <div className="text-muted-foreground text-xs mt-1">
+                        Selector: {step.payload.selector}
+                      </div>
+                    )}
                     {isVariable && variableDef && (
                       <div className="text-purple-600 text-xs mt-1 flex items-center gap-1">
                         <svg className="h-3 w-3" fill="currentColor" viewBox="0 0 20 20">

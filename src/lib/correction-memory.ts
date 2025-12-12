@@ -5,6 +5,7 @@
 
 import type { CorrectionEntry, LearnedPattern, PageType } from '../types/visual';
 import type { WorkflowStep } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 import { VisualSnapshotService } from '../content/visual-snapshot';
 import { aiConfig } from './ai-config';
 
@@ -42,6 +43,11 @@ export class CorrectionMemory {
       }
 
       // Create correction entry
+      if (!isWorkflowStepPayload(context.step.payload)) {
+        console.warn('CorrectionMemory: Cannot save correction for TAB_SWITCH step');
+        return;
+      }
+      
       const entry: CorrectionEntry = {
         id: `correction_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
         timestamp: Date.now(),
@@ -120,7 +126,7 @@ export class CorrectionMemory {
     step: WorkflowStep,
     pattern: LearnedPattern
   ): string | null {
-    if (!pattern.rule) return null;
+    if (!pattern.rule || !isWorkflowStepPayload(step.payload)) return null;
 
     // Selector transform
     if (pattern.rule.selectorTransform) {
@@ -262,6 +268,10 @@ export class CorrectionMemory {
     step: WorkflowStep,
     entry: CorrectionEntry
   ): number {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return 0; // TAB_SWITCH steps don't match corrections
+    }
+    
     let score = 0;
     let factors = 0;
 
@@ -347,6 +357,16 @@ export class CorrectionMemory {
    * Infer pattern from correction
    */
   private static inferPattern(context: CorrectionContext): LearnedPattern {
+    if (!isWorkflowStepPayload(context.step.payload)) {
+      // TAB_SWITCH steps don't have patterns
+      return {
+        patternType: 'selector_transform',
+        conditions: {},
+        rule: {},
+        confidence: 0,
+      };
+    }
+    
     const pattern: LearnedPattern = {
       patternType: 'selector_transform',
       conditions: {

@@ -78,16 +78,33 @@ serve(async (req) => {
     );
 
     const cacheKey = generateCacheKey(payload);
-    const cached = await checkCache(supabase, cacheKey);
     
-    if (cached) {
-      console.log('Cache hit for:', cacheKey);
-      return new Response(JSON.stringify(cached), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        },
-      });
+    // CRITICAL: For widget clicks with visual snapshots but NO decisionSpace (not menu items),
+    // skip cache to ensure each widget gets a fresh description based on its visual snapshot
+    // Widget clicks with the same selector pattern but different visual snapshots should NOT share cache
+    const hasVisualSnapshot = !!payload.step.payload.visualSnapshot?.elementSnippet;
+    const hasDecisionSpace = !!payload.step.payload.context?.decisionSpace;
+    const isWidgetClick = payload.step.payload.selector?.includes('gs-report-widget-element') || 
+                          payload.step.payload.selector?.includes('widget-element');
+    
+    // Skip cache for widget clicks that have visual snapshots but no decisionSpace
+    // These are widget clicks (not menu items) and should be analyzed fresh based on the visual snapshot
+    // to identify the specific widget title
+    if (hasVisualSnapshot && isWidgetClick && !hasDecisionSpace) {
+      console.log('Skipping cache for widget click with visual snapshot (will analyze fresh to identify specific widget)');
+      // Don't check cache - go straight to AI analysis
+    } else {
+      // For menu items (with decisionSpace) or non-widget clicks, use cache normally
+      const cached = await checkCache(supabase, cacheKey);
+      if (cached) {
+        console.log('Cache hit for:', cacheKey);
+        return new Response(JSON.stringify(cached), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
     }
 
     // Log what we're receiving
@@ -179,6 +196,11 @@ serve(async (req) => {
  * Include visual snapshot hash to differentiate similar steps
  */
 function generateCacheKey(payload: StepDescriptionPayload): string {
+  // For widget clicks, use more of the visual snapshot to differentiate between different widgets
+  // Use first 500 chars (instead of 200) to better differentiate widgets with similar selectors
+  const snapshotHash = payload.step.payload.visualSnapshot?.elementSnippet?.substring(0, 500) ||
+                      payload.step.payload.visualSnapshot?.viewport?.substring(0, 500);
+  
   const keyData = {
     type: 'step_description',
     stepType: payload.step.type,
@@ -191,9 +213,13 @@ function generateCacheKey(payload: StepDescriptionPayload): string {
     selectedIndex: payload.step.payload.context?.decisionSpace?.selectedIndex,
     // Include container context to differentiate same element in different widgets
     containerText: payload.step.payload.context?.container?.text,
-    // Include snapshot hash (first 200 chars) to differentiate visually different elements
-    // Increased from 100 to 200 for better differentiation of dropdown items
-    snapshotHash: payload.step.payload.visualSnapshot?.elementSnippet?.substring(0, 200),
+    // Include snapshot hash (first 500 chars) to differentiate visually different elements
+    // Increased from 200 to 500 for better differentiation of widgets with similar selectors
+    snapshotHash: snapshotHash,
+    // Include element bounds to differentiate widgets at different positions
+    elementBounds: payload.step.payload.elementBounds ? 
+      `${payload.step.payload.elementBounds.x},${payload.step.payload.elementBounds.y},${payload.step.payload.elementBounds.width},${payload.step.payload.elementBounds.height}` : 
+      undefined,
   };
   
   const str = JSON.stringify(keyData);
@@ -269,19 +295,27 @@ function buildPrompt(payload: StepDescriptionPayload): string {
     `2. Read any visible text, labels, or icons directly from the image\n` +
     `3. Understand the visual context (is it in a menu? toolbar? form? table?)\n` +
     `4. Determine the specific action being performed\n` +
-    `5. Note visual style (color, size, position) to distinguish from similar elements\n\n` +
+    `5. Note visual style (color, size, position) to distinguish from similar elements\n` +
+    `6. 🎯 IDENTIFY THE SPECIFIC WIDGET/DASHBOARD: Look for widget titles, card headers, or report names visible in the image\n` +
+    `   - If you see a widget title like "OFFERS EXPIRING IN NEXT 28 DAYS" or "EXPIRED OR REVOKED OFFERS", use that specific title\n` +
+    `   - If you see a dashboard section like "Demand Gen", use that but also try to identify the specific widget if visible\n` +
+    `   - The visual snapshot shows the actual widget context - use it to identify which specific widget was clicked\n\n` +
     `⚠️ DO NOT rely solely on text context if the visual snapshot shows something different.\n` +
     `⚠️ DO NOT use generic descriptions like "click on widget" or "click on element".\n` +
+    `⚠️ DO NOT use section headers (like "Demand Gen") if you can see a specific widget title in the image.\n` +
     `✅ DO use the visual snapshot to create SPECIFIC, ACTIONABLE descriptions.\n` +
-    `✅ DO describe what you actually SEE in the image, not what the text context suggests.\n\n` :
+    `✅ DO describe what you actually SEE in the image, not what the text context suggests.\n` +
+    `✅ DO identify the specific widget title from the screenshot if visible (e.g., "OFFERS EXPIRING IN NEXT 28 DAYS").\n\n` :
     `⚠️ WARNING: No visual snapshot available. Descriptions may be less accurate.\n` +
     `Use the text context information below, but be aware descriptions may be generic.\n\n`;
   
   // LOCATION CONTEXT: Always include widget/dashboard context (works WITH visual snapshot)
   if (step.payload.context?.container?.text) {
-    prompt += `\n📍 LOCATION CONTEXT (ALWAYS USE THIS): The action is within "${step.payload.context.container.text}" (${step.payload.context.container.type || 'container'})\n`;
-    prompt += `This is the widget/dashboard context. ALWAYS include this in your description to provide location-aware context.\n`;
-    prompt += `Example: If clicking a button, say "Click [button name] in ${step.payload.context.container.text}" instead of just "Click [button name]"\n\n`;
+    prompt += `\n📍 LOCATION CONTEXT: The text context suggests the action is within "${step.payload.context.container.text}" (${step.payload.context.container.type || 'container'})\n`;
+    prompt += `⚠️ IMPORTANT: If the visual snapshot shows a DIFFERENT or MORE SPECIFIC widget title, use the one from the visual snapshot instead.\n`;
+    prompt += `For example, if text context says "Demand Gen" but the image shows "OFFERS EXPIRING IN NEXT 28 DAYS", use "OFFERS EXPIRING IN NEXT 28 DAYS".\n`;
+    prompt += `The visual snapshot is the PRIMARY source - it shows what the user actually sees and clicks on.\n`;
+    prompt += `Example: If clicking a button in a widget, say "Click [button name] in [widget title from image]" instead of just "Click [button name]"\n\n`;
   }
   
   prompt += `Step Type: ${step.type}\n\n`;
@@ -346,16 +380,63 @@ function buildPrompt(payload: StepDescriptionPayload): string {
       prompt += `The current step is clicking the ITEM "${ds.selectedText}" WITHIN the dropdown.\n`;
       prompt += `\nREPEAT: Use "${ds.selectedText}" in your description. This is not optional.\n\n`;
     } else {
-      // Include container context in descriptions when available
+      // NO decisionSpace - this is NOT a menu item click
+      // This could be clicking on a widget element, button, icon, etc.
+      
+      // Check if this is a widget element click
+      const isWidgetElement = step.payload.selector?.includes('gs-report-widget-element') || 
+                              step.payload.selector?.includes('widget-element');
+      
+      // Detect problematic scenario: widget clicks with generic container text
+      // This happens when multiple widgets share the same selector pattern and container text
+      // In this case, we need to rely MORE on the visual snapshot to identify the specific widget
       const containerText = step.payload.context?.container?.text;
-      if (containerText) {
-        prompt += `- IMPORTANT: Include the widget/dashboard context "${containerText}" in your description when relevant.\n`;
-        prompt += `  Examples: "Click three dots in ${containerText}", "Click download button in ${containerText}"\n`;
+      const hasGenericContainer = containerText && (
+        containerText.length < 20 || // Short generic names like "Demand Gen"
+        !/[A-Z]{3,}/.test(containerText) || // No all-caps widget titles
+        containerText.toLowerCase().includes('section') ||
+        containerText.toLowerCase().includes('dashboard') ||
+        containerText.toLowerCase().includes('gen') // Generic section names
+      );
+      
+      const needsSnapshotPriority = isWidgetElement && hasGenericContainer && hasVisualSnapshot;
+      
+      if (needsSnapshotPriority) {
+        // PROBLEMATIC SCENARIO DETECTED: Widget clicks with generic container text
+        // Multiple widgets likely share the same selector pattern
+        // MUST rely on visual snapshot to identify the specific widget
+        prompt += `\n🎯🎯🎯 CRITICAL: WIDGET IDENTIFICATION ISSUE DETECTED 🎯🎯🎯\n\n`;
+        prompt += `⚠️ PROBLEM: Multiple widgets share the same selector pattern and generic container text ("${containerText}").\n`;
+        prompt += `⚠️ SOLUTION: You MUST rely on the VISUAL SNAPSHOT to identify the SPECIFIC widget that was clicked.\n\n`;
+        prompt += `MANDATORY INSTRUCTIONS:\n`;
+        prompt += `1. Look at the visual snapshot for the SPECIFIC WIDGET TITLE (e.g., "OFFERS EXPIRING IN NEXT 28 DAYS", "EXPIRED OR REVOKED OFFERS")\n`;
+        prompt += `2. The container text "${containerText}" is TOO GENERIC - ignore it and use the widget title from the image instead\n`;
+        prompt += `3. If you see a specific widget title in the image, use it in your description\n`;
+        prompt += `4. If you see a button/icon being clicked, describe that button/icon WITH the widget title from the image\n`;
+        prompt += `5. DO NOT say "Download Data" or "from menu" unless you ACTUALLY see a menu or download button in the image\n`;
+        prompt += `6. DO NOT use generic container text "${containerText}" - use the specific widget title from the visual snapshot\n`;
+        prompt += `7. If clicking on the widget itself (not a button), say "Click on [widget title from image]" or "Click widget: [widget title from image]"\n`;
+        prompt += `8. If clicking a button in the widget, say "Click [button name] in [widget title from image]"\n\n`;
+        prompt += `✅ CORRECT examples (based on what you see in the image):\n`;
+        prompt += `   - "Click on OFFERS EXPIRING IN NEXT 28 DAYS" (if clicking the widget itself)\n`;
+        prompt += `   - "Click three dots in OFFERS EXPIRING IN NEXT 28 DAYS" (if clicking a three-dot button)\n`;
+        prompt += `   - "Click widget: EXPIRED OR REVOKED OFFERS" (if clicking the widget)\n\n`;
+        prompt += `❌ WRONG examples (DO NOT USE):\n`;
+        prompt += `   - "Click 'Download Data' from menu" ← Only use if you ACTUALLY see a menu with "Download Data" in the image\n`;
+        prompt += `   - "Click on widget" ← Too generic, use the specific widget title from the image\n`;
+        prompt += `   - "Click in ${containerText}" ← Too generic, use the specific widget title from the image instead\n`;
+        prompt += `   - Any description that uses "${containerText}" without a specific widget title ← Use widget title from image\n\n`;
+      } else {
+        // Normal case - include standard instructions
+        if (containerText) {
+          prompt += `- IMPORTANT: Include the widget/dashboard context "${containerText}" in your description when relevant.\n`;
+          prompt += `  Examples: "Click three dots in ${containerText}", "Click download button in ${containerText}"\n`;
+        }
+        prompt += `- For three-dot menus: "Click the three-dot menu button" or "Open the options menu"\n`;
+        prompt += `- For dropdown items: "Click '[item name]' from the [menu name]" (e.g., "Click 'Download' from the export menu")\n`;
+        prompt += `- For icons: "Click the [icon name] icon" (e.g., "Click the download icon", "Click the settings icon")\n`;
+        prompt += `- For buttons: "Click the [button name] button" (e.g., "Click the download button")\n`;
       }
-      prompt += `- For three-dot menus: "Click the three-dot menu button" or "Open the options menu"\n`;
-      prompt += `- For dropdown items: "Click '[item name]' from the [menu name]" (e.g., "Click 'Download' from the export menu")\n`;
-      prompt += `- For icons: "Click the [icon name] icon" (e.g., "Click the download icon", "Click the settings icon")\n`;
-      prompt += `- For buttons: "Click the [button name] button" (e.g., "Click the download button")\n`;
     }
     
     prompt += `- AVOID generic descriptions like "click on widget" or "click on element" or just "CLICK"\n`;

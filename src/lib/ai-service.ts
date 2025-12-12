@@ -5,6 +5,7 @@
  */
 
 import type { WorkflowStep } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 import type { AIAnalysisPayload } from '../types/ai';
 import type { FailureSnapshot } from './dom-distiller';
 import type { PageType } from '../types/visual';
@@ -68,6 +69,11 @@ export class AIService {
         ...aiPayload,
         failureSnapshot: scrubbedSnapshot,
       };
+      
+      // Skip TAB_SWITCH steps - they don't need AI recovery
+      if (!isWorkflowStepPayload(step.payload)) {
+        throw new Error('AI recovery not applicable for TAB_SWITCH steps');
+      }
       
       // Phase 4: Add page type context for better AI understanding
       if (step.payload.pageType) {
@@ -383,10 +389,23 @@ export class AIService {
       };
     }
 
+    // Skip TAB_SWITCH steps - they don't need AI description generation
+    if (!isWorkflowStepPayload(step.payload)) {
+      return {
+        description: `Switch to tab`,
+        confidence: 1,
+      };
+    }
+
     try {
       // Generate cache key (include visual snapshot hash to differentiate similar steps)
       // CRITICAL: Include decisionSpace selectedText and selectedIndex to differentiate dropdown items
       // Also include elementText to differentiate similar elements
+      // IMPORTANT: For widget clicks, use more of the visual snapshot to differentiate between different widgets
+      // Use first 500 chars of snapshot (instead of 200) to better differentiate widgets with similar selectors
+      const snapshotHash = step.payload.visualSnapshot?.elementSnippet?.substring(0, 500) || 
+                          step.payload.visualSnapshot?.viewport?.substring(0, 500);
+      
       const cacheKey = AICache.generateKey({
         type: 'step_description',
         stepType: step.type,
@@ -398,14 +417,35 @@ export class AIService {
         selectedText: step.payload.context?.decisionSpace?.selectedText,
         selectedIndex: step.payload.context?.decisionSpace?.selectedIndex,
         containerText: step.payload.context?.container?.text, // Include container context in cache key
-        snapshotHash: step.payload.visualSnapshot?.elementSnippet?.substring(0, 200), // Increased from 100 to 200 for better differentiation
+        snapshotHash: snapshotHash, // Use 500 chars for better widget differentiation
+        // Include element bounds to differentiate widgets at different positions
+        elementBounds: step.payload.elementBounds ? 
+          `${step.payload.elementBounds.x},${step.payload.elementBounds.y},${step.payload.elementBounds.width},${step.payload.elementBounds.height}` : 
+          undefined,
       });
 
       // Check local cache first
-      const cachedResult = await AICache.getFromLocal(cacheKey);
-      if (cachedResult) {
-        console.log('GhostWriter: Using cached step description');
-        return cachedResult as StepDescriptionResult;
+      // CRITICAL: For widget clicks with visual snapshots but NO decisionSpace (not menu items),
+      // skip cache to ensure each widget gets a fresh description based on its visual snapshot
+      // Widget clicks with the same selector pattern but different visual snapshots should NOT share cache
+      const hasVisualSnapshot = !!step.payload.visualSnapshot?.elementSnippet;
+      const hasDecisionSpace = !!step.payload.context?.decisionSpace;
+      const isWidgetClick = step.payload.selector?.includes('gs-report-widget-element') || 
+                           step.payload.selector?.includes('widget-element');
+      
+      // Skip cache for widget clicks that have visual snapshots but no decisionSpace
+      // These are widget clicks (not menu items) and should be analyzed fresh based on the visual snapshot
+      // to identify the specific widget title
+      if (hasVisualSnapshot && isWidgetClick && !hasDecisionSpace) {
+        console.log('GhostWriter: Skipping cache for widget click with visual snapshot (will analyze fresh to identify specific widget)');
+        // Don't check cache - go straight to AI analysis
+      } else {
+        // For menu items (with decisionSpace) or non-widget clicks, use cache normally
+        const cachedResult = await AICache.getFromLocal(cacheKey);
+        if (cachedResult) {
+          console.log('GhostWriter: Using cached step description');
+          return cachedResult as StepDescriptionResult;
+        }
       }
 
       // Call Supabase Edge Function
@@ -440,6 +480,10 @@ export class AIService {
     const functionName = 'generate_step_description';
     const timeout = config.timeout || 10000;
     const url = `${config.supabaseUrl}/functions/v1/${functionName}`;
+    
+    if (!isWorkflowStepPayload(step.payload)) {
+      throw new Error('Description generation not applicable for TAB_SWITCH steps');
+    }
     
     console.log(`🤖 GhostWriter: Generating description for ${step.type} step...`);
     console.log(`🤖 GhostWriter: Has visual snapshot:`, !!step.payload.visualSnapshot?.elementSnippet);
@@ -509,6 +553,10 @@ export class AIService {
    * Returns concise, relevant descriptions (max 50 chars)
    */
   private static generateFallbackDescription(step: WorkflowStep): string {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return `Switch to tab`;
+    }
+    
     switch (step.type) {
       case 'CLICK':
         // Priority 1: Use button context if available (most specific)

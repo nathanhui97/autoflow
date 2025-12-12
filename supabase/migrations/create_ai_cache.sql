@@ -35,3 +35,4 @@ $$;
 -- SELECT cron.schedule('cleanup-ai-cache', '0 * * * *', 'SELECT cleanup_expired_ai_cache()');
 
 
+

@@ -5,6 +5,7 @@
  */
 
 import type { WorkflowStep, ElementBounds } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 import { SelectorEngine } from '../content/selector-engine';
 import { ElementStateCapture } from '../content/element-state';
 
@@ -33,6 +34,15 @@ export class DOMDistiller {
     step: WorkflowStep,
     currentDOM: Document
   ): FailureSnapshot {
+    if (!isWorkflowStepPayload(step.payload)) {
+      // TAB_SWITCH steps don't need failure snapshots
+      return {
+        targetDescription: 'tab switch',
+        candidates: [],
+        context: '',
+      };
+    }
+    
     // 1. Extract target description
     const targetDescription = step.payload.elementText || 
                              step.payload.label || 
@@ -61,6 +71,10 @@ export class DOMDistiller {
     doc: Document,
     maxCandidates: number = 10
   ): CandidateElement[] {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return [];
+    }
+    
     const stepType = step.type;
     const targetText = step.payload.elementText || step.payload.label;
     
@@ -114,7 +128,7 @@ export class DOMDistiller {
       
       // Role match
       const role = candidate.getAttribute('role');
-      if (step.payload.elementRole && role === step.payload.elementRole) {
+      if (isWorkflowStepPayload(step.payload) && step.payload.elementRole && role === step.payload.elementRole) {
         score += 5;
       }
       
@@ -135,7 +149,7 @@ export class DOMDistiller {
     // Return top N as structured data
     return scoredCandidates.slice(0, maxCandidates).map(({ element }) => {
       const rect = element.getBoundingClientRect();
-      const bounds = step.payload.elementBounds;
+      const bounds = isWorkflowStepPayload(step.payload) ? step.payload.elementBounds : undefined;
       let distance: number | undefined;
       
       if (bounds) {
@@ -195,6 +209,9 @@ export class DOMDistiller {
     step: WorkflowStep,
     doc: Document
   ): string {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return '';
+    }
     // Find parent form/container from step context
     const containerSelector = step.payload.context?.container?.selector;
     if (containerSelector) {

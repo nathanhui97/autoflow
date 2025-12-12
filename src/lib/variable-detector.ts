@@ -12,6 +12,7 @@
 
 import { aiConfig } from './ai-config';
 import type { WorkflowStep, WorkflowStepPayload } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 
 /**
  * Definition of a detected variable in a workflow
@@ -206,6 +207,11 @@ export class VariableDetector {
       const step = steps[i];
       const payload = step.payload;
 
+      // Skip TAB_SWITCH steps - they don't have variable values
+      if (step.type === 'TAB_SWITCH' || !isWorkflowStepPayload(payload)) {
+        continue;
+      }
+
       // Always include INPUT steps (primary variable source)
       // INPUT steps are important even without snapshots - the value is what matters
       if (step.type === 'INPUT') {
@@ -265,12 +271,16 @@ export class VariableDetector {
                                    selectorLower.includes("[role='option']");
           
           // Also check if this is the step immediately after a dropdown trigger
-          const isAfterDropdownTrigger = i > 0 && 
-                                         steps[i - 1]?.type === 'CLICK' &&
-                                         (steps[i - 1].payload.label?.toLowerCase().includes('select') ||
-                                          steps[i - 1].payload.label?.toLowerCase().includes('choose') ||
-                                          steps[i - 1].payload.elementText?.toLowerCase().includes('select') ||
-                                          steps[i - 1].payload.selector?.toLowerCase().includes('promotion type'));
+          let isAfterDropdownTrigger = false;
+          if (i > 0 && steps[i - 1]?.type === 'CLICK') {
+            const prevStep = steps[i - 1];
+            if (isWorkflowStepPayload(prevStep.payload)) {
+              isAfterDropdownTrigger = (prevStep.payload.label?.toLowerCase().includes('select') ||
+                                        prevStep.payload.label?.toLowerCase().includes('choose') ||
+                                        prevStep.payload.elementText?.toLowerCase().includes('select') ||
+                                        prevStep.payload.selector?.toLowerCase().includes('promotion type')) || false;
+            }
+          }
           
           const shouldInclude = hasSnapshot || hasDecisionSpace || isLikelyDropdown || isAfterDropdownTrigger;
           
@@ -371,12 +381,19 @@ export class VariableDetector {
   ): StepForAnalysis {
     const payload = step.payload;
 
+    // Only process WorkflowStepPayload, not TabSwitchPayload
+    if (!isWorkflowStepPayload(payload)) {
+      throw new Error('createStepForAnalysis called with TabSwitchPayload');
+    }
+
     // Get "before" snapshot from previous step if available
     let beforeSnapshot: string | undefined;
     if (stepIndex > 0) {
       const prevStep = allSteps[stepIndex - 1];
-      beforeSnapshot = prevStep.payload.visualSnapshot?.viewport || 
-                       prevStep.payload.visualSnapshot?.elementSnippet;
+      if (isWorkflowStepPayload(prevStep.payload)) {
+        beforeSnapshot = prevStep.payload.visualSnapshot?.viewport || 
+                         prevStep.payload.visualSnapshot?.elementSnippet;
+      }
     }
 
     // Get "after" snapshot from current step
@@ -388,10 +405,12 @@ export class VariableDetector {
     if (!afterSnapshot && (step.type === 'CLICK' || step.type === 'INPUT')) {
       if (stepIndex > 0) {
         const prevStep = allSteps[stepIndex - 1];
-        afterSnapshot = prevStep.payload.visualSnapshot?.viewport || 
-                       prevStep.payload.visualSnapshot?.elementSnippet;
-        if (afterSnapshot) {
-          console.log(`[VariableDetector] Using previous step's snapshot for ${step.type} step ${stepIndex}`);
+        if (isWorkflowStepPayload(prevStep.payload)) {
+          afterSnapshot = prevStep.payload.visualSnapshot?.viewport || 
+                         prevStep.payload.visualSnapshot?.elementSnippet;
+          if (afterSnapshot) {
+            console.log(`[VariableDetector] Using previous step's snapshot for ${step.type} step ${stepIndex}`);
+          }
         }
       }
     }
@@ -515,17 +534,22 @@ export class VariableDetector {
       const originalStep = steps[variable.stepIndex];
       const payload = originalStep?.payload;
 
+      // Only process WorkflowStepPayload
+      if (!isWorkflowStepPayload(payload)) {
+        continue;
+      }
+
       // Determine the field identifier key
       let fieldKey: string;
 
       // For spreadsheets, use cellReference as the key (most reliable)
-      const cellReference = payload?.context?.gridCoordinates?.cellReference;
+      const cellReference = payload.context?.gridCoordinates?.cellReference;
       if (cellReference) {
         fieldKey = `cell:${cellReference}`;
       } else if (variable.fieldLabel && /^[A-Z]+\d+$/.test(variable.fieldLabel)) {
         // If fieldLabel is a cell reference (like "B15"), use it
         fieldKey = `cell:${variable.fieldLabel}`;
-      } else if (payload?.selector) {
+      } else if (payload.selector) {
         // For regular fields, use selector (normalized)
         // Normalize selector by removing dynamic parts (like indices, timestamps)
         const normalizedSelector = this.normalizeSelector(payload.selector);
@@ -736,7 +760,7 @@ export class VariableDetector {
 
     // Build page context from first step
     const firstStep = allSteps[0];
-    const pageContext = firstStep ? {
+    const pageContext = firstStep && isWorkflowStepPayload(firstStep.payload) ? {
       url: firstStep.payload.url,
       title: document.title || '',
       pageType: firstStep.payload.pageType?.type,
