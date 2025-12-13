@@ -127,6 +127,25 @@ export interface TabSwitchPayload {
   timestamp: number;
 }
 
+export interface AIEvidence {
+  /** Simplified/distilled DOM structure for AI context understanding */
+  contextSnapshot?: string;
+  
+  /** Metadata about clipboard operations (copy/paste) */
+  clipboardMetadata?: {
+    sourceSelector?: string; // Where the data was copied from
+    copiedValue?: string; // The value that was copied
+    timestamp: number; // When the copy occurred
+  };
+  
+  /** Semantic anchors for element identification */
+  semanticAnchors?: {
+    textLabel?: string; // Human-readable label
+    nearbyText?: string[]; // Array of nearby text content
+    ariaLabel?: string; // ARIA label if present
+  };
+}
+
 export interface WorkflowStepPayload {
   selector: string; // The best stable selector
   fallbackSelectors: string[]; // List of backup selectors
@@ -246,6 +265,8 @@ export interface WorkflowStepPayload {
     uniquenessScore: number; // 0-1 score of how unique this element is
     disambiguation: string[]; // Attributes/text that make it unique
   };
+  // Phase 6: AI Evidence capture
+  aiEvidence?: AIEvidence; // AI context for better understanding and replay
 }
 
 export interface Pattern {

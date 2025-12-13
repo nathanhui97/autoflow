@@ -31,6 +31,7 @@ export class RecordingManager {
   private focusHandler: ((event: FocusEvent) => void) | null = null;
   private mousedownHandler: ((event: MouseEvent) => void) | null = null;
   private scrollHandler: ((event: Event) => void) | null = null;
+  private copyHandler: ((event: ClipboardEvent) => void) | null = null;
   private scrollDebounceTimer: number | null = null;
   private lastScrollStep: { scrollX: number; scrollY: number; timestamp: number } | null = null;
   private currentUrl: string = window.location.href;
@@ -191,6 +192,10 @@ export class RecordingManager {
     this.scrollHandler = this.handleScroll.bind(this);
     window.addEventListener('scroll', this.scrollHandler, true); // Capture phase for all scroll events
 
+    // Setup copy handler to track clipboard operations (Phase 6: Data lineage)
+    this.copyHandler = this.handleCopy.bind(this);
+    document.addEventListener('copy', this.copyHandler, false);
+
     console.log('Recording started');
   }
 
@@ -244,6 +249,11 @@ export class RecordingManager {
     if (this.scrollHandler) {
       window.removeEventListener('scroll', this.scrollHandler, true);
       this.scrollHandler = null;
+    }
+
+    if (this.copyHandler) {
+      document.removeEventListener('copy', this.copyHandler, false);
+      this.copyHandler = null;
     }
 
     // Clear any pending debounce timers
@@ -1199,6 +1209,12 @@ export class RecordingManager {
             console.log('📸 GhostWriter: No pending snapshot for click event');
           }
 
+          // Phase 6: Capture AI Evidence (context snapshot)
+          const contextSnapshot = DOMDistiller.captureInteractionContext(actualElement as HTMLElement);
+
+          // Capture semantic anchors (Phase 6)
+          const semanticAnchors = ElementContext.getSemanticAnchors(actualElement as HTMLElement);
+
           const stepPayload: WorkflowStep['payload'] = {
             selector: selectors.primary,
             fallbackSelectors: enhancedFallbacks.length > 0 ? enhancedFallbacks : [selectors.primary], // Ensure never empty
@@ -1247,6 +1263,13 @@ export class RecordingManager {
               disambiguation: Object.keys(disambiguationAttrs).map(
                 key => `${key}="${disambiguationAttrs[key]}"`
               ),
+            } : undefined,
+            // Phase 6: AI Evidence capture
+            aiEvidence: (contextSnapshot || semanticAnchors.textLabel || semanticAnchors.ariaLabel || semanticAnchors.nearbyText) ? {
+              contextSnapshot: contextSnapshot,
+              semanticAnchors: (semanticAnchors.textLabel || semanticAnchors.ariaLabel || semanticAnchors.nearbyText) 
+                ? semanticAnchors 
+                : undefined
             } : undefined,
           };
 
@@ -1602,6 +1625,12 @@ export class RecordingManager {
         console.warn('📸 GhostWriter: Failed to capture snapshot for keyboard event:', snapshotError);
       }
 
+      // Phase 6: Capture AI Evidence (context snapshot)
+      const contextSnapshot = DOMDistiller.captureInteractionContext(actualElement as HTMLElement);
+
+      // Capture semantic anchors (Phase 6)
+      const semanticAnchors = ElementContext.getSemanticAnchors(actualElement as HTMLElement);
+
       const stepPayload: WorkflowStep['payload'] = {
         selector: selectors.primary,
         fallbackSelectors: enhancedFallbacks.length > 0 ? enhancedFallbacks : [selectors.primary],
@@ -1619,6 +1648,13 @@ export class RecordingManager {
         visualSnapshot, // Visual snapshot for AI description generation
         // Phase 3: Minor enhancements
         pageState,
+        // Phase 6: AI Evidence capture
+        aiEvidence: (contextSnapshot || semanticAnchors.textLabel || semanticAnchors.ariaLabel || semanticAnchors.nearbyText) ? {
+          contextSnapshot: contextSnapshot,
+          semanticAnchors: (semanticAnchors.textLabel || semanticAnchors.ariaLabel || semanticAnchors.nearbyText) 
+            ? semanticAnchors 
+            : undefined
+        } : undefined,
       };
 
       // Determine wait conditions
@@ -1760,6 +1796,82 @@ export class RecordingManager {
         console.error('Error handling scroll event:', error);
       }
     }, this.SCROLL_DEBOUNCE_DELAY);
+  }
+
+  /**
+   * Handle copy events to track data lineage (Phase 6)
+   */
+  private handleCopy(_event: ClipboardEvent): void {
+    if (!this.isRecording) return;
+
+    try {
+      let selectedText: string | undefined;
+      let actualElement: Element | null = null;
+
+      // Better Text Extraction: Check if active element is input/textarea first
+      const activeElement = document.activeElement;
+      if (activeElement && 
+          (activeElement.tagName === 'INPUT' || activeElement.tagName === 'TEXTAREA')) {
+        const inputElement = activeElement as HTMLInputElement | HTMLTextAreaElement;
+        const selectionStart = inputElement.selectionStart || 0;
+        const selectionEnd = inputElement.selectionEnd || 0;
+        
+        if (selectionStart !== selectionEnd) {
+          selectedText = inputElement.value.substring(selectionStart, selectionEnd);
+          actualElement = activeElement as Element;
+        }
+      }
+
+      // Fallback to window.getSelection() if not from input/textarea
+      if (!selectedText || selectedText.trim().length === 0) {
+        const selection = window.getSelection();
+        selectedText = selection?.toString();
+        
+        if (!selectedText || selectedText.trim().length === 0) {
+          return; // Nothing selected
+        }
+
+        // Get the source element (where the copy happened)
+        if (!selection || selection.rangeCount === 0) {
+          return;
+        }
+
+        const range = selection.getRangeAt(0);
+        const sourceElement = range.commonAncestorContainer;
+        
+        // Get actual element (text nodes don't have methods we need)
+        actualElement = sourceElement.nodeType === Node.TEXT_NODE 
+          ? sourceElement.parentElement 
+          : sourceElement as Element;
+      }
+      
+      if (!actualElement) {
+        return;
+      }
+
+      // Generate selector for source element
+      const selectors = SelectorEngine.generateSelectors(actualElement);
+      
+      // Store to chrome.storage.local
+      const clipboardData = {
+        text: selectedText,
+        sourceSelector: selectors.primary,
+        timestamp: Date.now(),
+        url: window.location.href
+      };
+
+      console.log('📋 GhostWriter Copy Detected:', selectedText, 'from', selectors.primary);
+
+      chrome.storage.local.set({ ghostwriter_clipboard: clipboardData }, () => {
+        console.log('GhostWriter: Clipboard data stored:', {
+          textLength: selectedText.length,
+          sourceSelector: selectors.primary.substring(0, 50),
+          url: window.location.href
+        });
+      });
+    } catch (error) {
+      console.warn('GhostWriter: Failed to handle copy event:', error);
+    }
   }
 
   /**
@@ -2000,6 +2112,65 @@ export class RecordingManager {
         }
       }
 
+      // Phase 6: Capture AI Evidence (context snapshot)
+      const contextSnapshot = DOMDistiller.captureInteractionContext(element as HTMLElement);
+
+      // Capture semantic anchors (Phase 6)
+      const semanticAnchors = ElementContext.getSemanticAnchors(element as HTMLElement);
+
+      // Phase 6: Check for clipboard data transfer (data lineage)
+      let clipboardMetadata: { sourceSelector: string; copiedValue: string; timestamp: number } | undefined;
+      try {
+        const result = await chrome.storage.local.get('ghostwriter_clipboard');
+        const clipboardData = result.ghostwriter_clipboard as {
+          text: string;
+          sourceSelector: string;
+          timestamp: number;
+          url: string;
+        } | undefined;
+        
+        console.log('📋 Checking Clipboard Match:', { 
+          currentInput: value, 
+          clipboard: clipboardData ? {
+            text: clipboardData.text,
+            sourceSelector: clipboardData.sourceSelector,
+            timestamp: clipboardData.timestamp,
+            age: clipboardData ? Date.now() - clipboardData.timestamp : 'N/A'
+          } : null
+        });
+        
+        if (clipboardData && clipboardData.text) {
+          // Check if clipboard data is recent (less than 10 minutes old)
+          const tenMinutesInMs = 10 * 60 * 1000;
+          const age = Date.now() - clipboardData.timestamp;
+          
+          if (age < tenMinutesInMs) {
+            // Check if input value matches clipboard text
+            if (value === clipboardData.text) {
+              console.log('GhostWriter: Detected clipboard paste - input matches copied text');
+              clipboardMetadata = {
+                sourceSelector: clipboardData.sourceSelector,
+                copiedValue: clipboardData.text.length > 500 
+                  ? clipboardData.text.substring(0, 500) + '...' 
+                  : clipboardData.text, // Truncate large values
+                timestamp: clipboardData.timestamp
+              };
+            } else {
+              console.log('📋 Clipboard text does not match input value:', {
+                inputLength: value.length,
+                clipboardLength: clipboardData.text.length,
+                inputPreview: value.substring(0, 50),
+                clipboardPreview: clipboardData.text.substring(0, 50)
+              });
+            }
+          } else {
+            console.log('📋 Clipboard data too old:', { age: age, maxAge: tenMinutesInMs });
+          }
+        }
+      } catch (error) {
+        console.warn('GhostWriter: Failed to check clipboard data:', error);
+      }
+
       // Build step payload first (without wait conditions)
       const stepPayload: WorkflowStep['payload'] = {
         selector: selectors.primary,
@@ -2057,6 +2228,14 @@ export class RecordingManager {
           disambiguation: Object.keys(disambiguationAttrs).map(
             key => `${key}="${disambiguationAttrs[key]}"`
           ),
+        } : undefined,
+        // Phase 6: AI Evidence capture
+        aiEvidence: (contextSnapshot || clipboardMetadata || semanticAnchors.textLabel || semanticAnchors.ariaLabel || semanticAnchors.nearbyText) ? {
+          contextSnapshot: contextSnapshot,
+          clipboardMetadata: clipboardMetadata,
+          semanticAnchors: (semanticAnchors.textLabel || semanticAnchors.ariaLabel || semanticAnchors.nearbyText) 
+            ? semanticAnchors 
+            : undefined
         } : undefined,
       };
 

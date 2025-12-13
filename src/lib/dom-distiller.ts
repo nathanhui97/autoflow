@@ -297,6 +297,97 @@ export class DOMDistiller {
     
     return attrs;
   }
+
+  /**
+   * Capture a cleaned snapshot of the DOM around an element for AI context
+   * Returns simplified HTML with only essential attributes
+   */
+  static captureInteractionContext(targetElement: HTMLElement): string {
+    try {
+      // 1. Find closest semantic container
+      const container = this.findSemanticContainer(targetElement);
+      
+      // 2. Mark target element temporarily
+      const tempId = `ghostwriter-target-${Date.now()}`;
+      targetElement.setAttribute('data-ghostwriter-id', tempId);
+      
+      // 3. Clone the container
+      const clone = container.cloneNode(true) as HTMLElement;
+      
+      // 4. Clean up real element immediately
+      targetElement.removeAttribute('data-ghostwriter-id');
+      
+      // 5. Find and mark the target in clone
+      const targetInClone = clone.querySelector(`[data-ghostwriter-id="${tempId}"]`);
+      if (targetInClone) {
+        targetInClone.removeAttribute('data-ghostwriter-id');
+        targetInClone.setAttribute('data-ai-target', 'true');
+      }
+      
+      // 6. Distill the clone
+      this.distillClone(clone);
+      
+      // 7. Get HTML and truncate if needed
+      let html = clone.outerHTML;
+      if (html.length > 15000) {
+        html = html.substring(0, 15000);
+      }
+      
+      return html;
+    } catch (error) {
+      console.warn('GhostWriter: Failed to capture interaction context:', error);
+      return '';
+    }
+  }
+
+  /**
+   * Find the closest semantic parent container
+   */
+  private static findSemanticContainer(element: HTMLElement): HTMLElement {
+    const semanticTags = ['form', 'table', 'ul', 'ol', 'article', '[role="grid"]', '[role="dialog"]', '[role="main"]'];
+    
+    for (const tag of semanticTags) {
+      const container = element.closest(tag);
+      if (container instanceof HTMLElement) {
+        return container;
+      }
+    }
+    
+    // Fallback to body
+    return document.body;
+  }
+
+  /**
+   * Distill clone by removing unwanted tags and attributes
+   */
+  private static distillClone(clone: HTMLElement): void {
+    // Remove unwanted tags
+    const unwantedTags = ['script', 'style', 'svg', 'path', 'link', 'meta', 'noscript'];
+    for (const tag of unwantedTags) {
+      const elements = clone.querySelectorAll(tag);
+      elements.forEach(el => el.remove());
+    }
+    
+    // Strip attributes (keep only essential ones)
+    const keepAttributes = ['id', 'class', 'role', 'name', 'type', 'placeholder', 'value', 'data-testid', 'data-ai-target'];
+    const allElements = clone.querySelectorAll('*');
+    
+    allElements.forEach(el => {
+      const attributes = Array.from(el.attributes);
+      for (const attr of attributes) {
+        // Keep aria-* attributes
+        if (attr.name.startsWith('aria-')) {
+          continue;
+        }
+        // Keep whitelisted attributes
+        if (keepAttributes.includes(attr.name)) {
+          continue;
+        }
+        // Remove everything else
+        el.removeAttribute(attr.name);
+      }
+    });
+  }
 }
 
 

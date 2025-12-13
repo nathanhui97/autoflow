@@ -4,6 +4,7 @@
 
 import { SelectorEngine } from './selector-engine';
 import { ElementSimilarity } from './element-similarity';
+import { LabelFinder } from './label-finder';
 
 export interface ElementContextData {
   siblings: {
@@ -66,6 +67,104 @@ export class ElementContext {
       uniqueAttributes,
       formContext: this.captureFormContext(element),
     };
+  }
+
+  /**
+   * Get semantic anchors for element identification (Phase 6)
+   * Returns human-readable labels and nearby text for AI understanding
+   */
+  static getSemanticAnchors(element: HTMLElement): {
+    textLabel?: string;
+    nearbyText?: string[];
+    ariaLabel?: string;
+  } {
+    const anchors: {
+      textLabel?: string;
+      nearbyText?: string[];
+      ariaLabel?: string;
+    } = {};
+
+    // 1. Text Label - multiple strategies
+    let textLabel: string | undefined;
+
+    // For inputs, use LabelFinder
+    if (element.tagName === 'INPUT' || 
+        element.tagName === 'TEXTAREA' || 
+        element.tagName === 'SELECT') {
+      const label = LabelFinder.findLabel(element);
+      if (label) {
+        textLabel = label;
+      }
+    }
+
+    // For images/icons, check alt or title
+    if (!textLabel && (element.tagName === 'IMG' || element.tagName === 'SVG')) {
+      const alt = element.getAttribute('alt');
+      const title = element.getAttribute('title');
+      textLabel = alt || title || undefined;
+    }
+
+    // For other elements, use direct text content (first 100 chars)
+    if (!textLabel) {
+      const text = element.textContent?.trim();
+      if (text && text.length > 0) {
+        textLabel = text.length > 100 ? text.substring(0, 100) + '...' : text;
+      }
+    }
+
+    if (textLabel) {
+      anchors.textLabel = textLabel;
+    }
+
+    // 2. ARIA Label - check multiple aria attributes
+    const ariaLabel = element.getAttribute('aria-label');
+    const ariaLabelledBy = element.getAttribute('aria-labelledby');
+    const ariaDescription = element.getAttribute('aria-description');
+
+    // If aria-labelledby exists, resolve it to actual text
+    let resolvedAriaLabel: string | undefined;
+    if (ariaLabelledBy) {
+      try {
+        const labelElement = document.getElementById(ariaLabelledBy);
+        if (labelElement) {
+          resolvedAriaLabel = labelElement.textContent?.trim() || undefined;
+        }
+      } catch (e) {
+        // Invalid ID, skip
+      }
+    }
+
+    const finalAriaLabel = ariaLabel || resolvedAriaLabel || ariaDescription;
+    if (finalAriaLabel) {
+      anchors.ariaLabel = finalAriaLabel;
+    }
+
+    // 3. Nearby Text - immediate siblings only
+    const nearbyText: string[] = [];
+
+    // Check immediate previous sibling
+    const prevSibling = element.previousElementSibling;
+    if (prevSibling) {
+      const text = prevSibling.textContent?.trim();
+      if (text && text.length > 0 && text.length < 200) {
+        nearbyText.push(`[before] ${text}`);
+      }
+    }
+
+    // Check immediate next sibling
+    const nextSibling = element.nextElementSibling;
+    if (nextSibling) {
+      const text = nextSibling.textContent?.trim();
+      if (text && text.length > 0 && text.length < 200) {
+        nearbyText.push(`[after] ${text}`);
+      }
+    }
+
+    if (nearbyText.length > 0) {
+      anchors.nearbyText = nearbyText;
+    }
+
+    return anchors;
   }
 
   /**

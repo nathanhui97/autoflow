@@ -1,18 +1,29 @@
 /**
- * ExecutionEngine - Executes recorded workflow steps
+ * ExecutionEngine - Executes recorded workflow steps with Agentic behavior
  * Phase 3: Workflow execution with robust element finding
  * Phase 4: Enhanced with visual wait conditions and visual strategies
+ * Phase 6: Agentic execution with AI Evidence (semantic anchors, clipboard metadata)
  */
 
 import { ElementFinder } from './element-finder';
 import { ElementStateCapture } from './element-state';
 import { ExecutionTools } from './execution-tools';
+import { TextMatcher } from './text-matcher';
 import { VisualWait } from '../lib/visual-wait';
 import { visualFlowTracker } from '../lib/visual-flow';
 import { aiConfig } from '../lib/ai-config';
-import type { WorkflowStep, WorkflowIntent } from '../types/workflow';
+import type { WorkflowStep, WorkflowIntent, AIEvidence, WorkflowStepPayload } from '../types/workflow';
 import { isWorkflowStepPayload } from '../types/workflow';
 import type { WorkflowVariables } from '../lib/variable-detector';
+
+/**
+ * Result from semantic element search
+ */
+interface SemanticSearchResult {
+  element: Element;
+  score: number;
+  matchType: 'textLabel' | 'ariaLabel' | 'nearbyText' | 'combined';
+}
 
 export class ExecutionEngine {
   // Store variable values for the current execution
@@ -20,6 +31,495 @@ export class ExecutionEngine {
   private workflowVariables: WorkflowVariables | undefined;
   // Track current tab URL for multi-tab execution
   private currentTabUrl: string | null = null;
+
+  // ============================================
+  // AGENTIC METHODS - Finding, Resolving, Acting
+  // ============================================
+
+  /**
+   * STRATEGY 1 + 2: Find target element with CSS selectors + semantic fallback
+   * Uses aiEvidence.semanticAnchors for self-healing when CSS selectors fail
+   * 
+   * @param step - The workflow step containing element info
+   * @param doc - Document to search in (defaults to current document)
+   * @returns Found element or null
+   */
+  async findTargetElement(step: WorkflowStep, doc: Document = document): Promise<Element | null> {
+    // Skip TAB_SWITCH steps - they don't have elements
+    if (step.type === 'TAB_SWITCH' || !isWorkflowStepPayload(step.payload)) {
+      return null;
+    }
+
+    const payload = step.payload;
+
+    // STRATEGY 1: Use ElementFinder's comprehensive 12+ strategies
+    // This includes CSS selectors, fallback selectors, fuzzy text, container-based, etc.
+    const elementFromFinder = await ElementFinder.findElement(step, doc);
+    if (elementFromFinder) {
+      console.log('🎯 GhostWriter: Element found via ElementFinder strategies');
+      return elementFromFinder;
+    }
+
+    // STRATEGY 2: Semantic Fallback using aiEvidence.semanticAnchors
+    // Only try if CSS-based strategies failed AND we have semantic anchors
+    if (payload.aiEvidence?.semanticAnchors) {
+      console.log('🔍 GhostWriter: CSS strategies failed, trying semantic fallback...');
+      const semanticResult = await this.findBySemanticAnchors(
+        payload.aiEvidence.semanticAnchors,
+        step,
+        doc
+      );
+      
+      if (semanticResult) {
+        console.log(`✨ GhostWriter: Semantic fallback succeeded! Match type: ${semanticResult.matchType}, score: ${semanticResult.score.toFixed(2)}`);
+        return semanticResult.element;
+      }
+    }
+
+    // All strategies failed
+    return null;
+  }
+
+  /**
+   * Semantic fallback: Find element using aiEvidence.semanticAnchors
+   * Uses XPath and fuzzy text matching for resilient element finding
+   */
+  private async findBySemanticAnchors(
+    anchors: NonNullable<AIEvidence['semanticAnchors']>,
+    step: WorkflowStep,
+    doc: Document
+  ): Promise<SemanticSearchResult | null> {
+    const results: SemanticSearchResult[] = [];
+    const tagHints = this.getTagHintsForStep(step);
+
+    // Try textLabel first (highest confidence)
+    if (anchors.textLabel) {
+      const textResult = this.findBySemanticText(anchors.textLabel, tagHints, doc);
+      if (textResult) {
+        results.push({ ...textResult, matchType: 'textLabel' });
+      }
+    }
+
+    // Try ariaLabel second
+    if (anchors.ariaLabel) {
+      const ariaResult = this.findBySemanticAria(anchors.ariaLabel, tagHints, doc);
+      if (ariaResult) {
+        results.push({ ...ariaResult, matchType: 'ariaLabel' });
+      }
+    }
+
+    // Try nearbyText last (use for context verification)
+    if (anchors.nearbyText && anchors.nearbyText.length > 0 && results.length > 0) {
+      // Boost scores for elements that have matching nearby text
+      for (const result of results) {
+        const nearbyScore = this.scoreNearbyTextMatch(result.element, anchors.nearbyText);
+        result.score = result.score * 0.7 + nearbyScore * 0.3; // Weighted combination
+      }
+    }
+
+    // Return best result above threshold
+    if (results.length > 0) {
+      results.sort((a, b) => b.score - a.score);
+      const best = results[0];
+      if (best.score >= 0.6) {
+        return best;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * XPath search: Find elements containing textLabel
+   * Uses fuzzy matching for resilience to minor text changes
+   */
+  private findBySemanticText(
+    textLabel: string,
+    tagHints: string[],
+    doc: Document
+  ): { element: Element; score: number } | null {
+    let bestMatch: { element: Element; score: number } | null = null;
+    const normalizedLabel = TextMatcher.normalize(textLabel);
+
+    // Build tag selector for performance
+    const tagSelector = tagHints.length > 0 ? tagHints.join(', ') : '*';
+    const candidates = doc.querySelectorAll(tagSelector);
+
+    for (const candidate of Array.from(candidates)) {
+      // Skip hidden elements
+      if (!ElementStateCapture.isElementVisible(candidate)) continue;
+
+      // Get text from multiple sources
+      const candidateText = this.getElementTextContent(candidate);
+      if (!candidateText) continue;
+
+      // Calculate similarity score
+      const score = TextMatcher.similarityScore(normalizedLabel, candidateText);
+
+      // Track best match
+      if (score > 0.6 && (!bestMatch || score > bestMatch.score)) {
+        bestMatch = { element: candidate, score };
+      }
+    }
+
+    return bestMatch;
+  }
+
+  /**
+   * XPath search: Find elements with matching aria-label
+   * Supports both exact and fuzzy matching
+   */
+  private findBySemanticAria(
+    ariaLabel: string,
+    tagHints: string[],
+    doc: Document
+  ): { element: Element; score: number } | null {
+    const normalizedAria = TextMatcher.normalize(ariaLabel);
+
+    // Try exact match first using XPath
+    try {
+      const xpathResult = doc.evaluate(
+        `//*[@aria-label="${ariaLabel.replace(/"/g, '\\"')}"]`,
+        doc,
+        null,
+        XPathResult.FIRST_ORDERED_NODE_TYPE,
+        null
+      );
+      if (xpathResult.singleNodeValue) {
+        const element = xpathResult.singleNodeValue as Element;
+        if (ElementStateCapture.isElementVisible(element)) {
+          return { element, score: 1.0 };
+        }
+      }
+    } catch (e) {
+      // XPath failed, continue with fallback
+    }
+
+    // Fuzzy match as fallback
+    let bestMatch: { element: Element; score: number } | null = null;
+    const tagSelector = tagHints.length > 0 ? tagHints.join(', ') : '[aria-label]';
+    const candidates = doc.querySelectorAll(tagSelector);
+
+    for (const candidate of Array.from(candidates)) {
+      if (!ElementStateCapture.isElementVisible(candidate)) continue;
+
+      const candidateAria = candidate.getAttribute('aria-label');
+      if (!candidateAria) continue;
+
+      const score = TextMatcher.similarityScore(normalizedAria, candidateAria);
+      if (score > 0.7 && (!bestMatch || score > bestMatch.score)) {
+        bestMatch = { element: candidate, score };
+      }
+    }
+
+    return bestMatch;
+  }
+
+  /**
+   * Score how well an element's surrounding text matches the nearbyText array
+   */
+  private scoreNearbyTextMatch(element: Element, nearbyText: string[]): number {
+    if (nearbyText.length === 0) return 0;
+
+    // Get text from parent and siblings
+    const parent = element.parentElement;
+    if (!parent) return 0;
+
+    const parentText = TextMatcher.normalize(parent.textContent || '');
+    let matchCount = 0;
+
+    for (const nearby of nearbyText) {
+      const normalizedNearby = TextMatcher.normalize(nearby);
+      if (parentText.includes(normalizedNearby)) {
+        matchCount++;
+      }
+    }
+
+    return matchCount / nearbyText.length;
+  }
+
+  /**
+   * Get combined text content from element (text, aria-label, title, etc.)
+   */
+  private getElementTextContent(element: Element): string {
+    const textContent = element.textContent?.trim() || '';
+    const ariaLabel = element.getAttribute('aria-label') || '';
+    const title = element.getAttribute('title') || '';
+    const placeholder = element.getAttribute('placeholder') || '';
+
+    // Combine all text sources
+    const combined = [textContent, ariaLabel, title, placeholder]
+      .filter(t => t.length > 0)
+      .join(' ');
+
+    return TextMatcher.normalize(combined);
+  }
+
+  /**
+   * Get tag hints for element search based on step type
+   * Performance optimization: Only search relevant element types
+   */
+  private getTagHintsForStep(step: WorkflowStep): string[] {
+    switch (step.type) {
+      case 'CLICK':
+        return ['button', 'a', 'input[type="button"]', 'input[type="submit"]', '[role="button"]', '[role="link"]', '[role="menuitem"]', '[role="option"]', 'div[onclick]', 'span[onclick]'];
+      case 'INPUT':
+        return ['input', 'textarea', 'select', '[contenteditable="true"]'];
+      case 'KEYBOARD':
+        return ['input', 'textarea', 'select', 'button', 'a', '[tabindex]', '[contenteditable="true"]'];
+      default:
+        return [];
+    }
+  }
+
+  /**
+   * Resolve input value with context awareness
+   * Checks clipboardMetadata for data lineage and supports variable substitution
+   * 
+   * @param step - The workflow step
+   * @returns Resolved value to use for input
+   */
+  resolveInputValue(step: WorkflowStep): string {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return '';
+    }
+
+    const payload = step.payload;
+
+    // Check for clipboard metadata (data lineage tracking)
+    if (payload.aiEvidence?.clipboardMetadata) {
+      const clipboardMeta = payload.aiEvidence.clipboardMetadata;
+      console.log(`📋 GhostWriter: Context: Variable detected from source "${clipboardMeta.sourceSelector}"`);
+      console.log(`   Copied value: "${clipboardMeta.copiedValue}"`);
+      console.log(`   Timestamp: ${new Date(clipboardMeta.timestamp).toISOString()}`);
+      
+      // TODO: Future enhancement - dynamically fetch current value from sourceSelector
+      // For now, we use the recorded value or variable substitution
+    }
+
+    // Check for variable substitution
+    const variableValue = this.getVariableValueForStep(step);
+    if (variableValue !== undefined) {
+      console.log(`🔄 GhostWriter: Variable substitution: "${payload.value}" → "${variableValue}"`);
+      return variableValue;
+    }
+
+    // Default: return recorded value
+    return payload.value || '';
+  }
+
+  /**
+   * Perform action on element with reliable event dispatching
+   * Handles both click and input actions with framework-compatible events
+   * 
+   * @param element - Target element to interact with
+   * @param actionType - Type of action ('click' | 'input' | 'keyboard')
+   * @param step - The workflow step for context
+   * @param value - Optional value for input actions
+   */
+  async performAction(
+    element: Element,
+    actionType: 'click' | 'input' | 'keyboard',
+    step: WorkflowStep,
+    value?: string
+  ): Promise<void> {
+    // Scroll element into view
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    await this.delay(100);
+
+    switch (actionType) {
+      case 'click':
+        await this.dispatchClickEvents(element, step);
+        break;
+      case 'input':
+        await this.dispatchInputEvents(element, step, value || '');
+        break;
+      case 'keyboard':
+        await this.dispatchKeyboardEvents(element, step);
+        break;
+    }
+  }
+
+  /**
+   * Dispatch click events with proper sequence for React/Angular compatibility
+   */
+  private async dispatchClickEvents(element: Element, step: WorkflowStep): Promise<void> {
+    if (!isWorkflowStepPayload(step.payload)) {
+      throw new Error('GhostWriter: Invalid payload for click action');
+    }
+
+    const eventDetails = step.payload.eventDetails;
+    const mouseButton = eventDetails?.mouseButton || 'left';
+    const modifiers = eventDetails?.modifiers || {};
+
+    // Create event options
+    const eventOptions: MouseEventInit = {
+      bubbles: true,
+      cancelable: true,
+      button: mouseButton === 'left' ? 0 : mouseButton === 'right' ? 2 : 1,
+      ctrlKey: modifiers.ctrl || false,
+      shiftKey: modifiers.shift || false,
+      altKey: modifiers.alt || false,
+      metaKey: modifiers.meta || false,
+    };
+
+    // Get coordinates
+    const rect = element.getBoundingClientRect();
+    const x = eventDetails?.coordinates?.x || rect.left + rect.width / 2;
+    const y = eventDetails?.coordinates?.y || rect.top + rect.height / 2;
+
+    // Dispatch event sequence
+    const eventSequence = eventDetails?.eventSequence || ['mousedown', 'focus', 'mouseup', 'click'];
+    
+    for (const eventType of eventSequence) {
+      if (eventType === 'focus') {
+        (element as HTMLElement).focus();
+      } else if (eventType === 'mousedown' || eventType === 'mouseup' || eventType === 'click') {
+        const event = new MouseEvent(eventType, {
+          ...eventOptions,
+          clientX: x,
+          clientY: y,
+        });
+        element.dispatchEvent(event);
+      }
+      
+      // Small delay between events
+      await this.delay(10);
+    }
+  }
+
+  /**
+   * Dispatch input events with proper sequence for form and contenteditable elements
+   */
+  private async dispatchInputEvents(element: Element, step: WorkflowStep, value: string): Promise<void> {
+    if (!isWorkflowStepPayload(step.payload)) {
+      throw new Error('GhostWriter: Invalid payload for input action');
+    }
+
+    // Check if element is contenteditable
+    const isContentEditable = (element as HTMLElement).isContentEditable || 
+                              element.getAttribute('contenteditable') === 'true';
+    
+    const isStandardInput = element instanceof HTMLInputElement || 
+                            element instanceof HTMLTextAreaElement || 
+                            element instanceof HTMLSelectElement;
+
+    // Focus element
+    (element as HTMLElement).focus();
+    await this.delay(50);
+
+    if (isContentEditable) {
+      // For contenteditable elements (e.g., Google Sheets)
+      const htmlElement = element as HTMLElement;
+      
+      // Clear existing content
+      htmlElement.textContent = '';
+      htmlElement.innerText = '';
+      
+      // Set the value
+      htmlElement.textContent = value;
+      
+      // Dispatch InputEvent (crucial for modern editors)
+      const inputEvent = new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        inputType: 'insertText',
+        data: value
+      });
+      htmlElement.dispatchEvent(inputEvent);
+      
+      // Dispatch Enter key if recorded (for Google Sheets cell commit)
+      if (step.payload.keyboardDetails?.key === 'Enter') {
+        const enterEvent = new KeyboardEvent('keydown', {
+          key: 'Enter',
+          code: 'Enter',
+          bubbles: true,
+          cancelable: true
+        });
+        htmlElement.dispatchEvent(enterEvent);
+        
+        const enterUpEvent = new KeyboardEvent('keyup', {
+          key: 'Enter',
+          code: 'Enter',
+          bubbles: true,
+          cancelable: true
+        });
+        htmlElement.dispatchEvent(enterUpEvent);
+      }
+      
+      // Dispatch change event
+      htmlElement.dispatchEvent(new Event('change', { bubbles: true }));
+    } else if (isStandardInput) {
+      // For standard inputs, textareas, and selects
+      if (element instanceof HTMLSelectElement) {
+        element.value = value;
+      } else {
+        element.value = '';
+        element.value = value;
+      }
+
+      // Dispatch input and change events
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    // Blur if needed
+    if (step.payload.focusEvents?.needsBlur) {
+      (element as HTMLElement).blur();
+    }
+  }
+
+  /**
+   * Dispatch keyboard events
+   */
+  private async dispatchKeyboardEvents(element: Element, step: WorkflowStep): Promise<void> {
+    if (!isWorkflowStepPayload(step.payload)) {
+      throw new Error('GhostWriter: Invalid payload for keyboard action');
+    }
+
+    // Focus element
+    (element as HTMLElement).focus();
+    await this.delay(50);
+
+    const keyboardDetails = step.payload.keyboardDetails;
+    if (!keyboardDetails) {
+      throw new Error('GhostWriter: Keyboard step missing keyboardDetails');
+    }
+
+    const modifiers = keyboardDetails.modifiers || {};
+    const key = keyboardDetails.key;
+    const code = keyboardDetails.code;
+
+    // Dispatch keydown event
+    const keydownEvent = new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      key,
+      code,
+      ctrlKey: modifiers.ctrl || false,
+      shiftKey: modifiers.shift || false,
+      altKey: modifiers.alt || false,
+      metaKey: modifiers.meta || false,
+    });
+    element.dispatchEvent(keydownEvent);
+
+    // Dispatch keyup event
+    const keyupEvent = new KeyboardEvent('keyup', {
+      bubbles: true,
+      cancelable: true,
+      key,
+      code,
+      ctrlKey: modifiers.ctrl || false,
+      shiftKey: modifiers.shift || false,
+      altKey: modifiers.alt || false,
+      metaKey: modifiers.meta || false,
+    });
+    element.dispatchEvent(keyupEvent);
+  }
+
+  // ============================================
+  // WORKFLOW EXECUTION
+  // ============================================
 
   /**
    * Execute a workflow (backward compatible - defaults to exact replay)
@@ -361,7 +861,8 @@ export class ExecutionEngine {
   }
 
   /**
-   * Execute a single step
+   * Execute a single step with Agentic behavior
+   * Orchestrates: tab switching → wait conditions → find element → resolve value → perform action
    */
   private async executeStep(step: WorkflowStep): Promise<void> {
     // Check if tab switch is needed
@@ -393,15 +894,16 @@ export class ExecutionEngine {
       await visualFlowTracker.captureBeforeState();
     }
 
+    // Execute action based on step type
     switch (step.type) {
       case 'CLICK':
-        await this.executeClick(step);
+        await this.executeClickAgentic(step);
         break;
       case 'INPUT':
-        await this.executeInput(step);
+        await this.executeInputAgentic(step);
         break;
       case 'KEYBOARD':
-        await this.executeKeyboard(step);
+        await this.executeKeyboardAgentic(step);
         break;
       case 'NAVIGATION':
         // Navigation is handled by URL changes, not explicit execution
@@ -418,6 +920,112 @@ export class ExecutionEngine {
       await this.waitForVisualStability(step);
       await visualFlowTracker.captureAfterState();
     }
+  }
+
+  /**
+   * Execute CLICK step with Agentic element finding
+   */
+  private async executeClickAgentic(step: WorkflowStep): Promise<void> {
+    // Step 1: Find target element using agentic methods
+    const element = await this.findTargetElement(step);
+    
+    if (!element) {
+      throw this.buildElementNotFoundError(step, 'CLICK');
+    }
+
+    // Step 2: Perform click action
+    await this.performAction(element, 'click', step);
+  }
+
+  /**
+   * Execute INPUT step with Agentic element finding and value resolution
+   */
+  private async executeInputAgentic(step: WorkflowStep): Promise<void> {
+    // Step 1: Find target element
+    const element = await this.findTargetElement(step);
+    
+    if (!element) {
+      throw this.buildElementNotFoundError(step, 'INPUT');
+    }
+
+    if (!isWorkflowStepPayload(step.payload)) {
+      throw new Error('GhostWriter: Invalid payload for INPUT step');
+    }
+
+    // Step 2: Validate element is inputtable
+    const isContentEditable = (element as HTMLElement).isContentEditable || 
+                              element.getAttribute('contenteditable') === 'true';
+    const isStandardInput = element instanceof HTMLInputElement || 
+                            element instanceof HTMLTextAreaElement || 
+                            element instanceof HTMLSelectElement;
+
+    if (!isStandardInput && !isContentEditable) {
+      throw new Error(`GhostWriter: Element is not an input element: ${step.payload.selector}`);
+    }
+
+    // Step 3: Resolve input value (with clipboard context and variable substitution)
+    const valueToUse = this.resolveInputValue(step);
+
+    // Step 4: Perform input action
+    await this.performAction(element, 'input', step, valueToUse);
+  }
+
+  /**
+   * Execute KEYBOARD step with Agentic element finding
+   */
+  private async executeKeyboardAgentic(step: WorkflowStep): Promise<void> {
+    // Step 1: Find target element
+    const element = await this.findTargetElement(step);
+    
+    if (!element) {
+      throw this.buildElementNotFoundError(step, 'KEYBOARD');
+    }
+
+    // Step 2: Perform keyboard action
+    await this.performAction(element, 'keyboard', step);
+  }
+
+  /**
+   * Build a detailed error message when element is not found
+   * Includes semantic context for better debugging
+   */
+  private buildElementNotFoundError(step: WorkflowStep, actionType: string): Error {
+    if (!isWorkflowStepPayload(step.payload)) {
+      return new Error(`GhostWriter: Cannot execute ${actionType} step - invalid payload`);
+    }
+
+    const payload = step.payload;
+    const parts: string[] = [
+      `GhostWriter: Could not find element for ${actionType} step.`
+    ];
+
+    // Add selector info
+    parts.push(`Primary selector: "${payload.selector}"`);
+    parts.push(`Fallback selectors tried: ${payload.fallbackSelectors?.length || 0}`);
+
+    // Add semantic context if available
+    if (payload.aiEvidence?.semanticAnchors) {
+      const anchors = payload.aiEvidence.semanticAnchors;
+      if (anchors.textLabel) {
+        parts.push(`Text label: "${anchors.textLabel}"`);
+      }
+      if (anchors.ariaLabel) {
+        parts.push(`ARIA label: "${anchors.ariaLabel}"`);
+      }
+      if (anchors.nearbyText && anchors.nearbyText.length > 0) {
+        parts.push(`Nearby text: "${anchors.nearbyText.slice(0, 2).join('", "')}"`);
+      }
+    }
+
+    // Add element text if available
+    if (payload.elementText) {
+      parts.push(`Element text: "${payload.elementText}"`);
+    }
+
+    // Add helpful hint
+    parts.push('Semantic self-healing was attempted but no matching element was found.');
+
+    return new Error(parts.join(' | '));
   }
 
   /**
@@ -474,68 +1082,11 @@ export class ExecutionEngine {
   }
 
   /**
-   * Execute a CLICK step
+   * Execute a CLICK step (legacy method - used by adaptive execution)
+   * Delegates to agentic method for consistency
    */
   private async executeClick(step: WorkflowStep): Promise<void> {
-    const element = await ElementFinder.findElement(step);
-    
-    if (!element) {
-      if (!isWorkflowStepPayload(step.payload)) {
-        throw new Error(`GhostWriter: Cannot execute ${step.type} step - invalid payload`);
-      }
-      throw new Error(
-        `GhostWriter: Could not find element for ${step.type} step. ` +
-        `Tried ${step.payload.fallbackSelectors?.length || 0} selectors and AI recovery (single multimodal request via Supabase). ` +
-        `Selector: ${step.payload.selector}`
-      );
-    }
-
-    // Scroll element into view if needed
-    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    await this.delay(100); // Small delay after scroll
-
-    // Dispatch full event sequence for React/Angular compatibility
-    if (!isWorkflowStepPayload(step.payload)) {
-      throw new Error(`GhostWriter: Cannot execute ${step.type} step - invalid payload`);
-    }
-    const eventDetails = step.payload.eventDetails;
-    const mouseButton = eventDetails?.mouseButton || 'left';
-    const modifiers = eventDetails?.modifiers || {};
-
-    // Create event options
-    const eventOptions: MouseEventInit = {
-      bubbles: true,
-      cancelable: true,
-      button: mouseButton === 'left' ? 0 : mouseButton === 'right' ? 2 : 1,
-      ctrlKey: modifiers.ctrl || false,
-      shiftKey: modifiers.shift || false,
-      altKey: modifiers.alt || false,
-      metaKey: modifiers.meta || false,
-    };
-
-    // Get coordinates
-    const rect = element.getBoundingClientRect();
-    const x = eventDetails?.coordinates?.x || rect.left + rect.width / 2;
-    const y = eventDetails?.coordinates?.y || rect.top + rect.height / 2;
-
-    // Dispatch event sequence
-    const eventSequence = eventDetails?.eventSequence || ['mousedown', 'focus', 'mouseup', 'click'];
-    
-    for (const eventType of eventSequence) {
-      if (eventType === 'focus') {
-        (element as HTMLElement).focus();
-      } else if (eventType === 'mousedown' || eventType === 'mouseup' || eventType === 'click') {
-        const event = new MouseEvent(eventType, {
-          ...eventOptions,
-          clientX: x,
-          clientY: y,
-        });
-        element.dispatchEvent(event);
-      }
-      
-      // Small delay between events
-      await this.delay(10);
-    }
+    await this.executeClickAgentic(step);
   }
 
   /**
@@ -562,177 +1113,19 @@ export class ExecutionEngine {
   }
 
   /**
-   * Execute an INPUT step
+   * Execute an INPUT step (legacy method - used by adaptive execution)
+   * Delegates to agentic method for consistency
    */
   private async executeInput(step: WorkflowStep): Promise<void> {
-    const element = await ElementFinder.findElement(step);
-    
-    if (!element) {
-      if (!isWorkflowStepPayload(step.payload)) {
-        throw new Error(`GhostWriter: Cannot execute ${step.type} step - invalid payload`);
-      }
-      throw new Error(
-        `GhostWriter: Could not find element for ${step.type} step. ` +
-        `Tried ${step.payload.fallbackSelectors?.length || 0} selectors and AI recovery (single multimodal request via Supabase). ` +
-        `Selector: ${step.payload.selector}`
-      );
-    }
-
-    if (!isWorkflowStepPayload(step.payload)) {
-      throw new Error(`GhostWriter: Cannot execute ${step.type} step - invalid payload`);
-    }
-
-    // Check if element is contenteditable
-    const isContentEditable = (element as HTMLElement).isContentEditable || 
-                              element.getAttribute('contenteditable') === 'true';
-    
-    const isStandardInput = element instanceof HTMLInputElement || 
-                            element instanceof HTMLTextAreaElement || 
-                            element instanceof HTMLSelectElement;
-
-    if (!isStandardInput && !isContentEditable) {
-      throw new Error(`GhostWriter: Element is not an input element: ${step.payload.selector}`);
-    }
-
-    // Get the value to use - either from variables or from the recorded step
-    const variableValue = this.getVariableValueForStep(step);
-    const valueToUse = variableValue !== undefined ? variableValue : (step.payload.value || '');
-
-    // Log variable substitution for debugging
-    if (variableValue !== undefined) {
-      console.log(`[ExecutionEngine] Using variable value for step: "${variableValue}" (original: "${step.payload.value}")`);
-    }
-
-    // Scroll element into view
-    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    await this.delay(100);
-
-    // Focus element
-    (element as HTMLElement).focus();
-    await this.delay(50);
-
-    if (isContentEditable) {
-      // For contenteditable elements (e.g., Google Sheets), use InputEvent with inputType
-      const htmlElement = element as HTMLElement;
-      
-      // Clear existing content
-      htmlElement.textContent = '';
-      htmlElement.innerText = '';
-      
-      // Set the value
-      htmlElement.textContent = valueToUse;
-      
-      // Dispatch InputEvent (crucial for modern editors like Google Sheets)
-      // This triggers formula calculations and data validation
-      const inputEvent = new InputEvent('input', {
-        bubbles: true,
-        cancelable: true,
-        inputType: 'insertText',
-        data: valueToUse
-      });
-      htmlElement.dispatchEvent(inputEvent);
-      
-      // Dispatch Enter key if it was recorded to commit the cell
-      // This is the only way to make the cell "Save" in Google Sheets
-      if (isWorkflowStepPayload(step.payload) && step.payload.keyboardDetails?.key === 'Enter') {
-        const enterEvent = new KeyboardEvent('keydown', {
-          key: 'Enter',
-          code: 'Enter',
-          bubbles: true,
-          cancelable: true
-        });
-        htmlElement.dispatchEvent(enterEvent);
-        
-        // Also dispatch keyup for completeness
-        const enterUpEvent = new KeyboardEvent('keyup', {
-          key: 'Enter',
-          code: 'Enter',
-          bubbles: true,
-          cancelable: true
-        });
-        htmlElement.dispatchEvent(enterUpEvent);
-      }
-      
-      // Dispatch change event
-      htmlElement.dispatchEvent(new Event('change', { bubbles: true }));
-    } else if (isStandardInput) {
-      // For standard inputs, textareas, and selects
-      // Clear existing value
-      if (element instanceof HTMLSelectElement) {
-        // For selects, set value directly
-        element.value = valueToUse;
-      } else {
-        // For inputs and textareas, clear and set value
-        element.value = '';
-        element.value = valueToUse;
-      }
-
-      // Dispatch input and change events
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-
-    // Blur if needed
-    if (isWorkflowStepPayload(step.payload) && step.payload.focusEvents?.needsBlur) {
-      (element as HTMLElement).blur();
-    }
+    await this.executeInputAgentic(step);
   }
 
   /**
-   * Execute a KEYBOARD step
+   * Execute a KEYBOARD step (legacy method - used by adaptive execution)
+   * Delegates to agentic method for consistency
    */
   private async executeKeyboard(step: WorkflowStep): Promise<void> {
-    const element = await ElementFinder.findElement(step);
-    
-    if (!element) {
-      if (!isWorkflowStepPayload(step.payload)) {
-        throw new Error(`GhostWriter: Cannot execute ${step.type} step - invalid payload`);
-      }
-      throw new Error(`GhostWriter: Could not find element for keyboard step: ${step.payload.selector}`);
-    }
-
-    if (!isWorkflowStepPayload(step.payload)) {
-      throw new Error(`GhostWriter: Cannot execute ${step.type} step - invalid payload`);
-    }
-
-    // Focus element
-    (element as HTMLElement).focus();
-    await this.delay(50);
-
-    const keyboardDetails = step.payload.keyboardDetails;
-    if (!keyboardDetails) {
-      throw new Error('GhostWriter: Keyboard step missing keyboardDetails');
-    }
-
-    const modifiers = keyboardDetails.modifiers || {};
-    const key = keyboardDetails.key;
-    const code = keyboardDetails.code;
-
-    // Dispatch keydown event
-    const keydownEvent = new KeyboardEvent('keydown', {
-      bubbles: true,
-      cancelable: true,
-      key,
-      code,
-      ctrlKey: modifiers.ctrl || false,
-      shiftKey: modifiers.shift || false,
-      altKey: modifiers.alt || false,
-      metaKey: modifiers.meta || false,
-    });
-    element.dispatchEvent(keydownEvent);
-
-    // Dispatch keyup event
-    const keyupEvent = new KeyboardEvent('keyup', {
-      bubbles: true,
-      cancelable: true,
-      key,
-      code,
-      ctrlKey: modifiers.ctrl || false,
-      shiftKey: modifiers.shift || false,
-      altKey: modifiers.alt || false,
-      metaKey: modifiers.meta || false,
-    });
-    element.dispatchEvent(keyupEvent);
+    await this.executeKeyboardAgentic(step);
   }
 
   /**
