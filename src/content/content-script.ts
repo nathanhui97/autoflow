@@ -131,7 +131,8 @@ function handleFullMessage(
           try {
             await recordingManager.stop();
             // Include initial full page snapshot if available (for spreadsheet column headers)
-            const initialSnapshot = recordingManager.getInitialFullPageSnapshot();
+            // Use async version to wait for capture to complete if still in progress
+            const initialSnapshot = await recordingManager.getInitialFullPageSnapshotAsync();
             // #region agent log
             fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content-script.ts:STOP_RECORDING:beforeResponse',message:'Preparing STOP_RECORDING response',data:{hasSnapshot:!!initialSnapshot,snapshotLength:initialSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'J'})}).catch(()=>{});
             // #endregion

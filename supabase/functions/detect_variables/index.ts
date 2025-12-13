@@ -340,19 +340,37 @@ async function analyzeStep(
     pageContext.url.includes('onedrive.live.com') ||
     pageContext.url.includes('office365.com')
   ) : false;
-  const shouldIncludeSnapshot = !!(initialFullPageSnapshot && (isDataTablePage || isSpreadsheetStep || isSpreadsheetUrl));
+  
+  // CRITICAL: For spreadsheet steps, we MUST have the snapshot to read column headers
+  // Log warning if snapshot is missing but should be included
+  const needsSnapshot = isDataTablePage || isSpreadsheetStep || isSpreadsheetUrl;
+  const hasSnapshot = !!initialFullPageSnapshot;
+  const shouldIncludeSnapshot = !!(hasSnapshot && needsSnapshot);
+  
+  if (needsSnapshot && !hasSnapshot) {
+    console.warn(`[detect_variables] ⚠️ WARNING: Step ${metadata.stepIndex} needs snapshot but it's missing!`, {
+      isSpreadsheetStep,
+      isDataTablePage,
+      isSpreadsheetUrl,
+      cellReference: metadata.cellReference,
+      columnHeader: metadata.columnHeader,
+      pageUrl: pageContext?.url?.substring(0, 80) || 'N/A',
+      message: 'Snapshot is required to read column headers from spreadsheet. AI will fall back to cell references.',
+    });
+  }
   
   console.log(`[detect_variables] analyzeStep for step ${metadata.stepIndex} - Full page snapshot check:`, {
-    hasInitialSnapshot: !!initialFullPageSnapshot,
+    hasInitialSnapshot: hasSnapshot,
     snapshotLength: initialFullPageSnapshot?.substring(0, 50) || 'N/A', // First 50 chars for logging
     pageType: pageContext?.pageType,
     pageUrl: pageContext?.url?.substring(0, 80) || 'N/A', // First 80 chars
     isDataTablePage,
     isSpreadsheetUrl,
+    isSpreadsheetStep,
+    needsSnapshot,
+    shouldIncludeSnapshot,
     cellReference: metadata.cellReference,
     columnHeader: metadata.columnHeader,
-    isSpreadsheetStep,
-    shouldIncludeSnapshot,
   });
   
   // Add initial full page snapshot FIRST (before cell snapshots) so AI sees headers first
@@ -368,29 +386,47 @@ async function analyzeStep(
     
     parts.push({
       text: `\n\n═══════════════════════════════════════════════════════════════════════════════
-📸 SPREADSHEET HEADER DETECTION - INTELLIGENT SEARCH REQUIRED
+📸 CRITICAL: ZOOMED-OUT SPREADSHEET SNAPSHOT - READ ALL COLUMN HEADERS
 ═══════════════════════════════════════════════════════════════════════════════
 
-**Cell:** ${cellRef} | **Value:** "${metadata.value || ''}" | **Column:** ${columnLetter}
+**SNAPSHOT CONTEXT:**
+- This is a ZOOMED-OUT snapshot (33% zoom) captured at recording start
+- The spreadsheet was REFRESHED and scrolled to the top before recording
+- Header row is VISIBLE at the top of the snapshot
+- Multiple columns are visible because of the zoom-out
 
-**IMPORTANT:** The page was refreshed at recording start, so headers are visible in the snapshot. You must INTELLIGENTLY SEARCH for the header row.
+**CURRENT CELL BEING ANALYZED:**
+- Cell Reference: ${cellRef}
+- Value Entered: "${metadata.value || ''}"
+- Column Letter: ${columnLetter}
 
-**YOUR TASK:**
-1. Examine the entire spreadsheet image below
-2. INTELLIGENTLY find the header row by searching for:
-   - The row with descriptive text labels (not data values)
-   - Rows with different styling (bold, background color, borders)
-   - The topmost row with labels (could be row 1, 2, 3, or any row - FIND IT!)
-   - Headers may be frozen/sticky at the top
-3. Read all headers from left to right (read as many as visible)
-4. Match column ${columnLetter} to its header text
-5. Use that header text as "fieldName"
+**🎯 YOUR MANDATORY TASK (DO NOT SKIP ANY STEP):**
 
-**STEP-BY-STEP PROCESS:**
-1. Search the entire image for the header row
-2. Identify which row contains headers (could be 1, 2, 3, or any row)
-3. Read all headers left to right (read as many as visible)
-4. Match column ${columnLetter} to its header text
+**STEP 1: LOCATE THE HEADER ROW**
+Look at the spreadsheet image below. The header row is the row that contains:
+- Descriptive labels (like "Name", "Email", "Price", "Status")
+- NOT data values (like "123", "john@email.com", "yes", "no")
+- Usually has bold text or different background color
+- Typically row 1, but could be row 2 or 3
+
+**STEP 2: READ ALL VISIBLE HEADERS (LEFT TO RIGHT)**
+Starting from column A, read EVERY header you can see:
+- Column A: [read the header text]
+- Column B: [read the header text]
+- Column C: [read the header text]
+- Column D: [read the header text]
+- Continue for all visible columns...
+- Read the COMPLETE text (e.g., "Marketplace Fee" not just "Marketplace")
+
+**STEP 3: MATCH COLUMN ${columnLetter} TO ITS HEADER**
+Find column ${columnLetter} in your list from Step 2
+Use that EXACT header text as the fieldName
+
+**STEP 4: VERIFY YOUR ANSWER**
+- Is fieldName the actual header text you read from the image?
+- Is it NOT a cell reference like "${cellRef}"?
+- Is it NOT just the column letter "${columnLetter}"?
+- Is it the COMPLETE header text (all words)?
 
 **HANDLING PARTIAL VISIBILITY:**
 - If not all columns are visible in the snapshot, read the headers that ARE visible
@@ -409,13 +445,25 @@ async function analyzeStep(
 **MANDATORY JSON RESPONSE (ALL FIELDS REQUIRED - RESPONSE IS INVALID WITHOUT THESE):**
 {
   "isVariable": true,
+  "confidence": 0.95,
+  "fieldName": "Email",  // <-- The ACTUAL header from column B, row 1
+  "variableName": "email",
+  "imageDescription": "Zoomed-out Google Sheets. Header row is row 1. Headers are: Name, Email, Phone, Status...",
+  "headerRowPosition": "Row 1",
+  "headersFound": "Column A: Name, Column B: Email, Column C: Phone, Column D: Status",
+  "reasoning": "Located header row at row 1. Column B header reads 'Email'. User entered email address in cell B75."
+}
+
+**MANDATORY JSON RESPONSE FORMAT (ALL FIELDS REQUIRED):**
+{
+  "isVariable": true,
   "confidence": 0.9,
-  "fieldName": "Marketplace Fee",  // <-- COMPLETE header text for column ${columnLetter} (read ALL words!)
-  "variableName": "marketplaceFee",
-  "imageDescription": "Google Sheets with headers visible at top. Header row is row 1. I can see columns A through F.",  // MANDATORY: Describe what you see
-  "headerRowPosition": "Row 1",  // MANDATORY: Which row contains headers? (1, 2, 3, etc.)
-  "headersFound": "Column A: Store, Column B: Store UUID, Column C: ORG ID, Column D: Marketplace Fee, Column E: Status, Column F: Amount",  // MANDATORY: List ALL visible headers with COMPLETE text
-  "reasoning": "Found header row at row 1. Column ${columnLetter} header is 'Marketplace Fee' (read complete text, not just 'Marketplace')"
+  "fieldName": "ACTUAL_HEADER_TEXT_HERE",  // <-- MUST be from the image, NOT "${cellRef}" or "${columnLetter}"
+  "variableName": "camelCaseVersion",
+  "imageDescription": "MANDATORY - Describe: spreadsheet type, where headers are, what you see",
+  "headerRowPosition": "MANDATORY - Which row? (e.g., 'Row 1', 'Row 2')",
+  "headersFound": "MANDATORY - List ALL: 'Column A: [text], Column B: [text], Column C: [text]...'",
+  "reasoning": "MANDATORY - Explain how you found the header"
 }
 
 **⚠️ CRITICAL REQUIREMENTS - YOUR RESPONSE WILL BE REJECTED IF THESE ARE MISSING:**
@@ -439,34 +487,55 @@ async function analyzeStep(
       }
     });
     parts.push({
-      text: `\n\n**EXAMINE THE IMAGE ABOVE CAREFULLY**
+      text: `\n\n═══════════════════════════════════════════════════════════════════════════════
+🔍 NOW EXAMINE THE ZOOMED-OUT SPREADSHEET IMAGE ABOVE
+═══════════════════════════════════════════════════════════════════════════════
 
-You must INTELLIGENTLY SEARCH for the header row and read COMPLETE header text:
+**STEP-BY-STEP INSTRUCTIONS (FOLLOW EXACTLY):**
 
-1. **Search for the header row** - Look for the row with descriptive labels (not data values)
-   - Could be row 1, 2, 3, or any row - FIND IT visually
-   - Headers typically have different styling (bold, colors, borders)
+**1️⃣ FIND THE HEADER ROW:**
+Look at the spreadsheet image. The header row contains descriptive labels like:
+- ✅ Good: "Name", "Email", "Phone", "Status", "Price", "Quantity"
+- ❌ Bad: "123", "john@email.com", "yes", "no", "100", "5"
+The header row is usually row 1, with bold text or colored background.
 
-2. **Read ALL visible headers COMPLETELY** - Read from left to right:
-   - Read the ENTIRE text in each header cell (e.g., "Marketplace Fee" not just "Marketplace")
-   - Headers can be multi-word - capture ALL words
-   - List them in headersFound: "Column A: Store, Column B: Store UUID, Column C: ORG ID, Column D: Marketplace Fee"
+**2️⃣ READ EVERY HEADER FROM LEFT TO RIGHT:**
+Start from column A and read each header:
+- Column A: [what text do you see?]
+- Column B: [what text do you see?]
+- Column C: [what text do you see?]
+- Column D: [what text do you see?]
+- Continue for ALL visible columns...
 
-3. **Match column ${columnLetter}** - Find the COMPLETE header text for column ${columnLetter}
-   - If column D header says "Marketplace Fee", use "Marketplace Fee" (both words!)
-   - If column B header says "Store UUID", use "Store UUID" (both words!)
+READ THE COMPLETE TEXT. If it says "Email Address", write "Email Address" (both words!).
 
-4. **Use COMPLETE header text as fieldName** - The FULL text you see (e.g., "Marketplace Fee", "Store UUID", "ORG ID")
+**3️⃣ FIND COLUMN ${columnLetter} IN YOUR LIST:**
+Look at your list from step 2. What is the header text for column ${columnLetter}?
+That text is your fieldName.
 
-**MANDATORY: You MUST provide:**
-- imageDescription: What you see in the image
-- headerRowPosition: Which row has headers
-- headersFound: Complete list of ALL visible headers with full text
-- fieldName: The COMPLETE header text (all words, not partial)
+**4️⃣ FILL IN THE RESPONSE:**
+{
+  "isVariable": true,
+  "confidence": 0.9,
+  "fieldName": "[HEADER TEXT FROM COLUMN ${columnLetter}]",  // <-- FROM THE IMAGE
+  "variableName": "[camelCase version]",
+  "imageDescription": "[Describe what you see: spreadsheet type, header row location, visible columns]",
+  "headerRowPosition": "[Which row? e.g., 'Row 1']",
+  "headersFound": "[List: 'Column A: ..., Column B: ..., Column C: ...']",
+  "reasoning": "[Explain: Found headers at row X, column ${columnLetter} has header 'Y']"
+}
 
-**fieldName must be the COMPLETE header text**, NOT "${cellRef}" or "${columnLetter}" or a partial header.
+**🚫 ABSOLUTELY FORBIDDEN:**
+- fieldName = "${cellRef}" ❌
+- fieldName = "${columnLetter}" ❌  
+- fieldName = "Cell ${cellRef}" ❌
+- fieldName = "F41" or "B75" or any cell reference ❌
 
-If you can't find headers after thorough search, set fieldName to "Unknown Field" AND explain why in imageDescription.`
+**✅ CORRECT EXAMPLES:**
+- fieldName = "Email" ✅
+- fieldName = "Full Name" ✅
+- fieldName = "Order Status" ✅
+- fieldName = "Price" ✅`
     });
     console.log(`[detect_variables] Full page snapshot image added FIRST to Gemini request for step ${metadata.stepIndex}`);
   } else if (initialFullPageSnapshot) {
@@ -581,9 +650,12 @@ If you can't find headers after thorough search, set fieldName to "Unknown Field
       return null;
     }
     
-    // VALIDATION: Reject generic field names for spreadsheet steps with full page snapshot
+    // VALIDATION: Reject generic field names for spreadsheet steps
     // If AI returned a generic name like "Cell X Value" or "Column X Value", it didn't read the header
-    if (result.isVariable && result.fieldName && shouldIncludeSnapshot && initialFullPageSnapshot && metadata.cellReference) {
+    // Also reject pure cell references like "A74", "B75" - these are NOT valid field names
+    // Apply this validation for ALL spreadsheet steps, even if snapshot wasn't available
+    const isSpreadsheetStep = !!(metadata.cellReference || metadata.columnHeader);
+    if (result.isVariable && result.fieldName && isSpreadsheetStep && metadata.cellReference) {
       const columnLetter = metadata.cellReference.charAt(0);
       const genericPatterns = [
         /^Cell\s+[A-Z]+\d+\s*Value$/i,
@@ -608,17 +680,31 @@ If you can't find headers after thorough search, set fieldName to "Unknown Field
       if (isGeneric) {
         let reason = '';
         if (isCellReference) {
-          reason = `AI returned cell reference "${result.fieldName}" instead of reading actual header text from the snapshot`;
+          reason = shouldIncludeSnapshot 
+            ? `AI returned cell reference "${result.fieldName}" instead of reading actual header text from the snapshot`
+            : `AI returned cell reference "${result.fieldName}" but snapshot was not available to read headers.`;
         } else if (isSingleLetterMatch) {
-          reason = `AI returned column letter "${result.fieldName}" instead of reading actual header text`;
+          reason = shouldIncludeSnapshot
+            ? `AI returned column letter "${result.fieldName}" instead of reading actual header text`
+            : `AI returned column letter "${result.fieldName}" but snapshot was not available to read headers.`;
         } else {
-          reason = `AI did not read column header from snapshot`;
+          reason = shouldIncludeSnapshot
+            ? `AI did not read column header from snapshot`
+            : `AI did not provide proper header name and snapshot was not available`;
         }
-        console.log(`[detect_variables] ⚠️ REJECTING generic fieldName "${result.fieldName}" for step ${metadata.stepIndex} - ${reason}`);
-        console.log(`[detect_variables] Cell reference: ${metadata.cellReference}, Expected to read header TEXT from snapshot, not use cell reference "${result.fieldName}"`);
-        // Return null to indicate AI failed to read the header properly
-        // This will trigger fallback or return null
-        return null;
+        console.log(`[detect_variables] ⚠️ Generic fieldName "${result.fieldName}" for step ${metadata.stepIndex} - ${reason}`);
+        console.log(`[detect_variables] Cell reference: ${metadata.cellReference}, hasSnapshot: ${shouldIncludeSnapshot}`);
+        
+        // Instead of returning null, use a descriptive fallback name
+        // This ensures variables are still detected even if AI fails to read headers
+        const fallbackFieldName = `Column ${columnLetter} Value`;
+        const fallbackVarName = `column${columnLetter}Value`;
+        console.log(`[detect_variables] 🔄 Using fallback name: "${fallbackFieldName}" (variableName: "${fallbackVarName}")`);
+        
+        result.fieldName = fallbackFieldName;
+        result.variableName = fallbackVarName;
+        result.reasoning = `${reason} Using column-based fallback name. User can rename this variable.`;
+        // DON'T return null - continue with modified result
       }
     }
     
@@ -967,6 +1053,11 @@ ${metadata.columnHeader
   : ''}
 ${metadata.columnHeader 
   ? `- variableName should be camelCase version of "${metadata.columnHeader}" (e.g., "${metadata.columnHeader.toLowerCase().replace(/\s+/g, '')}")` 
+  : ''}
+${metadata.cellReference 
+  ? `\n**🚫 ABSOLUTELY FORBIDDEN FOR SPREADSHEET CELLS:**\n- fieldName MUST NEVER be "${metadata.cellReference}" or any cell reference (e.g., "A74", "B75", "C66")\n- fieldName MUST NEVER be just the column letter (e.g., "A", "B", "C")\n- fieldName MUST be the ACTUAL COLUMN HEADER TEXT (e.g., "Name", "Email", "Price", "Marketplace Fee")\n${!initialFullPageSnapshot || !shouldIncludeSnapshot 
+  ? `- ⚠️ WARNING: Full page snapshot is NOT available, so you cannot read the column header from the image\n- In this case, use a generic descriptive name like "Column ${metadata.cellReference.charAt(0)} Value" or "Unknown Field"\n- NEVER use "${metadata.cellReference}" or "${metadata.cellReference.charAt(0)}" as the fieldName\n`
+  : `- ✅ Full page snapshot IS available - you MUST read the actual column header text from the image\n- Examine the snapshot carefully to find the header row and read the COMPLETE header text for column ${metadata.cellReference.charAt(0)}\n`}\n` 
   : ''}
 ${initialFullPageSnapshot && (pageContext?.pageType === 'data_table' || metadata.cellReference)
   ? `
@@ -1344,6 +1435,19 @@ function parseVariableResponse(
         hasHeaderRowPosition: !!parsed.headerRowPosition,
         hasHeadersFound: !!parsed.headersFound,
         fieldName: parsed.fieldName,
+        message: 'AI did not provide required diagnostic fields (imageDescription, headerRowPosition, headersFound). This suggests the AI did not examine the snapshot.',
+      });
+    }
+    
+    // CRITICAL: Log the AI's raw response for spreadsheet steps
+    if (metadata.cellReference) {
+      console.log(`[detect_variables] Step ${metadata.stepIndex} AI raw response:`, {
+        fieldName: parsed.fieldName,
+        cellReference: metadata.cellReference,
+        hasSnapshot: shouldIncludeSnapshot,
+        imageDescription: parsed.imageDescription?.substring(0, 100) || 'NOT PROVIDED',
+        headerRowPosition: parsed.headerRowPosition || 'NOT PROVIDED',
+        headersFound: parsed.headersFound?.substring(0, 200) || 'NOT PROVIDED',
       });
     }
 

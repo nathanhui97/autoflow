@@ -153,12 +153,62 @@ async function pauseRecordingInAllTabs(): Promise<void> {
 
 /**
  * Stop recording in all active tabs and finalize the session
+ * Returns the initial full page snapshot from the last active tab (if available)
  */
-async function stopRecordingInAllTabs(): Promise<void> {
-  const tabIds = Array.from(activeRecordingTabs);
-  for (const tabId of tabIds) {
-    await stopRecordingInTab(tabId);
+async function stopRecordingInAllTabs(): Promise<{ initialFullPageSnapshot?: string }> {
+  let tabIds = Array.from(activeRecordingTabs);
+  let initialSnapshot: string | undefined;
+  
+  console.log(`[Service Worker] Stopping recording in ${tabIds.length} tabs`, { tabIds, lastActiveTabId });
+  
+  // FALLBACK: If no tabs tracked, try current active tab
+  if (tabIds.length === 0) {
+    console.warn('[Service Worker] ⚠️ No recording tabs tracked, trying active tab as fallback');
+    try {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (activeTab?.id) {
+        console.log(`[Service Worker] Using fallback active tab ${activeTab.id} (${activeTab.url})`);
+        tabIds = [activeTab.id];
+      }
+    } catch (error) {
+      console.warn('[Service Worker] Failed to query active tab for fallback:', error);
+    }
   }
+  
+  // Try to get snapshot from each tab (priority: last active tab first, then all others)
+  const tabsToCheck = lastActiveTabId && tabIds.includes(lastActiveTabId)
+    ? [lastActiveTabId, ...tabIds.filter(id => id !== lastActiveTabId)]
+    : tabIds;
+  
+  for (const tabId of tabsToCheck) {
+    if (!initialSnapshot) {  // Stop once we get a snapshot
+      try {
+        console.log(`[Service Worker] Requesting STOP_RECORDING from tab ${tabId}...`);
+        const response = await chrome.tabs.sendMessage(tabId, { type: 'STOP_RECORDING' });
+        console.log(`[Service Worker] Response from tab ${tabId}:`, {
+          success: response?.success,
+          hasData: !!response?.data,
+          hasSnapshot: !!response?.data?.initialFullPageSnapshot,
+          snapshotLength: response?.data?.initialFullPageSnapshot?.length || 0,
+        });
+        
+        if (response && response.success && response.data?.initialFullPageSnapshot) {
+          initialSnapshot = response.data.initialFullPageSnapshot;
+          console.log(`[Service Worker] ✅ Received snapshot from tab ${tabId}, length:`, initialSnapshot?.length || 0);
+        }
+      } catch (error) {
+        console.warn(`[Service Worker] Failed to get snapshot from tab ${tabId}:`, error);
+      }
+    } else {
+      // Already have snapshot, just stop recording in remaining tabs
+      try {
+        await chrome.tabs.sendMessage(tabId, { type: 'STOP_RECORDING_IN_TAB', payload: { tabId } });
+      } catch (error) {
+        console.warn(`[Service Worker] Failed to stop recording in tab ${tabId}:`, error);
+      }
+    }
+  }
+  
   activeRecordingTabs.clear();
   tabUrlMap.clear();
   recordingSessionId = null;
@@ -166,6 +216,10 @@ async function stopRecordingInAllTabs(): Promise<void> {
   sessionTabMap.clear();
   lastRecordedTabUrl = null;
   lastRecordedTabIndex = null;
+  
+  console.log(`[Service Worker] Recording stopped, snapshot available: ${!!initialSnapshot}, length: ${initialSnapshot?.length || 0}`);
+  
+  return { initialFullPageSnapshot: initialSnapshot };
 }
 
 // Message routing: forward messages between sidepanel and content scripts
@@ -340,10 +394,13 @@ chrome.runtime.onMessage.addListener(
     if (message.type === 'STOP_RECORDING') {
       (async () => {
         try {
-          await stopRecordingInAllTabs();
+          const result = await stopRecordingInAllTabs();
           sendResponse({
             success: true,
-            data: { message: 'Recording stopped' },
+            data: { 
+              message: 'Recording stopped',
+              initialFullPageSnapshot: result.initialFullPageSnapshot,
+            },
           });
         } catch (error) {
           sendResponse({

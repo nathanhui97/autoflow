@@ -776,6 +776,34 @@ export class VariableDetector {
       })),
     });
 
+    // CRITICAL: For spreadsheet steps, ensure snapshot is included
+    const isSpreadsheetUrl = pageContext?.url ? (
+      pageContext.url.includes('docs.google.com/spreadsheets') ||
+      pageContext.url.includes('excel.office.com') ||
+      pageContext.url.includes('onedrive.live.com') ||
+      pageContext.url.includes('office365.com')
+    ) : false;
+    const needsSnapshot = hasSpreadsheetSteps || isSpreadsheetUrl || pageContext?.pageType === 'data_table';
+    
+    if (needsSnapshot && !initialFullPageSnapshot) {
+      console.warn('[VariableDetector] ⚠️ WARNING: Spreadsheet steps detected but no initial snapshot available!', {
+        hasSpreadsheetSteps,
+        isSpreadsheetUrl,
+        pageType: pageContext?.pageType,
+        pageUrl: pageContext?.url?.substring(0, 80) || 'N/A',
+        stepsWithCellRef: stepsForAnalysis.filter(s => s.metadata.cellReference).map(s => ({
+          stepIndex: s.metadata.stepIndex,
+          cellReference: s.metadata.cellReference,
+        })),
+        message: 'Snapshot is required for AI to read column headers. Without it, AI will use cell references instead of header names.',
+      });
+    } else if (needsSnapshot && initialFullPageSnapshot) {
+      console.log('[VariableDetector] ✅ Snapshot available for spreadsheet column header detection:', {
+        snapshotLength: initialFullPageSnapshot.length,
+        stepsWithCellRef: stepsForAnalysis.filter(s => s.metadata.cellReference).length,
+      });
+    }
+
     const requestPayload = {
       steps: stepsForAnalysis,
       pageContext,
@@ -787,6 +815,7 @@ export class VariableDetector {
       pageType: requestPayload.pageContext?.pageType,
       hasInitialSnapshot: !!requestPayload.initialFullPageSnapshot,
       snapshotLength: requestPayload.initialFullPageSnapshot?.length,
+      needsSnapshot,
       stepsWithCellReference: requestPayload.steps.filter(s => s.metadata.cellReference).map(s => ({
         stepIndex: s.metadata.stepIndex,
         cellReference: s.metadata.cellReference,

@@ -290,13 +290,47 @@ export class RecordingManager {
   }
 
   /**
-   * Get the initial full page snapshot captured at recording start
-   * Used for spreadsheet column header detection
+   * Get the initial full page snapshot captured at recording start (synchronous version).
+   * Used for spreadsheet column header detection.
+   * @deprecated Use getInitialFullPageSnapshotAsync() instead to ensure capture is complete
    */
   getInitialFullPageSnapshot(): string | null {
+    console.log('📸 GhostWriter: getInitialFullPageSnapshot called (sync)', {
+      hasSnapshot: !!this.initialFullPageSnapshot,
+      snapshotLength: this.initialFullPageSnapshot?.length || 0,
+      isSpreadsheetDomain: VisualSnapshotService.isSpreadsheetDomain(),
+    });
     // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:getInitialFullPageSnapshot',message:'Getting initial snapshot',data:{hasSnapshot:!!this.initialFullPageSnapshot,snapshotLength:this.initialFullPageSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'I'})}).catch(()=>{});
+    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:getInitialFullPageSnapshot',message:'Getting initial snapshot (sync)',data:{hasSnapshot:!!this.initialFullPageSnapshot,snapshotLength:this.initialFullPageSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'I'})}).catch(()=>{});
     // #endregion
+    return this.initialFullPageSnapshot;
+  }
+
+  /**
+   * Get the initial full page snapshot captured at recording start (async version).
+   * Used for spreadsheet column header detection.
+   * Note: Snapshot is captured asynchronously when recording starts, so it may not be available immediately.
+   */
+  async getInitialFullPageSnapshotAsync(): Promise<string | null> {
+    console.log('📸 GhostWriter: getInitialFullPageSnapshotAsync called', {
+      hasSnapshot: !!this.initialFullPageSnapshot,
+      snapshotLength: this.initialFullPageSnapshot?.length || 0,
+      isSpreadsheetDomain: VisualSnapshotService.isSpreadsheetDomain(),
+    });
+    
+    // If snapshot is already available, return it immediately
+    if (this.initialFullPageSnapshot) {
+      return this.initialFullPageSnapshot;
+    }
+    
+    // Otherwise, wait a bit for the async capture to complete (max 2 seconds)
+    // The capture happens in start() method asynchronously
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:getInitialFullPageSnapshotAsync',message:'Getting initial snapshot (async)',data:{hasSnapshot:!!this.initialFullPageSnapshot,snapshotLength:this.initialFullPageSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'I-async'})}).catch(()=>{});
+    // #endregion
+    
     return this.initialFullPageSnapshot;
   }
 
