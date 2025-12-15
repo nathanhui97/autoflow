@@ -4,7 +4,28 @@
  */
 
 // IMMEDIATE LOG - This should appear if script loads at all
-console.log('GhostWriter: Content script file is executing...', new Date().toISOString());
+// Version identifier for debugging - update this when making significant changes
+const EXTENSION_VERSION = 'v0.1.1-starting-page-validation';
+const BUILD_TIMESTAMP = new Date().toISOString();
+console.log(`🚀 GhostWriter: Content script loaded (${EXTENSION_VERSION}) - ${BUILD_TIMESTAMP}`);
+
+// Dynamically detect build hash from script URL
+try {
+  const scripts = document.querySelectorAll('script[src*="content-script"]');
+  if (scripts.length > 0) {
+    const src = scripts[scripts.length - 1].getAttribute('src') || '';
+    const hashMatch = src.match(/content-script\.ts-([A-Za-z0-9]+)\.js/);
+    if (hashMatch) {
+      console.log(`📦 Build hash: content-script.ts-${hashMatch[1]}.js`);
+    }
+  }
+} catch (e) {
+  // Fallback: try to get from chrome.runtime.getURL if available
+  try {
+    const url = chrome.runtime.getURL('assets/content-script.ts-loader-eLd2ZhJw.js');
+    console.log(`📦 Loader script: ${url}`);
+  } catch {}
+}
 
 // Set up message listener IMMEDIATELY, before any imports
 // This ensures we can respond to PING even if imports fail
@@ -16,10 +37,11 @@ import type { ExtensionMessage, MessageResponse, PongMessage } from '../types/me
 import { RecordingManager } from './recording-manager';
 import { AIWorkflowAnalyzer } from './ai-workflow-analyzer';
 import { PatternDetector } from './pattern-detector';
-import { ExecutionEngine } from './execution-engine';
 import { AIDataBuilder } from './ai-data-builder';
 import { VisualSnapshotService } from './visual-snapshot';
-import type { WorkflowStep, WorkflowIntent } from '../types/workflow';
+import type { WorkflowStep } from '../types/workflow';
+// Universal Execution Engine - the new reliable execution engine
+import { executeWorkflow as executeUniversalWorkflow, convertLegacyStep } from './universal-execution';
 
 // Full message handler with all message types
 function handleFullMessage(
@@ -133,9 +155,6 @@ function handleFullMessage(
             // Include initial full page snapshot if available (for spreadsheet column headers)
             // Use async version to wait for capture to complete if still in progress
             const initialSnapshot = await recordingManager.getInitialFullPageSnapshotAsync();
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content-script.ts:STOP_RECORDING:beforeResponse',message:'Preparing STOP_RECORDING response',data:{hasSnapshot:!!initialSnapshot,snapshotLength:initialSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'J'})}).catch(()=>{});
-            // #endregion
             sendResponse({
               success: true,
               data: { 
@@ -266,40 +285,70 @@ function handleFullMessage(
         return false;
       }
 
-      case 'EXECUTE_WORKFLOW_ADAPTIVE': {
+      // All workflow execution now uses the Universal Execution Engine
+      case 'EXECUTE_WORKFLOW':
+      case 'EXECUTE_WORKFLOW_ADAPTIVE':  // @deprecated - redirects to Universal Engine
+      case 'EXECUTE_WORKFLOW_VERIFIED':  // @deprecated - redirects to Universal Engine
+      case 'EXECUTE_WORKFLOW_UNIVERSAL': {
         if (!message.payload?.steps) {
           sendResponse({
             success: false,
-            error: 'EXECUTE_WORKFLOW_ADAPTIVE requires steps in payload',
+            error: 'EXECUTE_WORKFLOW requires steps in payload',
           });
           return false;
         }
 
-        // Execute workflow asynchronously
+        // Execute workflow with new Universal Engine
         (async () => {
           try {
             const steps = message.payload.steps as WorkflowStep[];
-            const intent = message.payload.intent as WorkflowIntent | undefined;
-            // Extract variable values for parameterized execution
-            const variableValues = message.payload.variableValues as Record<string, string> | undefined;
-            const workflowVariables = message.payload.workflowVariables;
+            const workflowId = message.payload.workflowId as string || 'unknown';
+            const variableValues = message.payload.variableValues as Record<string, string> || {};
             
-            // Log variable substitution info
-            if (variableValues && Object.keys(variableValues).length > 0) {
-              console.log('GhostWriter: Executing workflow with variable values:', variableValues);
-            }
+            console.log('GhostWriter: Starting UNIVERSAL execution for workflow:', workflowId);
             
-            const executor = new ExecutionEngine();
-            await executor.executeWorkflow(steps, intent, variableValues, workflowVariables);
-            
+            // Notify execution started
             chrome.runtime.sendMessage({
-              type: 'EXECUTE_WORKFLOW_RESPONSE',
-              payload: { success: true },
+              type: 'VERIFIED_EXECUTION_STARTED',
+              payload: { workflowId },
             });
-          } catch (error) {
-            console.error('GhostWriter: Error executing workflow:', error);
+            
+            // Convert legacy steps to universal format
+            const universalSteps = steps.map(step => convertLegacyStep(step));
+            
+            // Execute with universal engine
+            const result = await executeUniversalWorkflow(universalSteps, {
+              stopOnFailure: true,
+              stepTimeout: 10000,
+              variableValues,
+              onStepProgress: (stepIndex, status) => {
+                chrome.runtime.sendMessage({
+                  type: status === 'starting' ? 'VERIFIED_STEP_STARTED' :
+                        status === 'completed' ? 'VERIFIED_STEP_COMPLETED' : 'VERIFIED_STEP_FAILED',
+                  payload: { stepIndex },
+                });
+              },
+              onStepError: (stepIndex, error) => {
+                console.error(`GhostWriter: Universal step ${stepIndex} error:`, error);
+              },
+            });
+            
+            // Notify execution completed
             chrome.runtime.sendMessage({
-              type: 'EXECUTE_WORKFLOW_RESPONSE',
+              type: 'VERIFIED_EXECUTION_COMPLETED',
+              payload: {
+                success: result.success,
+                stepsExecuted: result.stepsCompleted,
+                totalSteps: result.totalSteps,
+                totalTimeMs: result.totalElapsedMs,
+                error: result.success ? undefined : result.failureSummary,
+              },
+            });
+            
+          } catch (error) {
+            console.error('GhostWriter: Error in universal execution:', error);
+            chrome.runtime.sendMessage({
+              type: 'VERIFIED_EXECUTION_COMPLETED',
               payload: {
                 success: false,
                 error: error instanceof Error ? error.message : 'Unknown error',
@@ -310,8 +359,15 @@ function handleFullMessage(
 
         sendResponse({
           success: true,
-          data: { message: 'Execution started' },
+          data: { message: 'Universal execution started' },
         });
+        return false;
+      }
+
+      case 'VERIFIED_EXECUTION_CANCEL': {
+        // TODO: Add proper cancellation support in universal engine
+        console.log('GhostWriter: Execution cancellation requested');
+        sendResponse({ success: true });
         return false;
       }
 

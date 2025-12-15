@@ -4,6 +4,7 @@ import { runtimeBridge } from '../lib/bridge';
 import { WorkflowStorage } from '../lib/storage';
 import { CorrectionMemory } from '../lib/correction-memory';
 import { VariableDetector } from '../lib/variable-detector';
+import { NavigationOptimizer } from '../lib/navigation-optimizer';
 import { VariableInputForm } from './VariableInputForm';
 import type { ExtensionState } from '../types/state';
 import type { WorkflowStep, SavedWorkflow } from '../types/workflow';
@@ -154,7 +155,7 @@ function App() {
       } else if (message.type === 'UPDATE_STEP' && message.payload?.stepId && message.payload?.step) {
         useExtensionStore.getState().updateWorkflowStep(message.payload.stepId, message.payload.step);
         // Mark as enhanced when step is updated with AI suggestions
-        if (isWorkflowStepPayload(message.payload.step.payload) && message.payload.step.payload.fallbackSelectors?.length > 0) {
+        if (isWorkflowStepPayload(message.payload.step.payload) && (message.payload.step.payload.fallbackSelectors?.length ?? 0) > 0) {
           useExtensionStore.getState().setStepEnhanced(message.payload.stepId);
         }
       } else if (message.type === 'AI_VALIDATION_STARTED' && message.payload?.stepId) {
@@ -528,14 +529,43 @@ function App() {
       const variables = await VariableDetector.detectVariables(workflowSteps, null);
       console.log('[SaveWorkflow] Detected variables result:', JSON.stringify(variables, null, 2));
 
-      const workflow: SavedWorkflow = {
+      // Run navigation optimization to detect and optimize unnecessary navigation steps
+      console.log('[SaveWorkflow] Starting navigation optimization...');
+      setLearningFeedback('🔧 Analyzing navigation patterns...');
+      
+      const optimizer = new NavigationOptimizer();
+      const tempWorkflow: SavedWorkflow = {
         id: `workflow-${Date.now()}`,
+        name: workflowName.trim(),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        steps: workflowSteps,
+      };
+      
+      const optimizationResult = await optimizer.optimizeWorkflow(tempWorkflow, {
+        useAI: true,
+        aiConfidenceThreshold: 0.7,
+      });
+      
+      console.log('[SaveWorkflow] Optimization complete:', {
+        originalSteps: workflowSteps.length,
+        optimizedSteps: optimizationResult.optimizedSteps.length,
+        stepsRemoved: optimizationResult.metadata.stepsRemoved,
+        sequencesOptimized: optimizationResult.metadata.sequencesOptimized,
+        aiUsed: optimizationResult.metadata.aiAnalysisUsed,
+      });
+
+      const workflow: SavedWorkflow = {
+        id: tempWorkflow.id,
         name: workflowName.trim(),
         createdAt: Date.now(),
         updatedAt: Date.now(),
         steps: workflowSteps,
         // Include detected variables if any were found
         variables: variables.variables.length > 0 ? variables : undefined,
+        // Include optimized steps and metadata if optimization reduced steps
+        optimizedSteps: optimizationResult.metadata.stepsRemoved > 0 ? optimizationResult.optimizedSteps : undefined,
+        optimizationMetadata: optimizationResult.metadata.stepsRemoved > 0 ? optimizationResult.metadata : undefined,
       };
 
       await WorkflowStorage.saveWorkflow(workflow);
@@ -549,12 +579,21 @@ function App() {
       console.log('[SaveWorkflow] Variables count:', variables.variables.length);
       setCurrentWorkflowVariables(variables.variables.length > 0 ? variables : null);
       
-      // Show feedback if variables were detected
+      // Build feedback message
+      const feedbackParts: string[] = [];
       if (variables.variables.length > 0) {
-        setLearningFeedback(`✨ Detected ${variables.variables.length} variable${variables.variables.length > 1 ? 's' : ''} for parameterized execution`);
+        feedbackParts.push(`✨ ${variables.variables.length} variable${variables.variables.length > 1 ? 's' : ''} detected`);
+      }
+      if (optimizationResult.metadata.stepsRemoved > 0) {
+        feedbackParts.push(`🔧 ${optimizationResult.metadata.stepsRemoved} navigation step${optimizationResult.metadata.stepsRemoved > 1 ? 's' : ''} optimized`);
+      }
+      
+      if (feedbackParts.length > 0) {
+        setLearningFeedback(feedbackParts.join(' • '));
         setTimeout(() => setLearningFeedback(null), 4000);
       } else {
-        console.log('[SaveWorkflow] No variables detected');
+        console.log('[SaveWorkflow] No variables or optimizations detected');
+        setLearningFeedback(null);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save workflow');
@@ -613,6 +652,7 @@ function App() {
 
   /**
    * Execute workflow with optional variable values
+   * Uses the new Universal Execution Engine for reliable clicks and dropdown handling
    */
   const executeWorkflowWithVariables = async (
     steps: WorkflowStep[],
@@ -629,15 +669,24 @@ function App() {
         throw new Error('No active tab found');
       }
       
-      // Send execution message with variable values
+      // Use optimized steps if available, fallback to original steps
+      const stepsToExecute = workflow.optimizedSteps || steps;
+      const isOptimized = !!workflow.optimizedSteps;
+      
+      if (isOptimized) {
+        console.log(`[ExecuteWorkflow] Using optimized steps (${stepsToExecute.length} vs ${steps.length} original)`);
+      }
+      
+      console.log('[ExecuteWorkflow] Using Universal Execution Engine');
+      
+      // Send execution message using new Universal Execution Engine
       const response = await runtimeBridge.sendMessage(
         {
-          type: 'EXECUTE_WORKFLOW_ADAPTIVE',
+          type: 'EXECUTE_WORKFLOW_UNIVERSAL',
           payload: {
-            steps,
-            intent: workflow.analyzedIntent,
+            steps: stepsToExecute,
+            workflowId: workflow.id,
             variableValues,
-            workflowVariables: workflow.variables,
           },
         },
         tab.id
@@ -647,7 +696,15 @@ function App() {
         throw new Error(response.error || 'Failed to execute workflow');
       }
       
-      setLearningFeedback(`✓ Workflow executed successfully${variableValues ? ' with custom variable values' : ''}`);
+      const feedbackParts: string[] = ['✓ Workflow executed successfully'];
+      if (variableValues) {
+        feedbackParts.push('with custom values');
+      }
+      if (isOptimized && workflow.optimizationMetadata) {
+        feedbackParts.push(`(${workflow.optimizationMetadata.stepsRemoved} steps optimized)`);
+      }
+      
+      setLearningFeedback(feedbackParts.join(' '));
       setTimeout(() => setLearningFeedback(null), 3000);
     } catch (err) {
       console.error('Execute workflow error:', err);
@@ -1181,7 +1238,7 @@ function App() {
                 <div key={workflow.id} className="p-3 bg-muted rounded-md">
                   <div className="flex items-start justify-between mb-2">
                     <div>
-                      <div className="font-medium text-foreground flex items-center gap-2">
+                      <div className="font-medium text-foreground flex items-center gap-2 flex-wrap">
                         {workflow.name}
                         {workflow.variables && workflow.variables.variables.length > 0 && (
                           <span 
@@ -1191,9 +1248,20 @@ function App() {
                             {workflow.variables.variables.length} var{workflow.variables.variables.length !== 1 ? 's' : ''}
                           </span>
                         )}
+                        {workflow.optimizationMetadata && workflow.optimizationMetadata.stepsRemoved > 0 && (
+                          <span 
+                            className="px-2 py-0.5 text-xs bg-green-100 text-green-700 rounded-full"
+                            title={`${workflow.optimizationMetadata.stepsRemoved} navigation step${workflow.optimizationMetadata.stepsRemoved !== 1 ? 's' : ''} optimized`}
+                          >
+                            -{workflow.optimizationMetadata.stepsRemoved} nav
+                          </span>
+                        )}
                       </div>
                       <div className="text-xs text-muted-foreground mt-1">
-                        {formatDate(workflow.updatedAt)} • {workflow.steps.length} steps
+                        {formatDate(workflow.updatedAt)} • {workflow.optimizedSteps ? workflow.optimizedSteps.length : workflow.steps.length} steps
+                        {workflow.optimizedSteps && (
+                          <span className="text-green-600"> (optimized from {workflow.steps.length})</span>
+                        )}
                       </div>
                     </div>
                   </div>

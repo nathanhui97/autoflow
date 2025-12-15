@@ -11,6 +11,11 @@ import type {
   WorkflowIntent as VisualWorkflowIntent 
 } from './visual';
 import type { WorkflowVariables } from '../lib/variable-detector';
+// Reliable Replayer types
+import type { LocatorBundle } from './locator';
+import type { Intent, StepGoal } from './intent';
+import type { Scope } from './scope';
+import type { SuggestedCondition } from './conditions';
 
 export type WorkflowStepType = 'CLICK' | 'INPUT' | 'NAVIGATION' | 'KEYBOARD' | 'SCROLL' | 'TAB_SWITCH';
 
@@ -148,8 +153,9 @@ export interface AIEvidence {
 
 export interface WorkflowStepPayload {
   selector: string; // The best stable selector
-  fallbackSelectors: string[]; // List of backup selectors
-  xpath: string; // XPath for text matching
+  // Legacy fields - kept for backward compatibility, replaced by locatorBundle
+  fallbackSelectors?: string[]; // Deprecated: use locatorBundle.strategies
+  xpath?: string; // Deprecated: use locatorBundle.strategies (xpath type)
   label?: string; // "Client Name"
   value?: string; // "Acme Corp"
   timestamp: number;
@@ -160,7 +166,7 @@ export interface WorkflowStepPayload {
   shadowPath?: ShadowPath[]; // Path through shadow boundaries
   elementState?: ElementState; // Element state at time of recording
   elementText?: string; // Exact text content of the element (for buttons, links, labels)
-  waitConditions?: WaitCondition[]; // What to wait for before executing this step
+  // Legacy: waitConditions removed - StateWaitEngine handles waits dynamically at execution
   // Phase 1: Critical fixes
   eventDetails?: EventDetails; // Event sequence and details
   viewport?: ViewportInfo; // Viewport dimensions and scroll position
@@ -267,6 +273,23 @@ export interface WorkflowStepPayload {
   };
   // Phase 6: AI Evidence capture
   aiEvidence?: AIEvidence; // AI context for better understanding and replay
+  
+  // Reliable Replayer enhancements
+  locatorBundle?: LocatorBundle;           // Multiple strategies with runtime-scorable features
+  intent?: Intent;                         // Machine-readable goal (CLICK, OPEN_ROW_ACTIONS, etc.)
+  stepGoal?: StepGoal;                     // Complete goal description with expected outcome
+  scope?: Scope;                           // Container scope (modal, table row, widget, etc.)
+  suggestedCondition?: SuggestedCondition; // Auto-detected success condition
+  disambiguators?: string[];               // Nearby text for filtering ambiguous matches
+  
+  // Locator quality metadata
+  locatorQuality?: {
+    hasStableAttributes: boolean;    // Uses data-testid, aria-label, name, id
+    hasUniqueMatch: boolean;         // Selector matched exactly one element at record time
+    hasDynamicParts: boolean;        // Selector contains generated IDs or dynamic parts
+    strategiesAvailable: number;      // How many locator strategies were found
+    confidenceScore: number;          // 0-1 overall confidence in element finding
+  };
 }
 
 export interface Pattern {
@@ -304,6 +327,42 @@ export function isWorkflowStepPayload(payload: WorkflowStepPayload | TabSwitchPa
   return 'selector' in payload && 'url' in payload;
 }
 
+/**
+ * Metadata about an optimization decision
+ */
+export interface OptimizationMapEntry {
+  /** Indices of original steps that were optimized */
+  originalIndices: number[];
+  /** Index in the optimized workflow (-1 if removed entirely) */
+  optimizedIndex: number;
+  /** Reason for the optimization */
+  reason: string;
+  /** How the decision was made */
+  decisionMethod: 'rule-based' | 'ai-powered' | 'hybrid';
+  /** AI confidence if AI was used */
+  aiConfidence?: number;
+}
+
+/**
+ * Metadata about the optimization process
+ */
+export interface OptimizationMetadata {
+  /** When the analysis was performed */
+  analyzedAt: number;
+  /** Number of navigation sequences found */
+  sequencesFound: number;
+  /** Number of sequences that were optimized */
+  sequencesOptimized: number;
+  /** Total number of steps removed */
+  stepsRemoved: number;
+  /** Whether AI analysis was used */
+  aiAnalysisUsed: boolean;
+  /** Average AI confidence (if AI was used) */
+  aiConfidenceAvg?: number;
+  /** Detailed optimization map */
+  optimizationMap: OptimizationMapEntry[];
+}
+
 export interface SavedWorkflow {
   id: string; // Unique identifier (timestamp or UUID)
   name: string; // User-provided name
@@ -315,5 +374,8 @@ export interface SavedWorkflow {
   pageTypeHistory?: PageType[]; // Page types encountered during recording
   // Phase 5: Variable detection and parameterization
   variables?: WorkflowVariables; // Detected variables for parameterized execution
+  // Navigation optimization
+  optimizedSteps?: WorkflowStep[]; // Optimized version of workflow steps for playback
+  optimizationMetadata?: OptimizationMetadata; // Metadata about the optimization process
 }
 

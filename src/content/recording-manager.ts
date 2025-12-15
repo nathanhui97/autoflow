@@ -8,7 +8,7 @@ import { ElementContext } from './element-context';
 import { ElementSimilarity } from './element-similarity';
 import { ElementStateCapture } from './element-state';
 import { ElementTextCapture } from './element-text';
-import { WaitConditionDeterminer } from './wait-conditions';
+// WaitConditionDeterminer removed - StateWaitEngine handles waits at execution time
 import { IframeUtils } from './iframe-utils';
 import { ContextScanner } from './context-scanner';
 import { VisualSnapshotService } from './visual-snapshot';
@@ -20,8 +20,23 @@ import { aiConfig } from '../lib/ai-config';
 import type { WorkflowStep, WorkflowStepPayload } from '../types/workflow';
 import { isWorkflowStepPayload } from '../types/workflow';
 import type { PageAnalysis, PageType } from '../types/visual';
+// Reliable Replayer enhancements
+import { buildLocatorBundle } from '../lib/locator-builder';
+import { 
+  inferClickIntent, 
+  inferInputIntent, 
+  inferKeyboardIntent,
+  inferSuccessCondition,
+  buildStepGoal 
+} from '../lib/intent-inference';
+import type { LocatorBundle } from '../types/locator';
+import type { Intent, StepGoal } from '../types/intent';
+import type { SuggestedCondition } from '../types/conditions';
 
 export class RecordingManager {
+  // Feature flag for reliable replayer enhancements
+  private readonly ENABLE_RELIABLE_RECORDING = true;
+  
   private isRecording: boolean = false;
   private inputDebounceTimer: number | null = null;
   private clickHandler: ((event: MouseEvent) => void) | null = null;
@@ -60,9 +75,6 @@ export class RecordingManager {
    * Start recording - attach event listeners
    */
   start(): void {
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:entry',message:'RecordingManager.start() called',data:{isRecording:this.isRecording,url:window.location.href},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-    // #endregion
     if (this.isRecording) {
       console.warn('Recording already started');
       return;
@@ -86,14 +98,8 @@ export class RecordingManager {
     // Capture full page snapshot at start for spreadsheet column header detection
     // This allows AI to see all column headers even when cells are scrolled down
     const isSpreadsheet = VisualSnapshotService.isSpreadsheetDomain();
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:isSpreadsheetCheck',message:'Checking if spreadsheet domain',data:{isSpreadsheet,url:window.location.href,hostname:window.location.hostname},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-    // #endregion
     if (isSpreadsheet) {
       console.log('📸 GhostWriter: Capturing initial full page snapshot for spreadsheet column headers');
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:beforeCapture',message:'About to call captureFullPage',data:{quality:0.8},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-      // #endregion
       // Page was refreshed before recording started, so header row should be visible in viewport
       // Verify scroll position is at (0, 0) as a safety check
       const scrollY = window.scrollY || window.pageYOffset || 0;
@@ -103,54 +109,27 @@ export class RecordingManager {
         // Wait for scroll to complete before capturing
         setTimeout(() => {
           VisualSnapshotService.captureFullPage(0.8).then((fullPage) => {
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:captureSuccess',message:'captureFullPage promise resolved',data:{hasFullPage:!!fullPage,hasScreenshot:!!fullPage?.screenshot,screenshotLength:fullPage?.screenshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-            // #endregion
             if (fullPage) {
               this.initialFullPageSnapshot = fullPage.screenshot;
               console.log('📸 GhostWriter: Initial full page snapshot captured for spreadsheet headers');
-              // #region agent log
-              fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:snapshotStored',message:'Initial snapshot stored',data:{snapshotLength:this.initialFullPageSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-              // #endregion
             } else {
-              // #region agent log
-              fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:captureReturnedNull',message:'captureFullPage returned null',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'F'})}).catch(()=>{});
-              // #endregion
             }
           }).catch((error) => {
             console.warn('📸 GhostWriter: Failed to capture initial full page snapshot:', error);
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:captureError',message:'captureFullPage promise rejected',data:{error:error?.message,errorString:String(error)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
-            // #endregion
           });
         }, 200);
       } else {
         VisualSnapshotService.captureFullPage(0.8).then((fullPage) => {
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:captureSuccess',message:'captureFullPage promise resolved',data:{hasFullPage:!!fullPage,hasScreenshot:!!fullPage?.screenshot,screenshotLength:fullPage?.screenshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-          // #endregion
           if (fullPage) {
             this.initialFullPageSnapshot = fullPage.screenshot;
             console.log('📸 GhostWriter: Initial full page snapshot captured for spreadsheet headers');
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:snapshotStored',message:'Initial snapshot stored',data:{snapshotLength:this.initialFullPageSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-            // #endregion
           } else {
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:captureReturnedNull',message:'captureFullPage returned null',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'F'})}).catch(()=>{});
-            // #endregion
           }
         }).catch((error) => {
           console.warn('📸 GhostWriter: Failed to capture initial full page snapshot:', error);
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:captureError',message:'captureFullPage promise rejected',data:{error:error?.message,errorString:String(error)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
-          // #endregion
         });
       }
     } else {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:start:notSpreadsheet',message:'Not a spreadsheet domain, skipping snapshot',data:{url:window.location.href},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'H'})}).catch(()=>{});
-      // #endregion
     }
 
     // Setup click handler - use CAPTURE phase to catch events before React/Base UI stops propagation
@@ -310,9 +289,6 @@ export class RecordingManager {
       snapshotLength: this.initialFullPageSnapshot?.length || 0,
       isSpreadsheetDomain: VisualSnapshotService.isSpreadsheetDomain(),
     });
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:getInitialFullPageSnapshot',message:'Getting initial snapshot (sync)',data:{hasSnapshot:!!this.initialFullPageSnapshot,snapshotLength:this.initialFullPageSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'I'})}).catch(()=>{});
-    // #endregion
     return this.initialFullPageSnapshot;
   }
 
@@ -337,9 +313,6 @@ export class RecordingManager {
     // The capture happens in start() method asynchronously
     await new Promise(resolve => setTimeout(resolve, 100));
     
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/08fac55b-7055-4bba-a7e9-c9135deb467c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'recording-manager.ts:getInitialFullPageSnapshotAsync',message:'Getting initial snapshot (async)',data:{hasSnapshot:!!this.initialFullPageSnapshot,snapshotLength:this.initialFullPageSnapshot?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'I-async'})}).catch(()=>{});
-    // #endregion
     
     return this.initialFullPageSnapshot;
   }
@@ -730,12 +703,12 @@ export class RecordingManager {
         let isListItemOrOption = this.isListItemOrOption(actualElement);
         
         // CRITICAL: Check if the last step was a dropdown trigger - if so, this click is likely a dropdown item
-        const wasDropdownTrigger = (this.lastStep && isWorkflowStepPayload(this.lastStep.payload) && this.lastStep.payload.waitConditions?.some(
-          (wc: { type: string; selector?: string }) => wc.type === 'element' && 
-          (wc.selector?.includes('[role="listbox"]') || 
-           wc.selector?.includes('[role="menu"]') ||
-           wc.selector?.includes('listbox') ||
-           wc.selector?.includes('menu'))
+        const wasDropdownTrigger = (this.lastStep && isWorkflowStepPayload(this.lastStep.payload) && (
+          this.lastStep.payload.elementRole === 'combobox' ||
+          this.lastStep.payload.elementRole === 'listbox' ||
+          this.lastStep.payload.selector?.includes('[role="combobox"]') ||
+          this.lastStep.payload.selector?.includes('[role="listbox"]') ||
+          this.lastStep.payload.selector?.includes('[role="menu"]')
         )) || false;
         
         // If last step was a dropdown trigger and this click is within 2 seconds, treat it as a dropdown item
@@ -1117,12 +1090,12 @@ export class RecordingManager {
           
           // RE-CHECK: Verify if this is a dropdown item (check again in async context)
           // Also check if previous step was a dropdown trigger
-          const wasDropdownTrigger = (this.lastStep && isWorkflowStepPayload(this.lastStep.payload) && this.lastStep.payload.waitConditions?.some(
-            (wc: { type: string; selector?: string }) => wc.type === 'element' && 
-            (wc.selector?.includes('[role="listbox"]') || 
-             wc.selector?.includes('[role="menu"]') ||
-             wc.selector?.includes('listbox') ||
-             wc.selector?.includes('menu'))
+          const wasDropdownTrigger = (this.lastStep && isWorkflowStepPayload(this.lastStep.payload) && (
+            this.lastStep.payload.elementRole === 'combobox' ||
+            this.lastStep.payload.elementRole === 'listbox' ||
+            this.lastStep.payload.selector?.includes('[role="combobox"]') ||
+            this.lastStep.payload.selector?.includes('[role="listbox"]') ||
+            this.lastStep.payload.selector?.includes('[role="menu"]')
           )) || false;
           
           const timeSinceLastStep = this.lastStep ? (Date.now() - this.lastStep.payload.timestamp) : Infinity;
@@ -1273,14 +1246,33 @@ export class RecordingManager {
             } : undefined,
           };
 
-          // Determine wait conditions based on this step and previous step
-          const tempStep: WorkflowStep = {
-            type: isNavigation ? 'NAVIGATION' : 'CLICK',
-            payload: stepPayload,
-          };
-          const waitConditions = WaitConditionDeterminer.determineWaitConditions(tempStep, this.lastStep || undefined);
-          stepPayload.waitConditions = waitConditions.length > 0 ? waitConditions : undefined;
+          // Enrich with reliable replayer data (LocatorBundle, Intent, Success Conditions)
+          const reliableData = this.enrichStepWithReliableData(actualElement, 'CLICK');
+          if (reliableData) {
+            stepPayload.locatorBundle = reliableData.locatorBundle;
+            stepPayload.intent = reliableData.intent;
+            stepPayload.stepGoal = reliableData.stepGoal;
+            stepPayload.suggestedCondition = reliableData.suggestedCondition;
+            stepPayload.scope = reliableData.locatorBundle.scope;
+            stepPayload.disambiguators = reliableData.locatorBundle.disambiguators;
+            
+            // Calculate locator quality metrics
+            const hasStableAttributes = reliableData.locatorBundle.strategies.some(s => s.features.hasStableAttributes);
+            const hasUniqueMatch = reliableData.locatorBundle.strategies.some(s => s.features.uniqueMatchAtRecordTime);
+            const hasDynamicParts = reliableData.locatorBundle.strategies.some(s => s.features.hasDynamicParts);
+            
+            stepPayload.locatorQuality = {
+              hasStableAttributes,
+              hasUniqueMatch,
+              hasDynamicParts,
+              strategiesAvailable: reliableData.locatorBundle.strategies.length,
+              confidenceScore: hasStableAttributes && hasUniqueMatch && !hasDynamicParts ? 0.9 :
+                              hasStableAttributes || hasUniqueMatch ? 0.7 :
+                              reliableData.locatorBundle.strategies.length >= 3 ? 0.5 : 0.3,
+            };
+          }
 
+          // Determine wait conditions based on this step and previous step
           const step: WorkflowStep = {
             type: isNavigation ? 'NAVIGATION' : 'CLICK',
             payload: stepPayload,
@@ -1657,14 +1649,33 @@ export class RecordingManager {
         } : undefined,
       };
 
-      // Determine wait conditions
-      const tempStep: WorkflowStep = {
-        type: 'KEYBOARD',
-        payload: stepPayload,
-      };
-      const waitConditions = WaitConditionDeterminer.determineWaitConditions(tempStep, this.lastStep || undefined);
-      stepPayload.waitConditions = waitConditions.length > 0 ? waitConditions : undefined;
+      // Enrich with reliable replayer data (LocatorBundle, Intent, Success Conditions)
+      const reliableData = this.enrichStepWithReliableData(actualElement, 'KEYBOARD', undefined, keyboardDetails.key);
+      if (reliableData) {
+        stepPayload.locatorBundle = reliableData.locatorBundle;
+        stepPayload.intent = reliableData.intent;
+        stepPayload.stepGoal = reliableData.stepGoal;
+        stepPayload.suggestedCondition = reliableData.suggestedCondition;
+        stepPayload.scope = reliableData.locatorBundle.scope;
+        stepPayload.disambiguators = reliableData.locatorBundle.disambiguators;
+        
+        // Calculate locator quality metrics
+        const hasStableAttributes = reliableData.locatorBundle.strategies.some(s => s.features.hasStableAttributes);
+        const hasUniqueMatch = reliableData.locatorBundle.strategies.some(s => s.features.uniqueMatchAtRecordTime);
+        const hasDynamicParts = reliableData.locatorBundle.strategies.some(s => s.features.hasDynamicParts);
+        
+        stepPayload.locatorQuality = {
+          hasStableAttributes,
+          hasUniqueMatch,
+          hasDynamicParts,
+          strategiesAvailable: reliableData.locatorBundle.strategies.length,
+          confidenceScore: hasStableAttributes && hasUniqueMatch && !hasDynamicParts ? 0.9 :
+                          hasStableAttributes || hasUniqueMatch ? 0.7 :
+                          reliableData.locatorBundle.strategies.length >= 3 ? 0.5 : 0.3,
+        };
+      }
 
+      // Determine wait conditions
       const step: WorkflowStep = {
         type: 'KEYBOARD',
         payload: stepPayload,
@@ -1771,13 +1782,6 @@ export class RecordingManager {
         };
 
         // Determine wait conditions
-        const tempStep: WorkflowStep = {
-          type: 'SCROLL',
-          payload: stepPayload,
-        };
-        const waitConditions = WaitConditionDeterminer.determineWaitConditions(tempStep, this.lastStep || undefined);
-        stepPayload.waitConditions = waitConditions.length > 0 ? waitConditions : undefined;
-
         const step: WorkflowStep = {
           type: 'SCROLL',
           payload: stepPayload,
@@ -2239,14 +2243,33 @@ export class RecordingManager {
         } : undefined,
       };
 
-      // Determine wait conditions based on this step and previous step
-      const tempStep: WorkflowStep = {
-        type: 'INPUT',
-        payload: stepPayload,
-      };
-      const waitConditions = WaitConditionDeterminer.determineWaitConditions(tempStep, this.lastStep || undefined);
-      stepPayload.waitConditions = waitConditions.length > 0 ? waitConditions : undefined;
+      // Enrich with reliable replayer data (LocatorBundle, Intent, Success Conditions)
+      const reliableData = this.enrichStepWithReliableData(element, 'INPUT', value);
+      if (reliableData) {
+        stepPayload.locatorBundle = reliableData.locatorBundle;
+        stepPayload.intent = reliableData.intent;
+        stepPayload.stepGoal = reliableData.stepGoal;
+        stepPayload.suggestedCondition = reliableData.suggestedCondition;
+        stepPayload.scope = reliableData.locatorBundle.scope;
+        stepPayload.disambiguators = reliableData.locatorBundle.disambiguators;
+        
+        // Calculate locator quality metrics
+        const hasStableAttributes = reliableData.locatorBundle.strategies.some(s => s.features.hasStableAttributes);
+        const hasUniqueMatch = reliableData.locatorBundle.strategies.some(s => s.features.uniqueMatchAtRecordTime);
+        const hasDynamicParts = reliableData.locatorBundle.strategies.some(s => s.features.hasDynamicParts);
+        
+        stepPayload.locatorQuality = {
+          hasStableAttributes,
+          hasUniqueMatch,
+          hasDynamicParts,
+          strategiesAvailable: reliableData.locatorBundle.strategies.length,
+          confidenceScore: hasStableAttributes && hasUniqueMatch && !hasDynamicParts ? 0.9 :
+                          hasStableAttributes || hasUniqueMatch ? 0.7 :
+                          reliableData.locatorBundle.strategies.length >= 3 ? 0.5 : 0.3,
+        };
+      }
 
+      // Determine wait conditions based on this step and previous step
       const step: WorkflowStep = {
         type: 'INPUT',
         payload: stepPayload,
@@ -2514,6 +2537,63 @@ export class RecordingManager {
       } catch (err) {
         // Fail silently
       }
+    }
+  }
+
+  /**
+   * Enrich step with reliable replayer data (LocatorBundle, Intent, Success Conditions)
+   */
+  private enrichStepWithReliableData(
+    element: Element,
+    stepType: 'CLICK' | 'INPUT' | 'KEYBOARD',
+    value?: string,
+    key?: string
+  ): {
+    locatorBundle: LocatorBundle;
+    intent: Intent;
+    stepGoal: StepGoal;
+    suggestedCondition: SuggestedCondition;
+  } | null {
+    if (!this.ENABLE_RELIABLE_RECORDING) {
+      return null;
+    }
+
+    try {
+      // Build comprehensive locator bundle with all strategies and features
+      const locatorBundle = buildLocatorBundle(element, document);
+      
+      // Infer machine-readable intent based on step type and element context
+      let intent: Intent;
+      switch (stepType) {
+        case 'CLICK':
+          intent = inferClickIntent(element);
+          break;
+        case 'INPUT':
+          intent = inferInputIntent(element, value || '');
+          break;
+        case 'KEYBOARD':
+          intent = inferKeyboardIntent(key || 'Enter');
+          break;
+      }
+      
+      // Build complete step goal with description and expected outcome
+      const stepGoal = buildStepGoal(intent, element);
+      
+      // Suggest success condition based on intent and context
+      const suggestedCondition = inferSuccessCondition(intent, element);
+      
+      console.log('🎯 GhostWriter: Enriched step with reliable data:', {
+        intent: intent.kind,
+        strategiesFound: locatorBundle.strategies.length,
+        hasScope: !!locatorBundle.scope,
+        disambiguators: locatorBundle.disambiguators.length,
+        conditionConfidence: suggestedCondition.confidence,
+      });
+      
+      return { locatorBundle, intent, stepGoal, suggestedCondition };
+    } catch (error) {
+      console.warn('GhostWriter: Failed to enrich step with reliable data:', error);
+      return null;
     }
   }
 }

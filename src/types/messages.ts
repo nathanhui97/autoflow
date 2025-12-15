@@ -13,7 +13,20 @@ export type MessageType =
   | 'AI_VALIDATION_COMPLETED'
   | 'STEP_ENHANCED'
   | 'ANALYZE_WORKFLOW'
-  | 'EXECUTE_WORKFLOW_ADAPTIVE'
+  // Unified workflow execution - all three handled by same engine
+  | 'EXECUTE_WORKFLOW'
+  | 'EXECUTE_WORKFLOW_ADAPTIVE'  // @deprecated - alias for EXECUTE_WORKFLOW
+  | 'EXECUTE_WORKFLOW_VERIFIED'  // @deprecated - alias for EXECUTE_WORKFLOW
+  | 'EXECUTE_WORKFLOW_UNIVERSAL' // New Universal Execution Engine (v2)
+  // Execution progress and control messages
+  | 'VERIFIED_EXECUTION_CANCEL'
+  | 'VERIFIED_EXECUTION_STARTED'
+  | 'VERIFIED_STEP_STARTED'
+  | 'VERIFIED_STEP_COMPLETED'
+  | 'VERIFIED_STEP_FAILED'
+  | 'VERIFIED_EXECUTION_COMPLETED'
+  | 'VERIFIED_DISAMBIGUATE_REQUEST'
+  | 'VERIFIED_DISAMBIGUATE_RESPONSE'
   | 'CAPTURE_VIEWPORT'
   | 'CORRECTION_SAVED'
   | 'ELEMENT_FIND_FAILED'
@@ -162,6 +175,7 @@ export interface AnalyzeWorkflowMessage extends ExtensionMessage {
 }
 
 /**
+ * @deprecated - Use EXECUTE_WORKFLOW_UNIVERSAL instead
  * EXECUTE_WORKFLOW_ADAPTIVE message - execute workflow with intent
  */
 export interface ExecuteWorkflowAdaptiveMessage extends ExtensionMessage {
@@ -172,6 +186,19 @@ export interface ExecuteWorkflowAdaptiveMessage extends ExtensionMessage {
     // Variable substitution support
     variableValues?: Record<string, string>;
     workflowVariables?: import('../lib/variable-detector').WorkflowVariables;
+  };
+}
+
+/**
+ * EXECUTE_WORKFLOW_UNIVERSAL message - execute workflow using new Universal Execution Engine
+ * This is the recommended way to execute workflows - handles clicks, dropdowns, and all UI patterns
+ */
+export interface ExecuteWorkflowUniversalMessage extends ExtensionMessage {
+  type: 'EXECUTE_WORKFLOW_UNIVERSAL';
+  payload: {
+    steps: import('./workflow').WorkflowStep[];
+    workflowId: string;
+    variableValues?: Record<string, string>;
   };
 }
 

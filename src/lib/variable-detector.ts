@@ -203,7 +203,36 @@ export class VariableDetector {
   private static filterStepsForAnalysis(steps: WorkflowStep[]): StepForAnalysis[] {
     const result: StepForAnalysis[] = [];
     
+    // Track which steps to skip (e.g., dropdown triggers that are followed by option selections)
+    const stepsToSkip = new Set<number>();
+    
+    // First pass: Identify dropdown trigger + option pairs to skip the trigger
+    for (let i = 0; i < steps.length - 1; i++) {
+      const currentStep = steps[i];
+      const nextStep = steps[i + 1];
+      
+      if (currentStep.type === 'CLICK' && nextStep.type === 'CLICK' &&
+          isWorkflowStepPayload(currentStep.payload) && isWorkflowStepPayload(nextStep.payload)) {
+        
+        const currentIsDropdownTrigger = this.isDropdownTrigger(currentStep.payload);
+        const nextIsDropdownOption = this.isDropdownOption(nextStep.payload);
+        
+        if (currentIsDropdownTrigger && nextIsDropdownOption) {
+          console.log(`[VariableDetector] Detected dropdown trigger + option pair at steps ${i} and ${i + 1}`);
+          console.log(`[VariableDetector] Trigger text: "${currentStep.payload.elementText}", Option text: "${nextStep.payload.elementText}"`);
+          console.log(`[VariableDetector] Skipping trigger step ${i}, will only analyze option step ${i + 1}`);
+          stepsToSkip.add(i); // Skip the trigger, keep the option
+        }
+      }
+    }
+    
     for (let i = 0; i < steps.length; i++) {
+      // Skip if identified as dropdown trigger in a pair
+      if (stepsToSkip.has(i)) {
+        console.log(`[VariableDetector] ⏭️ Skipping dropdown trigger at step ${i}`);
+        continue;
+      }
+      
       const step = steps[i];
       const payload = step.payload;
 
@@ -308,6 +337,73 @@ export class VariableDetector {
     }
 
     return result;
+  }
+
+  /**
+   * Determine if a CLICK step is a dropdown trigger (the element that opens the dropdown)
+   * Dropdown triggers typically:
+   * - Have role="combobox" or similar
+   * - Have placeholder text like "Select...", "Choose...", etc.
+   * - Open a listbox when clicked
+   */
+  private static isDropdownTrigger(payload: WorkflowStepPayload): boolean {
+    const elementText = (payload.elementText || '').toLowerCase().trim();
+    const label = (payload.label || '').toLowerCase().trim();
+    const role = (payload.elementRole || '').toLowerCase();
+    const selector = (payload.selector || '').toLowerCase();
+    
+    // Check for combobox role (strong indicator)
+    if (role === 'combobox' || selector.includes('role="combobox"') || selector.includes("role='combobox'")) {
+      return true;
+    }
+    
+    // Check for placeholder-like text patterns
+    const placeholderPatterns = ['select ', 'choose ', 'pick ', 'please select', 'please choose'];
+    const hasPlaceholderText = placeholderPatterns.some(pattern => 
+      elementText.includes(pattern) || label.includes(pattern)
+    );
+    
+    // Check if selector contains combobox or input with dropdown properties
+    const hasDropdownSelector = selector.includes('combobox') || 
+                                 selector.includes('dropdown') ||
+                                 (selector.includes('input') && selector.includes('listbox'));
+    
+    return hasPlaceholderText || hasDropdownSelector;
+  }
+  
+  /**
+   * Determine if a CLICK step is a dropdown option (an option within an opened dropdown)
+   * Dropdown options typically:
+   * - Have role="option"
+   * - Are inside a listbox
+   * - Have specific option text (not placeholder)
+   */
+  private static isDropdownOption(payload: WorkflowStepPayload): boolean {
+    const role = (payload.elementRole || '').toLowerCase();
+    const selector = (payload.selector || '').toLowerCase();
+    
+    // Check for option role (strongest indicator)
+    if (role === 'option') {
+      return true;
+    }
+    
+    // Check selector for role='option' or role="option"
+    if (selector.includes('role="option"') || selector.includes("role='option'") || 
+        selector.includes('[role="option"]') || selector.includes("[role='option']")) {
+      return true;
+    }
+    
+    // Check for listbox context
+    if (selector.includes('listbox')) {
+      return true;
+    }
+    
+    // Check if decisionSpace indicates this is a list option
+    if (payload.context?.decisionSpace?.type === 'LIST_SELECTION') {
+      return true;
+    }
+    
+    return false;
   }
 
   /**

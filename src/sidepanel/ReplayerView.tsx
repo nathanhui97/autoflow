@@ -1,215 +1,298 @@
 /**
- * ReplayerView Component
+ * ReplayerView - Unified replayer using Universal Execution Engine
  * 
- * Displays workflow execution progress with real-time step-by-step visualization
+ * Shows:
+ * - Step goals and verification status
+ * - Recovery actions taken
+ * - Disambiguation prompts
+ * - Execution metrics
  */
 
 import { useEffect, useState } from 'react';
 import type { SavedWorkflow } from '../types/workflow';
 import { isWorkflowStepPayload } from '../types/workflow';
+import type { StepMetrics, InstrumentationSummary } from '../lib/step-instrumentation';
+import { StepInstrumentation } from '../lib/step-instrumentation';
 
 interface ReplayerViewProps {
   workflow: SavedWorkflow;
   variableValues?: Record<string, string>;
   onClose?: () => void;
-  onSavePatches?: (workflow: SavedWorkflow) => void;
 }
 
 interface StepStatus {
-  status: 'pending' | 'executing' | 'completed' | 'failed';
+  status: 'pending' | 'executing' | 'completed' | 'failed' | 'needs_input';
   error?: string;
+  metrics?: Partial<StepMetrics>;
+  winningStrategy?: string;
+  recoveryUsed?: boolean;
 }
 
+/**
+ * Disambiguation Modal Component
+ */
+function DisambiguationModal({
+  candidates,
+  stepDescription,
+  onSelect,
+  onCancel,
+}: {
+  candidates: Array<{ element: string; text: string; index: number }>;
+  stepDescription: string;
+  onSelect: (index: number) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+      <div className="bg-card p-6 rounded-lg border border-border max-w-lg w-full mx-4">
+        <h3 className="text-lg font-semibold mb-2 text-card-foreground">
+          Multiple Matches Found
+        </h3>
+        <p className="text-sm text-muted-foreground mb-4">
+          Found {candidates.length} elements matching step: <strong>{stepDescription}</strong>
+        </p>
+        <p className="text-sm text-muted-foreground mb-4">
+          Please select the correct element:
+        </p>
+        
+        <div className="space-y-2 max-h-60 overflow-y-auto mb-4">
+          {candidates.map((candidate, index) => (
+            <button
+              key={index}
+              onClick={() => onSelect(candidate.index)}
+              className="w-full p-3 text-left border border-border rounded-md hover:border-primary hover:bg-primary/5 transition-colors"
+            >
+              <div className="font-medium text-foreground">{candidate.element}</div>
+              <div className="text-sm text-muted-foreground truncate">{candidate.text}</div>
+            </button>
+          ))}
+        </div>
+        
+        <div className="flex gap-2">
+          <button
+            onClick={onCancel}
+            className="flex-1 px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700"
+          >
+            Cancel Execution
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Metrics Panel Component
+ */
+function MetricsPanel({ summary }: { summary: InstrumentationSummary }) {
+  return (
+    <div className="p-3 bg-muted rounded-md text-sm space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-muted-foreground">Success Rate:</span>
+        <span className={`font-medium ${
+          summary.successRate >= 0.9 ? 'text-green-600' :
+          summary.successRate >= 0.7 ? 'text-yellow-600' : 'text-red-600'
+        }`}>
+          {Math.round(summary.successRate * 100)}%
+        </span>
+      </div>
+      
+      <div className="flex items-center justify-between">
+        <span className="text-muted-foreground">Steps:</span>
+        <span className="text-foreground">
+          {summary.successfulSteps}/{summary.totalSteps} passed
+        </span>
+      </div>
+      
+      <div className="flex items-center justify-between">
+        <span className="text-muted-foreground">Avg Time/Step:</span>
+        <span className="text-foreground">{Math.round(summary.avgTotalTimeMs)}ms</span>
+      </div>
+      
+      {summary.topStrategies.length > 0 && (
+        <div>
+          <span className="text-muted-foreground">Top Strategy: </span>
+          <span className="text-foreground">{summary.topStrategies[0].strategy}</span>
+        </div>
+      )}
+      
+      {summary.topRecoveryActions.length > 0 && (
+        <div>
+          <span className="text-muted-foreground">Recovery Used: </span>
+          <span className="text-foreground">{summary.topRecoveryActions[0].action}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * ReplayerView Component
+ */
 export function ReplayerView({
   workflow,
   variableValues,
   onClose,
-  onSavePatches,
 }: ReplayerViewProps) {
   const [isExecuting, setIsExecuting] = useState(false);
   const [currentStepIndex, setCurrentStepIndex] = useState<number | null>(null);
   const [stepStatuses, setStepStatuses] = useState<Map<number, StepStatus>>(new Map());
   const [error, setError] = useState<string | null>(null);
-  const [patchesCount, setPatchesCount] = useState(0);
-  const [showSavePrompt, setShowSavePrompt] = useState(false);
-
+  const [showMetrics, setShowMetrics] = useState(false);
+  const [metrics, setMetrics] = useState<InstrumentationSummary | null>(null);
+  const [disambiguationData, setDisambiguationData] = useState<{
+    candidates: Array<{ element: string; text: string; index: number }>;
+    stepDescription: string;
+    resolve: (index: number | null) => void;
+  } | null>(null);
+  
+  const stepsToDisplay = workflow.optimizedSteps || workflow.steps;
+  
   // Initialize step statuses
   useEffect(() => {
     const initialStatuses = new Map<number, StepStatus>();
-    workflow.steps.forEach((_, index) => {
+    stepsToDisplay.forEach((_, index) => {
       initialStatuses.set(index, { status: 'pending' });
     });
     setStepStatuses(initialStatuses);
   }, [workflow]);
-
+  
   // Listen for execution progress messages
   useEffect(() => {
-    const handleMessage = (
-      message: any,
-      _sender: chrome.runtime.MessageSender
-    ) => {
-      if (message.type === 'EXECUTION_STARTED') {
+    const handleMessage = (message: any) => {
+      if (message.type === 'VERIFIED_EXECUTION_STARTED') {
         setIsExecuting(true);
         setError(null);
         setCurrentStepIndex(null);
-        // Reset all step statuses to pending
+        
         const newStatuses = new Map<number, StepStatus>();
-        workflow.steps.forEach((_, index) => {
+        stepsToDisplay.forEach((_, index) => {
           newStatuses.set(index, { status: 'pending' });
         });
         setStepStatuses(newStatuses);
-      } else if (message.type === 'EXECUTION_STEP_STARTED') {
-        const stepIndex = message.payload.stepIndex;
+        
+      } else if (message.type === 'VERIFIED_STEP_STARTED') {
+        const { stepIndex } = message.payload;
         setCurrentStepIndex(stepIndex);
         setStepStatuses(prev => {
           const next = new Map(prev);
           next.set(stepIndex, { status: 'executing' });
           return next;
         });
-      } else if (message.type === 'EXECUTION_STEP_COMPLETED') {
-        const stepIndex = message.payload.stepIndex;
+        
+      } else if (message.type === 'VERIFIED_STEP_COMPLETED') {
+        const { stepIndex, metrics: stepMetrics } = message.payload;
         setStepStatuses(prev => {
           const next = new Map(prev);
-          next.set(stepIndex, { status: 'completed' });
-          return next;
-        });
-      } else if (message.type === 'EXECUTION_STEP_FAILED') {
-        const stepIndex = message.payload.stepIndex;
-        setStepStatuses(prev => {
-          const next = new Map(prev);
-          next.set(stepIndex, { 
-            status: 'failed',
-            error: message.payload.error,
+          next.set(stepIndex, {
+            status: 'completed',
+            metrics: stepMetrics,
+            winningStrategy: stepMetrics?.resolution?.winningStrategy,
+            recoveryUsed: stepMetrics?.recovery?.attemptCount > 0,
           });
           return next;
         });
-        setError(message.payload.error);
-      } else if (message.type === 'EXECUTION_COMPLETED') {
+        
+      } else if (message.type === 'VERIFIED_STEP_FAILED') {
+        const { stepIndex, error: stepError, metrics: stepMetrics } = message.payload;
+        setStepStatuses(prev => {
+          const next = new Map(prev);
+          next.set(stepIndex, {
+            status: 'failed',
+            error: stepError,
+            metrics: stepMetrics,
+          });
+          return next;
+        });
+        setError(stepError);
+        
+      } else if (message.type === 'VERIFIED_EXECUTION_COMPLETED') {
         setIsExecuting(false);
         setCurrentStepIndex(null);
-        if (message.payload.patchesCount && message.payload.patchesCount > 0) {
-          setPatchesCount(message.payload.patchesCount);
-          setShowSavePrompt(true);
+        
+        // Check if execution failed due to wrong starting page
+        if (!message.payload.success && message.payload.error) {
+          setError(message.payload.error);
         }
-      } else if (message.type === 'EXECUTION_ERROR') {
-        setIsExecuting(false);
-        setError(message.payload.error);
+        
+        // Update metrics
+        const summary = StepInstrumentation.getSummary();
+        setMetrics(summary);
+        
+      } else if (message.type === 'VERIFIED_DISAMBIGUATE_REQUEST') {
+        const { candidates, stepDescription } = message.payload;
+        
+        // Show disambiguation modal
+        setDisambiguationData({
+          candidates,
+          stepDescription,
+          resolve: (index) => {
+            // Send response back
+            chrome.runtime.sendMessage({
+              type: 'VERIFIED_DISAMBIGUATE_RESPONSE',
+              payload: { selectedIndex: index },
+            });
+            setDisambiguationData(null);
+          },
+        });
       }
     };
-
-    // Register message listeners
+    
     chrome.runtime.onMessage.addListener(handleMessage);
-
-    return () => {
-      chrome.runtime.onMessage.removeListener(handleMessage);
-    };
+    return () => chrome.runtime.onMessage.removeListener(handleMessage);
   }, [workflow]);
-
+  
   const handleStart = async () => {
     try {
       setError(null);
       setIsExecuting(true);
-
-      // Get active tab
+      
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab?.id) {
         throw new Error('No active tab found');
       }
-
-      let targetTabId = tab.id;
-      let didNavigate = false;
-
-      // Get starting URL from first step's URL
+      
+      // Get starting URL
       const startingUrl = workflow.steps.length > 0 && isWorkflowStepPayload(workflow.steps[0].payload)
         ? workflow.steps[0].payload.url
         : undefined;
-
-      // Navigate to starting URL if available and different from current URL
+      
+      // Navigate if needed
       if (startingUrl && tab.url !== startingUrl) {
-        didNavigate = true;
-        try {
-          console.log(`[ReplayerView] Navigating to starting URL: ${startingUrl}`);
-          await chrome.tabs.update(tab.id, { url: startingUrl });
+        await chrome.tabs.update(tab.id, { url: startingUrl });
+        
+        // Wait for page load
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            reject(new Error('Navigation timeout'));
+          }, 15000);
           
-          // Wait for page to load
-          await new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(() => {
+          const listener = (tabId: number, changeInfo: { status?: string }) => {
+            if (tabId === tab.id && changeInfo.status === 'complete') {
+              clearTimeout(timeout);
               chrome.tabs.onUpdated.removeListener(listener);
-              reject(new Error('Navigation timeout'));
-            }, 15000); // 15 second timeout
-
-            const listener = (tabId: number, changeInfo: { status?: string; url?: string }) => {
-              if (tabId === tab.id) {
-                if (changeInfo.status === 'complete') {
-                  clearTimeout(timeout);
-                  chrome.tabs.onUpdated.removeListener(listener);
-                  // Additional wait for page to be fully ready
-                  setTimeout(() => resolve(), 1000);
-                } else if (changeInfo.status === 'loading' && changeInfo.url) {
-                  // URL changed, page is loading
-                  console.log(`[ReplayerView] Page loading: ${changeInfo.url}`);
-                }
-              }
-            };
-            chrome.tabs.onUpdated.addListener(listener);
-          });
-          
-          // Re-query tab to get updated tab (in case URL changed)
-          const [updatedTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-          if (updatedTab?.id) {
-            targetTabId = updatedTab.id;
-          }
-          
-          // Wait for content script to be ready (ping it)
-          let contentScriptReady = false;
-          for (let attempt = 0; attempt < 10; attempt++) {
-            try {
-              const pingResponse = await chrome.tabs.sendMessage(targetTabId, {
-                type: 'PING',
-                payload: { timestamp: Date.now() },
-              });
-              if (pingResponse?.success && pingResponse.data?.type === 'PONG') {
-                contentScriptReady = true;
-                console.log(`[ReplayerView] Content script ready after ${attempt + 1} attempt(s)`);
-                break;
-              }
-            } catch (pingError) {
-              // Content script not ready yet, wait and retry
-              await new Promise(resolve => setTimeout(resolve, 500));
+              setTimeout(() => resolve(), 1000);
             }
-          }
-          
-          if (!contentScriptReady) {
-            console.warn('[ReplayerView] Content script not ready after navigation, continuing anyway');
-          }
-        } catch (navError) {
-          console.warn('[ReplayerView] Navigation error, continuing anyway:', navError);
-          // Continue execution even if navigation fails
-        }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+        });
       }
-
-      // Use the target tab ID (may have changed after navigation)
-      if (!targetTabId) {
-        const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!currentTab?.id) {
-          throw new Error('No active tab found');
-        }
-        targetTabId = currentTab.id;
-      }
-
-      // Send execution message to content script
-      // Progress messages will come via chrome.runtime.onMessage from content script
-      const response = await chrome.tabs.sendMessage(targetTabId, {
-        type: 'EXECUTE_WORKFLOW_ADAPTIVE',
+      
+      // Start execution using Universal Execution Engine
+      const stepsToExecute = workflow.optimizedSteps || workflow.steps;
+      
+      console.log('[ReplayerView] Starting Universal Execution with', stepsToExecute.length, 'steps');
+      
+      const response = await chrome.tabs.sendMessage(tab.id!, {
+        type: 'EXECUTE_WORKFLOW_UNIVERSAL',
         payload: {
-          steps: workflow.steps,
-          intent: workflow.analyzedIntent,
-          variableValues,
-          workflowVariables: workflow.variables,
-          justNavigated: didNavigate, // Tell execution engine we just navigated
+          steps: stepsToExecute,
+          workflowId: workflow.id,
+          variableValues: variableValues || {},
         },
       });
-
+      
       if (!response?.success) {
         throw new Error(response?.error || 'Failed to start execution');
       }
@@ -219,14 +302,13 @@ export function ReplayerView({
       setIsExecuting(false);
     }
   };
-
+  
   const handleStop = async () => {
-    // Send cancellation message (will be handled by execution engine)
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (tab?.id) {
         await chrome.tabs.sendMessage(tab.id, {
-          type: 'EXECUTION_CANCELLED',
+          type: 'VERIFIED_EXECUTION_CANCEL',
         });
       }
     } catch (err) {
@@ -235,50 +317,63 @@ export function ReplayerView({
     setIsExecuting(false);
     setCurrentStepIndex(null);
   };
-
-  const handleSavePatches = () => {
-    if (onSavePatches) {
-      onSavePatches(workflow);
-    }
-    setShowSavePrompt(false);
-    setPatchesCount(0);
+  
+  const handleDisambiguationSelect = (index: number) => {
+    disambiguationData?.resolve(index);
   };
-
-  const handleDiscardPatches = () => {
-    setShowSavePrompt(false);
-    setPatchesCount(0);
+  
+  const handleDisambiguationCancel = () => {
+    disambiguationData?.resolve(null);
+    handleStop();
   };
-
-  const progress = workflow.steps.length > 0 && currentStepIndex !== null
-    ? ((currentStepIndex + 1) / workflow.steps.length) * 100
+  
+  const progress = stepsToDisplay.length > 0 && currentStepIndex !== null
+    ? ((currentStepIndex + 1) / stepsToDisplay.length) * 100
     : 0;
-
+  
   return (
     <div className="space-y-4">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-xl font-semibold text-foreground">{workflow.name}</h2>
-          <p className="text-sm text-muted-foreground">
-            {workflow.steps.length} step{workflow.steps.length !== 1 ? 's' : ''}
-          </p>
+          <div className="flex items-center gap-2 mt-1">
+            <p className="text-sm text-muted-foreground">
+              {stepsToDisplay.length} step{stepsToDisplay.length !== 1 ? 's' : ''}
+            </p>
+            <span className="px-2 py-0.5 text-xs bg-emerald-100 text-emerald-700 rounded-full font-medium">
+              Universal Engine
+            </span>
+          </div>
         </div>
-        {onClose && (
+        <div className="flex gap-2">
           <button
-            onClick={onClose}
-            className="px-3 py-1 text-sm bg-gray-600 text-white rounded hover:bg-gray-700"
-            disabled={isExecuting}
+            onClick={() => setShowMetrics(!showMetrics)}
+            className="px-3 py-1 text-sm bg-muted text-muted-foreground rounded hover:bg-muted/80"
+            title="Show execution metrics"
           >
-            Close
+            📊
           </button>
-        )}
+          {onClose && (
+            <button
+              onClick={onClose}
+              className="px-3 py-1 text-sm bg-gray-600 text-white rounded hover:bg-gray-700"
+              disabled={isExecuting}
+            >
+              Close
+            </button>
+          )}
+        </div>
       </div>
-
+      
+      {/* Metrics Panel */}
+      {showMetrics && metrics && <MetricsPanel summary={metrics} />}
+      
       {/* Progress Bar */}
       <div className="space-y-2">
         <div className="flex items-center justify-between text-sm">
           <span className="text-muted-foreground">
-            {currentStepIndex !== null ? `Step ${currentStepIndex + 1} of ${workflow.steps.length}` : 'Ready'}
+            {currentStepIndex !== null ? `Step ${currentStepIndex + 1} of ${stepsToDisplay.length}` : 'Ready'}
           </span>
           <span className="text-muted-foreground">{Math.round(progress)}%</span>
         </div>
@@ -289,7 +384,7 @@ export function ReplayerView({
           />
         </div>
       </div>
-
+      
       {/* Execution Controls */}
       <div className="flex gap-2">
         {!isExecuting ? (
@@ -297,7 +392,7 @@ export function ReplayerView({
             onClick={handleStart}
             className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 font-medium"
           >
-            Start Execution
+            ▶️ Run Workflow
           </button>
         ) : (
           <button
@@ -308,23 +403,23 @@ export function ReplayerView({
           </button>
         )}
       </div>
-
+      
       {/* Error Display */}
       {error && (
         <div className="p-3 bg-red-50 border border-red-200 rounded-md">
           <p className="text-sm text-red-800">{error}</p>
         </div>
       )}
-
+      
       {/* Step List */}
       <div className="space-y-2 max-h-96 overflow-y-auto">
-        {workflow.steps.map((step, index) => {
-          const status = stepStatuses.get(index) || { status: 'pending' as const };
+        {stepsToDisplay.map((step, index) => {
+          const status = stepStatuses.get(index) || { status: 'pending' };
           const isCurrent = currentStepIndex === index;
-          const stepId = isWorkflowStepPayload(step.payload) 
-            ? String(step.payload.timestamp) 
+          const stepId = isWorkflowStepPayload(step.payload)
+            ? String(step.payload.timestamp)
             : `step-${index}`;
-
+          
           return (
             <div
               key={stepId}
@@ -359,15 +454,30 @@ export function ReplayerView({
                     )}
                   </div>
                   <div className="flex-1 min-w-0">
-                    <div className="font-medium text-foreground">
+                    <div className="font-medium text-foreground flex items-center gap-2">
                       {index + 1}. {step.type}
-                      {isCurrent && <span className="ml-2 text-blue-600 text-sm">(Executing...)</span>}
+                      {status.winningStrategy && (
+                        <span className="px-1.5 py-0.5 text-xs bg-blue-100 text-blue-700 rounded" title={`Found via ${status.winningStrategy}`}>
+                          {status.winningStrategy}
+                        </span>
+                      )}
+                      {status.recoveryUsed && (
+                        <span className="px-1.5 py-0.5 text-xs bg-yellow-100 text-yellow-700 rounded" title="Recovery actions were used">
+                          🔧
+                        </span>
+                      )}
+                      {isCurrent && <span className="text-blue-600 text-sm">(Executing...)</span>}
                     </div>
                     {step.description && (
                       <div className="text-sm text-muted-foreground mt-1">{step.description}</div>
                     )}
                     {status.error && (
                       <div className="text-sm text-red-600 mt-1">{status.error}</div>
+                    )}
+                    {status.metrics?.totalTimeMs && (
+                      <div className="text-xs text-muted-foreground mt-1">
+                        {status.metrics.totalTimeMs}ms
+                      </div>
                     )}
                   </div>
                 </div>
@@ -376,34 +486,15 @@ export function ReplayerView({
           );
         })}
       </div>
-
-      {/* Save Patches Prompt */}
-      {showSavePrompt && patchesCount > 0 && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-card p-6 rounded-lg border border-border max-w-md w-full mx-4">
-            <h3 className="text-lg font-semibold mb-2 text-card-foreground">
-              Workflow Repaired
-            </h3>
-            <p className="text-sm text-muted-foreground mb-4">
-              The workflow was repaired during execution ({patchesCount} selector{patchesCount !== 1 ? 's' : ''} updated).
-              Would you like to save these changes?
-            </p>
-            <div className="flex gap-2">
-              <button
-                onClick={handleSavePatches}
-                className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90"
-              >
-                Save Changes
-              </button>
-              <button
-                onClick={handleDiscardPatches}
-                className="flex-1 px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700"
-              >
-                Discard
-              </button>
-            </div>
-          </div>
-        </div>
+      
+      {/* Disambiguation Modal */}
+      {disambiguationData && (
+        <DisambiguationModal
+          candidates={disambiguationData.candidates}
+          stepDescription={disambiguationData.stepDescription}
+          onSelect={handleDisambiguationSelect}
+          onCancel={handleDisambiguationCancel}
+        />
       )}
     </div>
   );
