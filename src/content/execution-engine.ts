@@ -12,7 +12,7 @@ import { TextMatcher } from './text-matcher';
 import { VisualWait } from '../lib/visual-wait';
 import { visualFlowTracker } from '../lib/visual-flow';
 import { aiConfig } from '../lib/ai-config';
-import type { WorkflowStep, WorkflowIntent, AIEvidence, WorkflowStepPayload } from '../types/workflow';
+import type { WorkflowStep, WorkflowIntent, AIEvidence } from '../types/workflow';
 import { isWorkflowStepPayload } from '../types/workflow';
 import type { WorkflowVariables } from '../lib/variable-detector';
 
@@ -1120,13 +1120,6 @@ export class ExecutionEngine {
     await this.executeInputAgentic(step);
   }
 
-  /**
-   * Execute a KEYBOARD step (legacy method - used by adaptive execution)
-   * Delegates to agentic method for consistency
-   */
-  private async executeKeyboard(step: WorkflowStep): Promise<void> {
-    await this.executeKeyboardAgentic(step);
-  }
 
   /**
    * Wait for element to appear

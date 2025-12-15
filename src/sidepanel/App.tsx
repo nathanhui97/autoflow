@@ -35,8 +35,6 @@ function App() {
     setConnectionStatus,
     setError,
     setLastPingTime,
-    addWorkflowStep,
-    updateWorkflowStep,
     clearWorkflowSteps,
     loadWorkflow,
     setSavedWorkflows,
@@ -44,8 +42,6 @@ function App() {
     removeSavedWorkflow,
     setCurrentWorkflowName,
     setIsRecording,
-    setAIValuationPending,
-    setStepEnhanced,
   } = useExtensionStore();
 
   const [isPinging, setIsPinging] = useState(false);
@@ -145,6 +141,7 @@ function App() {
   }, [currentWorkflowVariables]);
 
   // Listen for RECORDED_STEP, UPDATE_STEP, and AI validation messages from content script
+  // Note: Empty dependency array ensures listener is only registered once on mount
   useEffect(() => {
     const handleMessage = (
       message: RecordedStepMessage | UpdateStepMessage | AIValidationStartedMessage | AIValidationCompletedMessage | StepEnhancedMessage | CorrectionSavedMessage | ElementFindFailedMessage,
@@ -152,23 +149,24 @@ function App() {
       _sendResponse: (response?: any) => void
     ) => {
       if (message.type === 'RECORDED_STEP' && message.payload?.step) {
-        addWorkflowStep(message.payload.step);
+        // Use the store actions directly instead of from hook to avoid stale closures
+        useExtensionStore.getState().addWorkflowStep(message.payload.step);
       } else if (message.type === 'UPDATE_STEP' && message.payload?.stepId && message.payload?.step) {
-        updateWorkflowStep(message.payload.stepId, message.payload.step);
+        useExtensionStore.getState().updateWorkflowStep(message.payload.stepId, message.payload.step);
         // Mark as enhanced when step is updated with AI suggestions
         if (isWorkflowStepPayload(message.payload.step.payload) && message.payload.step.payload.fallbackSelectors?.length > 0) {
-          setStepEnhanced(message.payload.stepId);
+          useExtensionStore.getState().setStepEnhanced(message.payload.stepId);
         }
       } else if (message.type === 'AI_VALIDATION_STARTED' && message.payload?.stepId) {
-        setAIValuationPending(message.payload.stepId, true);
+        useExtensionStore.getState().setAIValuationPending(message.payload.stepId, true);
       } else if (message.type === 'AI_VALIDATION_COMPLETED' && message.payload?.stepId) {
-        setAIValuationPending(message.payload.stepId, false);
+        useExtensionStore.getState().setAIValuationPending(message.payload.stepId, false);
         if (message.payload.enhanced) {
-          setStepEnhanced(message.payload.stepId);
+          useExtensionStore.getState().setStepEnhanced(message.payload.stepId);
         }
       } else if (message.type === 'STEP_ENHANCED' && message.payload?.stepId) {
-        setAIValuationPending(message.payload.stepId, false);
-        setStepEnhanced(message.payload.stepId);
+        useExtensionStore.getState().setAIValuationPending(message.payload.stepId, false);
+        useExtensionStore.getState().setStepEnhanced(message.payload.stepId);
       } else if (message.type === 'CORRECTION_SAVED') {
         setCorrectionModeStep(null);
         setLearningFeedback('✓ Correction saved! The extension will learn from this.');
@@ -183,13 +181,15 @@ function App() {
     };
 
     // Listen for messages from content script
+    console.log('[App] Registering message listener');
     chrome.runtime.onMessage.addListener(handleMessage);
 
     // Cleanup listener on unmount
     return () => {
+      console.log('[App] Removing message listener');
       chrome.runtime.onMessage.removeListener(handleMessage);
     };
-  }, [addWorkflowStep, updateWorkflowStep, setAIValuationPending, setStepEnhanced]);
+  }, []); // Empty deps array - listener registered only once on mount
 
   // Helper function to check if current page is a spreadsheet domain
   const isSpreadsheetDomain = (url: string): boolean => {

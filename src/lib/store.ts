@@ -72,9 +72,22 @@ export const useExtensionStore = create<ExtensionStore>((set) => ({
   },
 
   addWorkflowStep: (step: WorkflowStep) => {
-    set((state) => ({
-      workflowSteps: [...state.workflowSteps, step],
-    }));
+    set((state) => {
+      // Prevent duplicate steps based on timestamp (within 100ms window)
+      const stepTimestamp = step.payload.timestamp;
+      const isDuplicate = state.workflowSteps.some(
+        (existingStep) => Math.abs(existingStep.payload.timestamp - stepTimestamp) < 100
+      );
+      
+      if (isDuplicate) {
+        console.warn('[Store] Prevented duplicate step addition:', step.type, stepTimestamp);
+        return state; // Return unchanged state
+      }
+      
+      return {
+        workflowSteps: [...state.workflowSteps, step],
+      };
+    });
   },
 
   updateWorkflowStep: (stepId: string, step: WorkflowStep) => {
