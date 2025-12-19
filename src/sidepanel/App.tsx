@@ -6,9 +6,11 @@ import { CorrectionMemory } from '../lib/correction-memory';
 import { VariableDetector } from '../lib/variable-detector';
 import { NavigationOptimizer } from '../lib/navigation-optimizer';
 import { VariableInputForm } from './VariableInputForm';
+import { ScreenshotModal } from './ScreenshotModal';
 import type { ExtensionState } from '../types/state';
 import type { WorkflowStep, SavedWorkflow } from '../types/workflow';
 import { isWorkflowStepPayload } from '../types/workflow';
+import type { AgentAction } from '../lib/ai-agent';
 import type { 
   RecordedStepMessage, 
   UpdateStepMessage,
@@ -68,6 +70,25 @@ function App() {
     steps: WorkflowStep[];
   }>({ workflow: null, steps: [] });
   const [isExecuting, setIsExecuting] = useState(false);
+  // Screenshot modal state
+  const [screenshotModalStep, setScreenshotModalStep] = useState<{ step: WorkflowStep; index: number } | null>(null);
+  // Optimization toggle state
+  const [useOptimizedSteps, setUseOptimizedSteps] = useState<Record<string, boolean>>({});
+  // AI Agent execution state
+  const [isAgentRunning, setIsAgentRunning] = useState(false);
+  const [_agentProgress, setAgentProgress] = useState<{
+    stepNumber: number;
+    action: AgentAction | null;
+    status: 'thinking' | 'acting' | 'completed' | 'failed';
+  } | null>(null);
+  const [agentLog, setAgentLog] = useState<Array<{
+    time: string;
+    action: string;
+    status: 'success' | 'failed' | 'info';
+    reasoning?: string;
+  }>>([]);
+  // Mode selection: 'selector' (legacy) or 'agent' (AI-powered)
+  const [executionMode, setExecutionMode] = useState<'selector' | 'agent'>('agent');
 
   // Ping content script on mount
   useEffect(() => {
@@ -141,15 +162,38 @@ function App() {
     }
   }, [currentWorkflowVariables]);
 
-  // Listen for RECORDED_STEP, UPDATE_STEP, and AI validation messages from content script
+  // Listen for RECORDED_STEP, UPDATE_STEP, AI validation, and agent messages from content script
   // Note: Empty dependency array ensures listener is only registered once on mount
   useEffect(() => {
     const handleMessage = (
-      message: RecordedStepMessage | UpdateStepMessage | AIValidationStartedMessage | AIValidationCompletedMessage | StepEnhancedMessage | CorrectionSavedMessage | ElementFindFailedMessage,
+      message: RecordedStepMessage | UpdateStepMessage | AIValidationStartedMessage | AIValidationCompletedMessage | StepEnhancedMessage | CorrectionSavedMessage | ElementFindFailedMessage | any,
       _sender: chrome.runtime.MessageSender,
       _sendResponse: (response?: any) => void
     ) => {
-      if (message.type === 'RECORDED_STEP' && message.payload?.step) {
+      if (message.type === 'AGENT_EXECUTION_COMPLETED' && message.payload) {
+        // AI Agent finished executing
+        const result = message.payload;
+        console.log('[App] Agent execution completed:', result);
+        
+        setIsAgentRunning(false);
+        setIsExecuting(false);
+        setState('IDLE');
+        setAgentProgress(null);
+        
+        setAgentLog(prev => [...prev, {
+          time: new Date().toLocaleTimeString(),
+          action: `Completed: ${result.stepsCompleted}/${result.totalSteps} steps`,
+          status: result.success ? 'success' : 'failed',
+          reasoning: result.error,
+        }]);
+        
+        if (result.success) {
+          setLearningFeedback('✓ AI Agent completed workflow successfully');
+        } else {
+          setLearningFeedback(`⚠️ AI Agent: ${result.stepsCompleted}/${result.totalSteps} steps completed`);
+        }
+        setTimeout(() => setLearningFeedback(null), 5000);
+      } else if (message.type === 'RECORDED_STEP' && message.payload?.step) {
         // Use the store actions directly instead of from hook to avoid stale closures
         useExtensionStore.getState().addWorkflowStep(message.payload.step);
       } else if (message.type === 'UPDATE_STEP' && message.payload?.stepId && message.payload?.step) {
@@ -659,6 +703,85 @@ function App() {
     workflow: SavedWorkflow,
     variableValues?: Record<string, string>
   ) => {
+    // Route to appropriate execution mode
+    if (executionMode === 'agent') {
+      await executeWithAgent(workflow, variableValues);
+    } else {
+      await executeWithSelectors(steps, workflow, variableValues);
+    }
+  };
+
+  /**
+   * Execute workflow using AI Agent (observe-act loop)
+   */
+  const executeWithAgent = async (
+    workflow: SavedWorkflow,
+    variableValues?: Record<string, string>
+  ) => {
+    setIsAgentRunning(true);
+    setIsExecuting(true);
+    setState('EXECUTING');
+    setAgentLog([]);
+    setAgentProgress(null);
+    
+    const addLog = (action: string, status: 'success' | 'failed' | 'info', reasoning?: string) => {
+      setAgentLog(prev => [...prev, {
+        time: new Date().toLocaleTimeString(),
+        action,
+        status,
+        reasoning,
+      }]);
+    };
+    
+    try {
+      // Get the active tab to send message to its content script
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id) {
+        throw new Error('No active tab found');
+      }
+      
+      addLog('Starting AI Agent execution...', 'info');
+      
+      // Send execution message to content script using AI Agent
+      // Note: Agent runs in background, completion comes via AGENT_EXECUTION_COMPLETED message
+      const response = await runtimeBridge.sendMessage(
+        {
+          type: 'EXECUTE_WORKFLOW_AGENT',
+          payload: {
+            workflow,
+            variableValues,
+          },
+        },
+        tab.id
+      );
+      
+      if (!response.success) {
+        addLog(`Failed to start agent: ${response.error}`, 'failed');
+        throw new Error(response.error || 'Failed to start AI Agent');
+      }
+      
+      addLog('AI Agent is running...', 'info');
+      // Completion will be handled by AGENT_EXECUTION_COMPLETED message listener
+    } catch (err) {
+      console.error('AI Agent execution error:', err);
+      addLog(err instanceof Error ? err.message : 'Unknown error', 'failed');
+      setError(err instanceof Error ? err.message : 'Failed to execute workflow');
+    } finally {
+      setIsAgentRunning(false);
+      setIsExecuting(false);
+      setState('IDLE');
+      setAgentProgress(null);
+    }
+  };
+
+  /**
+   * Execute workflow using legacy selector-based execution
+   */
+  const executeWithSelectors = async (
+    steps: WorkflowStep[],
+    workflow: SavedWorkflow,
+    variableValues?: Record<string, string>
+  ) => {
     setIsExecuting(true);
     setState('EXECUTING');
     
@@ -669,12 +792,15 @@ function App() {
         throw new Error('No active tab found');
       }
       
-      // Use optimized steps if available, fallback to original steps
-      const stepsToExecute = workflow.optimizedSteps || steps;
-      const isOptimized = !!workflow.optimizedSteps;
+      // Use optimized steps if available AND user wants to use them
+      const shouldUseOptimized = useOptimizedSteps[workflow.id] !== false; // Default to true if not set
+      const stepsToExecute = (workflow.optimizedSteps && shouldUseOptimized) ? workflow.optimizedSteps : steps;
+      const isOptimized = !!(workflow.optimizedSteps && shouldUseOptimized);
       
       if (isOptimized) {
         console.log(`[ExecuteWorkflow] Using optimized steps (${stepsToExecute.length} vs ${steps.length} original)`);
+      } else if (workflow.optimizedSteps) {
+        console.log(`[ExecuteWorkflow] Using original steps (user disabled optimization)`);
       }
       
       console.log('[ExecuteWorkflow] Using Universal Execution Engine');
@@ -939,6 +1065,10 @@ function App() {
                 );
                 const isVariable = !!variableDef;
                 
+                // Check if this step has a visual snapshot
+                const hasScreenshot = isWorkflowStepPayload(step.payload) && 
+                  (step.payload.visualSnapshot?.viewport || step.payload.visualSnapshot?.elementSnippet);
+                
                 return (
                   <div 
                     key={index} 
@@ -977,6 +1107,19 @@ function App() {
                         )}
                       </div>
                       <div className="flex items-center gap-2">
+                        {/* Screenshot Button */}
+                        {hasScreenshot && (
+                          <button
+                            onClick={() => setScreenshotModalStep({ step, index })}
+                            className="p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors"
+                            title="View screenshot"
+                          >
+                            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                            </svg>
+                          </button>
+                        )}
                         {isPending && (
                           <div className="flex items-center gap-1 text-yellow-600 text-xs">
                             <svg className="animate-spin h-3 w-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -1225,6 +1368,103 @@ function App() {
           </div>
         )}
 
+        {/* Execution Mode Toggle */}
+        {savedWorkflows.length > 0 && (
+          <div className="mb-6 p-4 bg-card rounded-lg border border-border">
+            <h2 className="text-lg font-semibold mb-3 text-card-foreground flex items-center gap-2">
+              <svg className="h-5 w-5 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+              </svg>
+              Execution Mode
+            </h2>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setExecutionMode('agent')}
+                className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                  executionMode === 'agent'
+                    ? 'bg-purple-600 text-white'
+                    : 'bg-muted text-muted-foreground hover:bg-muted/80'
+                }`}
+              >
+                <div className="flex items-center justify-center gap-2">
+                  <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                  </svg>
+                  AI Agent
+                </div>
+                <div className="text-xs opacity-80 mt-0.5">Observe → Think → Act</div>
+              </button>
+              <button
+                onClick={() => setExecutionMode('selector')}
+                className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                  executionMode === 'selector'
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-muted text-muted-foreground hover:bg-muted/80'
+                }`}
+              >
+                <div className="flex items-center justify-center gap-2">
+                  <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+                  </svg>
+                  Selectors
+                </div>
+                <div className="text-xs opacity-80 mt-0.5">CSS/XPath based</div>
+              </button>
+            </div>
+            <p className="text-xs text-muted-foreground mt-2">
+              {executionMode === 'agent' 
+                ? '🤖 AI observes each page and decides what to do next. More adaptive to UI changes.'
+                : '⚡ Uses recorded CSS selectors directly. Faster but less adaptive.'}
+            </p>
+          </div>
+        )}
+
+        {/* AI Agent Log */}
+        {agentLog.length > 0 && (
+          <div className="mb-6 p-4 bg-card rounded-lg border border-purple-200">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-lg font-semibold text-card-foreground flex items-center gap-2">
+                <svg className="h-5 w-5 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                </svg>
+                AI Agent Log
+                {isAgentRunning && (
+                  <span className="flex items-center gap-1 text-sm text-purple-600">
+                    <span className="animate-pulse">●</span> Running
+                  </span>
+                )}
+              </h2>
+              <button
+                onClick={() => setAgentLog([])}
+                className="text-xs text-muted-foreground hover:text-foreground"
+              >
+                Clear
+              </button>
+            </div>
+            <div className="space-y-1 max-h-48 overflow-y-auto text-sm">
+              {agentLog.map((entry, i) => (
+                <div key={i} className={`flex items-start gap-2 p-1.5 rounded ${
+                  entry.status === 'success' ? 'bg-green-50' :
+                  entry.status === 'failed' ? 'bg-red-50' : 'bg-gray-50'
+                }`}>
+                  <span className="text-xs text-muted-foreground whitespace-nowrap">{entry.time}</span>
+                  <span className={`${
+                    entry.status === 'success' ? 'text-green-700' :
+                    entry.status === 'failed' ? 'text-red-700' : 'text-gray-700'
+                  }`}>
+                    {entry.action}
+                  </span>
+                  {entry.reasoning && (
+                    <span className="text-xs text-muted-foreground truncate" title={entry.reasoning}>
+                      - {entry.reasoning}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Saved Workflows */}
         <div className="mb-6 p-4 bg-card rounded-lg border border-border">
           <h2 className="text-lg font-semibold mb-4 text-card-foreground">
@@ -1265,6 +1505,31 @@ function App() {
                       </div>
                     </div>
                   </div>
+                  {/* Optimization Toggle */}
+                  {workflow.optimizedSteps && workflow.optimizationMetadata && workflow.optimizationMetadata.stepsRemoved > 0 && (
+                    <div className="mb-2 p-2 bg-yellow-50 dark:bg-yellow-900/20 rounded border border-yellow-200 dark:border-yellow-700">
+                      <label className="flex items-center gap-2 text-sm cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={useOptimizedSteps[workflow.id] !== false}
+                          onChange={(e) => {
+                            setUseOptimizedSteps({
+                              ...useOptimizedSteps,
+                              [workflow.id]: e.target.checked,
+                            });
+                          }}
+                          className="rounded"
+                        />
+                        <span className="text-yellow-800 dark:text-yellow-200">
+                          Use optimized version ({workflow.optimizedSteps.length} steps)
+                        </span>
+                      </label>
+                      <p className="text-xs text-yellow-700 dark:text-yellow-300 mt-1 ml-6">
+                        ⚠️ Uncheck if modal/state-dependent steps fail. Original has {workflow.steps.length} steps.
+                      </p>
+                    </div>
+                  )}
+                  
                   <div className="flex gap-2 mt-2">
                     <button
                       onClick={() => handleLoadWorkflow(workflow)}
@@ -1508,6 +1773,16 @@ function App() {
               </div>
             </div>
           </div>
+        )}
+
+        {/* Screenshot Modal */}
+        {screenshotModalStep && (
+          <ScreenshotModal
+            step={screenshotModalStep.step}
+            stepIndex={screenshotModalStep.index}
+            isOpen={true}
+            onClose={() => setScreenshotModalStep(null)}
+          />
         )}
       </div>
     </div>

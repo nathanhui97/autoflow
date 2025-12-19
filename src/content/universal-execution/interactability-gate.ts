@@ -475,3 +475,6 @@ function isInteractiveElement(element: Element): boolean {
   return false;
 }
 
+
+
+

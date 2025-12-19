@@ -12,7 +12,7 @@ import type {
   ActionOptions,
 } from '../../../types/universal-types';
 import { checkInteractability, findClickableAncestor } from '../interactability-gate';
-import { detectAnyStateChange, waitForCondition } from '../state-verifier';
+import { detectAnyStateChange } from '../state-verifier';
 
 // ============================================================================
 // Main Click Execution
@@ -34,6 +34,42 @@ export async function executeClick(
   let targetElement = element;
   let interactability = checkInteractability(targetElement);
   
+  // CRITICAL FIX: Special handling for dropdown options (role="option")
+  // Options inside scrollable listboxes need to be scrolled into view FIRST
+  const elementRole = targetElement.getAttribute('role');
+  if (elementRole === 'option' || elementRole === 'menuitem') {
+    console.log('[SimpleClick] Detected dropdown option/menu item, checking if in scrollable container...');
+    
+    // Find parent listbox/menu
+    const listbox = targetElement.closest('[role="listbox"], [role="menu"], [role="listitem"]');
+    if (listbox) {
+      console.log('[SimpleClick] Found parent listbox/menu, scrolling option into view...');
+      
+      // Scroll the option into view within the listbox
+      (targetElement as HTMLElement).scrollIntoView({ block: 'nearest', behavior: 'instant' });
+      await sleep(150);
+      
+      // Also ensure the listbox itself is visible in the viewport
+      if (listbox instanceof HTMLElement) {
+        const listboxRect = listbox.getBoundingClientRect();
+        const isListboxVisible = listboxRect.top >= 0 && 
+                                 listboxRect.bottom <= window.innerHeight &&
+                                 listboxRect.left >= 0 && 
+                                 listboxRect.right <= window.innerWidth;
+        
+        if (!isListboxVisible) {
+          console.log('[SimpleClick] Listbox not fully visible, scrolling listbox into view...');
+          listbox.scrollIntoView({ block: 'center', behavior: 'instant' });
+          await sleep(150);
+        }
+      }
+      
+      // Re-check interactability after scrolling
+      interactability = checkInteractability(targetElement);
+      console.log('[SimpleClick] After scrolling dropdown option - interactable:', interactability.ok);
+    }
+  }
+  
   if (!interactability.ok) {
     // Try to find a clickable ancestor (handles wrapper divs)
     const clickableAncestor = findClickableAncestor(element);
@@ -43,27 +79,65 @@ export async function executeClick(
     }
     
     if (!interactability.ok) {
-      return {
-        success: false,
-        actionType: 'click',
-        elapsedMs: Date.now() - startTime,
-        strategiesTried: [],
-        error: `Element not interactable: ${interactability.reason}`,
-      };
+      // If element is obscured, try scrolling it into view
+      if (interactability.reason?.includes('obscured')) {
+        console.log('[SimpleClick] Element obscured, scrolling into view...');
+        (targetElement as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await sleep(300);
+        
+        // Re-check interactability after scrolling
+        interactability = checkInteractability(targetElement);
+        
+        if (!interactability.ok) {
+          // Try scrolling more aggressively
+          window.scrollBy({ top: -100, behavior: 'smooth' });
+          await sleep(200);
+          interactability = checkInteractability(targetElement);
+        }
+      }
+      
+      if (!interactability.ok) {
+        return {
+          success: false,
+          actionType: 'click',
+          elapsedMs: Date.now() - startTime,
+          strategiesTried: ['scroll-into-view'],
+          error: `Element not interactable: ${interactability.reason}`,
+        };
+      }
     }
   }
 
   // Determine where to click
   const clickPosition = getClickPosition(targetElement, signature);
+  
+  console.log(`[SimpleClick] Clicking element: ${targetElement.tagName}.${targetElement.className?.toString().split(' ')[0] || ''}`);
+  console.log(`[SimpleClick] Click position:`, clickPosition);
 
-  // Define click strategies in order of preference
+  // CRITICAL: Find the ACTUAL element at the click coordinates
+  // React often wraps elements and the wrapper might not handle clicks properly
+  let clickTarget = targetElement;
+  if (clickPosition.x && clickPosition.y) {
+    const elementAtPoint = document.elementFromPoint(clickPosition.x, clickPosition.y);
+    if (elementAtPoint && elementAtPoint !== targetElement) {
+      // Found a different element at the coordinates - this might be the real target
+      console.log(`[SimpleClick] Found different element at coordinates: ${elementAtPoint.tagName}.${elementAtPoint.className?.toString().split(' ')[0] || ''}`);
+      // Check if it's inside our target or vice versa
+      if (targetElement.contains(elementAtPoint) || elementAtPoint.contains(targetElement)) {
+        clickTarget = elementAtPoint;
+        console.log(`[SimpleClick] Using element at coordinates as click target`);
+      }
+    }
+  }
+
+  // Simplified click strategies - just try the most effective ones
   const strategies = [
-    { name: 'native-click', fn: () => nativeClick(targetElement) },
-    { name: 'focus-click', fn: () => focusAndClick(targetElement) },
-    { name: 'mouse-event', fn: () => dispatchClickEvent(targetElement, clickPosition) },
-    { name: 'pointer-sequence', fn: () => dispatchPointerSequence(targetElement, clickPosition) },
-    { name: 'focus-enter', fn: () => focusAndEnter(targetElement) },
-    { name: 'focus-space', fn: () => focusAndSpace(targetElement) },
+    // Native click on element at coordinates (most reliable)
+    { name: 'native-click', fn: () => nativeClick(clickTarget) },
+    // Full pointer sequence (for React)
+    { name: 'pointer-sequence', fn: () => dispatchPointerSequence(clickTarget, clickPosition) },
+    // Focus and click
+    { name: 'focus-click', fn: () => focusAndClick(clickTarget) },
   ];
 
   // Try each strategy
@@ -155,26 +229,7 @@ async function focusAndClick(element: Element): Promise<void> {
 }
 
 /**
- * Strategy 3: Dispatch MouseEvent click
- */
-async function dispatchClickEvent(
-  element: Element,
-  position: { x: number; y: number }
-): Promise<void> {
-  const clickEvent = new MouseEvent('click', {
-    bubbles: true,
-    cancelable: true,
-    view: window,
-    clientX: position.x,
-    clientY: position.y,
-    button: 0,
-  });
-  
-  element.dispatchEvent(clickEvent);
-}
-
-/**
- * Strategy 4: Full pointer event sequence
+ * Strategy 3: Full pointer event sequence
  */
 async function dispatchPointerSequence(
   element: Element,
@@ -244,68 +299,6 @@ async function dispatchPointerSequence(
     clientX: position.x,
     clientY: position.y,
     button: 0,
-  }));
-}
-
-/**
- * Strategy 5: Focus and press Enter
- */
-async function focusAndEnter(element: Element): Promise<void> {
-  if (!(element instanceof HTMLElement)) {
-    throw new Error('Cannot focus non-HTML element');
-  }
-  
-  element.focus();
-  await sleep(50);
-  
-  // Keydown
-  element.dispatchEvent(new KeyboardEvent('keydown', {
-    bubbles: true,
-    cancelable: true,
-    key: 'Enter',
-    code: 'Enter',
-    keyCode: 13,
-  }));
-  await sleep(10);
-  
-  // Keyup
-  element.dispatchEvent(new KeyboardEvent('keyup', {
-    bubbles: true,
-    cancelable: true,
-    key: 'Enter',
-    code: 'Enter',
-    keyCode: 13,
-  }));
-}
-
-/**
- * Strategy 6: Focus and press Space
- */
-async function focusAndSpace(element: Element): Promise<void> {
-  if (!(element instanceof HTMLElement)) {
-    throw new Error('Cannot focus non-HTML element');
-  }
-  
-  element.focus();
-  await sleep(50);
-  
-  // Keydown
-  element.dispatchEvent(new KeyboardEvent('keydown', {
-    bubbles: true,
-    cancelable: true,
-    key: ' ',
-    code: 'Space',
-    keyCode: 32,
-  }));
-  await sleep(10);
-  
-  // Keyup
-  element.dispatchEvent(new KeyboardEvent('keyup', {
-    bubbles: true,
-    cancelable: true,
-    key: ' ',
-    code: 'Space',
-    keyCode: 32,
   }));
 }
 
@@ -470,4 +463,5 @@ function isVisible(element: Element): boolean {
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+
 

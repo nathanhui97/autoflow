@@ -45,7 +45,7 @@ export async function executeKeyboardAction(
 
     // Dispatch keydown
     const keydownEvent = new KeyboardEvent('keydown', eventOptions);
-    const keydownResult = element.dispatchEvent(keydownEvent);
+    element.dispatchEvent(keydownEvent);
     await sleep(20);
 
     // For character keys, also dispatch keypress

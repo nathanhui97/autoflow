@@ -143,3 +143,6 @@ Look for these logs when recording dropdown interactions:
   - Cascading selects (country → state → city)
   - Any UI where opening a list and selecting an option are separate clicks
 
+
+
+

@@ -8,7 +8,8 @@
     "scripting",
     "storage",
     "sidePanel",
-    "tabs"
+    "tabs",
+    "debugger"
   ],
   "action": {},
   "side_panel": {

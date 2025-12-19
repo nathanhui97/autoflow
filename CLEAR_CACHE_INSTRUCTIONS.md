@@ -65,3 +65,6 @@ If you still see the old hash, Chrome is aggressively caching. Try:
 - Use Chrome in Incognito mode (extensions work there too)
 - Check if you have multiple Chrome profiles and are using the right one
 
+
+
+

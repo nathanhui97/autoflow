@@ -11,7 +11,7 @@ import { ElementTextCapture } from './element-text';
 // WaitConditionDeterminer removed - StateWaitEngine handles waits at execution time
 import { IframeUtils } from './iframe-utils';
 import { ContextScanner } from './context-scanner';
-import { VisualSnapshotService } from './visual-snapshot';
+import { VisualSnapshotService, type AnnotatedCaptureResult } from './visual-snapshot';
 import { AIService } from '../lib/ai-service';
 import { VisualAnalysisService } from '../lib/visual-analysis';
 import { DOMDistiller } from '../lib/dom-distiller';
@@ -63,6 +63,9 @@ export class RecordingManager {
   private currentInputElement: Element | null = null; // Track which element we're editing
   // Visual Snapshot Cache: Promise-based cache for snapshots captured on mousedown
   private pendingSnapshot: Promise<{ viewport: string; elementSnippet: string } | null> | null = null;
+  // Visual Annotation: Store annotated snapshot with click markers
+  private pendingAnnotatedSnapshot: Promise<AnnotatedCaptureResult | null> | null = null;
+  private pendingClickPoint: { x: number; y: number } | null = null;
   // AI Validation: Track pending validations to wait before saving
   private pendingValidations: Promise<void>[] = [];
   // Phase 4: Human-like visual understanding
@@ -323,11 +326,13 @@ export class RecordingManager {
   private isListItemOrOption(element: Element): boolean {
     const role = element.getAttribute('role');
     if (role === 'option' || role === 'menuitem' || role === 'listitem') {
+      console.log('🔍 GhostWriter: Element is list item/option (by role):', role);
       return true;
     }
 
     const tagName = element.tagName.toLowerCase();
     if (tagName === 'li' || tagName === 'option') {
+      console.log('🔍 GhostWriter: Element is list item/option (by tag):', tagName);
       return true;
     }
 
@@ -338,6 +343,7 @@ export class RecordingManager {
         className.includes('list-item') ||
         className.includes('dropdown-item') ||
         className.includes('select-option')) {
+      console.log('🔍 GhostWriter: Element is list item/option (by class):', className.substring(0, 50));
       return true;
     }
 
@@ -346,11 +352,21 @@ export class RecordingManager {
     // They just use div elements inside a [role="listbox"] or [role="menu"] container
     const container = element.closest('[role="listbox"], [role="menu"], [role="list"], select, [data-baseui="listbox"], [data-baseui="menu"]');
     if (container && element !== container) {
+      // ENHANCED LOGGING: Show container details
+      const containerInfo = {
+        tag: container.tagName,
+        role: container.getAttribute('role'),
+        label: container.getAttribute('aria-label'),
+        id: container.id,
+        elementTag: element.tagName,
+        elementText: (element as HTMLElement).textContent?.trim().substring(0, 50),
+      };
+      
       // If we're inside a dropdown container, this is very likely a dropdown option
       // Be permissive: any clickable element inside a listbox/menu is probably an option
       // This catches cases where the option is a div inside a listbox without explicit roles
       if (this.isInteractiveElement(element)) {
-        console.log('GhostWriter: Detected dropdown option inside container:', container.tagName, 'Role:', container.getAttribute('role'), 'Element:', element.tagName);
+        console.log('🔍 GhostWriter: Detected dropdown option inside container:', containerInfo);
         return true;
       }
       
@@ -358,7 +374,7 @@ export class RecordingManager {
       // Some dropdowns use non-interactive divs that become clickable via event handlers
       const isDirectChild = element.parentElement === container;
       if (isDirectChild) {
-        console.log('GhostWriter: Detected direct child of dropdown container as option:', container.tagName, 'Role:', container.getAttribute('role'));
+        console.log('🔍 GhostWriter: Detected direct child of dropdown container as option:', containerInfo);
         return true;
       }
     }
@@ -370,6 +386,7 @@ export class RecordingManager {
       if (parentRole === 'listbox' || 
           parentRole === 'menu' || 
           parentRole === 'list') {
+        console.log('🔍 GhostWriter: Element is list item/option (parent has list role):', parentRole);
         return true;
       }
     }
@@ -447,11 +464,12 @@ export class RecordingManager {
   }
 
   /**
-   * Find the actual clickable element when clicking on an overlay
+   * Find the actual clickable element when clicking on an overlay (SYNCHRONOUS version)
+   * This version accepts pre-captured elements to avoid race conditions with disappearing dropdowns
    * If the element is invisible (overlay), find the widget/container underneath
    * Returns null if no visible, interactive target can be found
    */
-  private findActualClickableElement(element: Element, event: MouseEvent): Element | null {
+  private findActualClickableElementSync(element: Element, event: MouseEvent, elementsAtPoint: Element[]): Element | null {
     // Check if element is visible and not an overlay
     const isVisible = ElementStateCapture.isElementVisible(element);
     const isOverlay = this.isOverlayElement(element);
@@ -463,11 +481,23 @@ export class RecordingManager {
 
     // Element is invisible or is an overlay, try to find the actual clickable element
 
-    // Strategy 1: Use elementsFromPoint to get ALL elements at click coordinates
+    // Strategy 1: Use pre-captured elementsAtPoint (already captured synchronously)
     // This is more reliable than elementFromPoint (singular) which might return the overlay
     // PRIORITY: Prefer smaller, more specific elements (buttons, menu items) over large containers (widgets)
     try {
-      const elementsAtPoint = document.elementsFromPoint(event.clientX, event.clientY);
+      // ENHANCED LOGGING: Log all elements at this point for debugging
+      console.log('🔍 GhostWriter: Elements at click point (', event.clientX, ',', event.clientY, '):', 
+        elementsAtPoint.slice(0, 10).map(el => ({
+          tag: el.tagName,
+          role: el.getAttribute('role'),
+          text: (el as HTMLElement).textContent?.trim().substring(0, 30),
+          classes: el.className?.toString().substring(0, 50),
+          isVisible: ElementStateCapture.isElementVisible(el),
+          isOverlay: this.isOverlayElement(el),
+          isListItem: this.isListItemOrOption(el),
+          size: `${el.getBoundingClientRect().width}x${el.getBoundingClientRect().height}`
+        }))
+      );
       
       // Filter for visible, interactive elements that are not overlays
       // CRITICAL: Be permissive for list items/options (portal elements)
@@ -482,6 +512,8 @@ export class RecordingManager {
         
         return this.isInteractiveElement(el); // Must be interactive
       });
+      
+      console.log('🔍 GhostWriter: Filtered to', visibleElements.length, 'visible, interactive elements');
       
       if (visibleElements.length > 0) {
         // PRIORITY: Prefer smaller, more specific elements over large containers
@@ -509,10 +541,275 @@ export class RecordingManager {
           return aSize - bSize;
         });
         
+        // ENHANCED LOGGING: Show all candidates and why the selected one was chosen
+        console.log('🔍 GhostWriter: Sorted candidates:', sorted.slice(0, 5).map((el, idx) => {
+          const tag = el.tagName.toLowerCase();
+          const role = el.getAttribute('role');
+          const rect = el.getBoundingClientRect();
+          const isSpecific = tag === 'button' || tag === 'a' || role === 'button' || role === 'menuitem' || role === 'option';
+          return {
+            rank: idx + 1,
+            tag,
+            role,
+            text: (el as HTMLElement).textContent?.trim().substring(0, 30),
+            size: `${rect.width}x${rect.height}`,
+            isSpecific,
+            isListItem: this.isListItemOrOption(el),
+          };
+        }));
+        
         const selected = sorted[0];
         const selectedTag = selected.tagName.toLowerCase();
         const selectedRole = selected.getAttribute('role');
-        console.log('GhostWriter: Selected element from elementsFromPoint:', selectedTag, 'Role:', selectedRole, 'Size:', selected.getBoundingClientRect().width, 'x', selected.getBoundingClientRect().height);
+        const selectedText = (selected as HTMLElement).textContent?.trim().substring(0, 50);
+        console.log('✅ GhostWriter: Selected element from elementsFromPoint:', selectedTag, 'Role:', selectedRole, 'Text:', selectedText, 'Size:', selected.getBoundingClientRect().width, 'x', selected.getBoundingClientRect().height);
+        
+        // ENHANCED LOGGING: Check if there are multiple dropdown containers
+        const dropdownContainers = elementsAtPoint.filter(el => 
+          el.getAttribute('role') === 'listbox' || 
+          el.getAttribute('role') === 'menu' ||
+          el.getAttribute('role') === 'combobox'
+        );
+        if (dropdownContainers.length > 1) {
+          console.warn('⚠️ GhostWriter: Multiple dropdown containers detected at click point!', {
+            count: dropdownContainers.length,
+            containers: dropdownContainers.map(el => ({
+              role: el.getAttribute('role'),
+              label: el.getAttribute('aria-label'),
+              id: el.id,
+            }))
+          });
+        }
+        
+        return selected;
+      }
+    } catch (error) {
+      console.warn('GhostWriter: Error using elementsFromPoint:', error);
+    }
+
+    // Strategy 2: Traverse up the DOM to find interactive elements (buttons, menu items) FIRST
+    // Only fall back to widget containers if no interactive element is found
+    let current: Element | null = element.parentElement;
+    let level = 0;
+    const maxLevels = 10;
+    let foundInteractiveElement: Element | null = null;
+    const widgetTags = ['gs-report-widget-element', 'gs-widget', 'widget', 'gridster-item'];
+
+    while (current && level < maxLevels && current !== document.body) {
+      const tagName = current.tagName.toLowerCase();
+      const role = current.getAttribute('role');
+      
+      // PRIORITY: Look for actual interactive elements (buttons, menu items, etc.)
+      // These should be preferred over widget containers
+      const isInteractive = this.isInteractiveElement(current);
+      const isButton = tagName === 'button' || role === 'button' || role === 'menuitem';
+      const isMenuItem = role === 'menuitem' || role === 'option' || role === 'listitem';
+      const isLink = tagName === 'a' || role === 'link';
+      
+      if (isInteractive && (isButton || isMenuItem || isLink)) {
+        // Found an actual interactive element - prefer this over widget containers
+        if (ElementStateCapture.isElementVisible(current)) {
+          foundInteractiveElement = current;
+          // Continue searching to see if there's a more specific element (closer to click)
+        }
+      }
+      
+      // Only check for widget containers if we haven't found an interactive element yet
+      if (!foundInteractiveElement && widgetTags.some(wt => tagName.includes(wt))) {
+        // Check if it's visible and interactive
+        if (ElementStateCapture.isElementVisible(current) && this.isInteractiveElement(current)) {
+          // Only use widget as fallback if no interactive element was found
+          if (level < 3) {
+            // Widget is close to the element, might be the actual target
+            // But prefer interactive elements found later
+            current = current.parentElement;
+            level++;
+            continue;
+          }
+        }
+      }
+
+      current = current.parentElement;
+      level++;
+    }
+    
+    // Return the interactive element if found, otherwise continue to Strategy 3
+    if (foundInteractiveElement) {
+      console.log('GhostWriter: Found interactive element in parent hierarchy:', foundInteractiveElement.tagName, 'Role:', foundInteractiveElement.getAttribute('role'));
+      return foundInteractiveElement;
+    }
+
+    // Strategy 3: If element is an overlay, search for widget elements in parent hierarchy
+    if (isOverlay) {
+      let parent: Element | null = element.parentElement;
+      level = 0;
+      while (parent && level < 5 && parent !== document.body) {
+        // Look for widget elements within the parent
+        for (const widgetTag of widgetTags) {
+          const widget = parent.querySelector(widgetTag);
+          if (widget && ElementStateCapture.isElementVisible(widget) && this.isInteractiveElement(widget)) {
+            return widget;
+          }
+        }
+        parent = parent.parentElement;
+        level++;
+      }
+    }
+
+      // Strategy 4: Try to find any visible, interactive element near the click point
+      // This is a last resort - look for siblings or nearby elements
+      try {
+        const rect = element.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        const centerY = rect.top + rect.height / 2;
+        
+        // Try elementsFromPoint at the center of the element
+        const elementsAtCenter = document.elementsFromPoint(centerX, centerY);
+        for (const el of elementsAtCenter) {
+          if (el === element) continue;
+          if (this.isOverlayElement(el)) continue;
+          
+          // Check if visible and interactive
+          if (ElementStateCapture.isElementVisible(el) && this.isInteractiveElement(el)) {
+            return el;
+          }
+        }
+      } catch (error) {
+        // Ignore errors in fallback strategy
+      }
+
+      // CRITICAL: If the original element is a list item/option, return it even if visibility checks fail
+      // Portal elements might have visibility quirks, but we still want to record them
+      if (this.isListItemOrOption(element)) {
+        console.log('GhostWriter: Returning list item/option element despite visibility/overlay checks (portal element)');
+        return element;
+      }
+
+      // If no better target found, return null (caller will skip recording)
+      console.warn('GhostWriter: Could not find visible, interactive element for click. Original element:', element.tagName, 'Visible:', isVisible, 'Overlay:', isOverlay);
+      return null;
+  }
+
+  /**
+   * DEPRECATED: Find the actual clickable element when clicking on an overlay (LEGACY async version)
+   * This method is no longer used - replaced by findActualClickableElementSync to avoid race conditions
+   * Kept for reference only
+   * @deprecated Use findActualClickableElementSync to prevent dropdown race conditions
+   */
+  // @ts-ignore - Deprecated method kept for reference
+  private _DEPRECATED_findActualClickableElement(element: Element, event: MouseEvent): Element | null {
+    // Check if element is visible and not an overlay
+    const isVisible = ElementStateCapture.isElementVisible(element);
+    const isOverlay = this.isOverlayElement(element);
+    
+    // If visible and not an overlay, return as-is
+    if (isVisible && !isOverlay && this.isInteractiveElement(element)) {
+      return element;
+    }
+
+    // Element is invisible or is an overlay, try to find the actual clickable element
+
+    // Strategy 1: Use elementsFromPoint to get ALL elements at click coordinates
+    // This is more reliable than elementFromPoint (singular) which might return the overlay
+    // PRIORITY: Prefer smaller, more specific elements (buttons, menu items) over large containers (widgets)
+    try {
+      const elementsAtPoint = document.elementsFromPoint(event.clientX, event.clientY);
+      
+      // ENHANCED LOGGING: Log all elements at this point for debugging
+      console.log('🔍 GhostWriter: Elements at click point (', event.clientX, ',', event.clientY, '):', 
+        elementsAtPoint.slice(0, 10).map(el => ({
+          tag: el.tagName,
+          role: el.getAttribute('role'),
+          text: (el as HTMLElement).textContent?.trim().substring(0, 30),
+          classes: el.className?.toString().substring(0, 50),
+          isVisible: ElementStateCapture.isElementVisible(el),
+          isOverlay: this.isOverlayElement(el),
+          isListItem: this.isListItemOrOption(el),
+          size: `${el.getBoundingClientRect().width}x${el.getBoundingClientRect().height}`
+        }))
+      );
+      
+      // Filter for visible, interactive elements that are not overlays
+      // CRITICAL: Be permissive for list items/options (portal elements)
+      const visibleElements = elementsAtPoint.filter(el => {
+        if (el === element) return false; // Skip the original overlay element
+        if (this.isOverlayElement(el)) return false; // Skip other overlays
+        
+        // For list items/options, be more permissive with visibility
+        const isListItemOrOption = this.isListItemOrOption(el);
+        const isVisible = ElementStateCapture.isElementVisible(el);
+        if (!isVisible && !isListItemOrOption) return false; // Must be visible (unless list item/option)
+        
+        return this.isInteractiveElement(el); // Must be interactive
+      });
+      
+      console.log('🔍 GhostWriter: Filtered to', visibleElements.length, 'visible, interactive elements');
+      
+      if (visibleElements.length > 0) {
+        // PRIORITY: Prefer smaller, more specific elements over large containers
+        // Sort by: buttons/menu items first, then by size (smaller = more specific)
+        const sorted = visibleElements.sort((a, b) => {
+          const aTag = a.tagName.toLowerCase();
+          const bTag = b.tagName.toLowerCase();
+          const aRole = a.getAttribute('role');
+          const bRole = b.getAttribute('role');
+          
+          // Prioritize buttons, menu items, links
+          const aIsSpecific = aTag === 'button' || aTag === 'a' || aRole === 'button' || aRole === 'menuitem' || aRole === 'option';
+          const bIsSpecific = bTag === 'button' || bTag === 'a' || bRole === 'button' || bRole === 'menuitem' || bRole === 'option';
+          
+          if (aIsSpecific && !bIsSpecific) return -1;
+          if (!aIsSpecific && bIsSpecific) return 1;
+          
+          // If both are specific or both are not, prefer smaller elements (more specific)
+          const aRect = a.getBoundingClientRect();
+          const bRect = b.getBoundingClientRect();
+          const aSize = aRect.width * aRect.height;
+          const bSize = bRect.width * bRect.height;
+          
+          // Prefer smaller elements (they're more specific)
+          return aSize - bSize;
+        });
+        
+        // ENHANCED LOGGING: Show all candidates and why the selected one was chosen
+        console.log('🔍 GhostWriter: Sorted candidates:', sorted.slice(0, 5).map((el, idx) => {
+          const tag = el.tagName.toLowerCase();
+          const role = el.getAttribute('role');
+          const rect = el.getBoundingClientRect();
+          const isSpecific = tag === 'button' || tag === 'a' || role === 'button' || role === 'menuitem' || role === 'option';
+          return {
+            rank: idx + 1,
+            tag,
+            role,
+            text: (el as HTMLElement).textContent?.trim().substring(0, 30),
+            size: `${rect.width}x${rect.height}`,
+            isSpecific,
+            isListItem: this.isListItemOrOption(el),
+          };
+        }));
+        
+        const selected = sorted[0];
+        const selectedTag = selected.tagName.toLowerCase();
+        const selectedRole = selected.getAttribute('role');
+        const selectedText = (selected as HTMLElement).textContent?.trim().substring(0, 50);
+        console.log('✅ GhostWriter: Selected element from elementsFromPoint:', selectedTag, 'Role:', selectedRole, 'Text:', selectedText, 'Size:', selected.getBoundingClientRect().width, 'x', selected.getBoundingClientRect().height);
+        
+        // ENHANCED LOGGING: Check if there are multiple dropdown containers
+        const dropdownContainers = elementsAtPoint.filter(el => 
+          el.getAttribute('role') === 'listbox' || 
+          el.getAttribute('role') === 'menu' ||
+          el.getAttribute('role') === 'combobox'
+        );
+        if (dropdownContainers.length > 1) {
+          console.warn('⚠️ GhostWriter: Multiple dropdown containers detected at click point!', {
+            count: dropdownContainers.length,
+            containers: dropdownContainers.map(el => ({
+              role: el.getAttribute('role'),
+              label: el.getAttribute('aria-label'),
+              id: el.id,
+            }))
+          });
+        }
         
         return selected;
       }
@@ -675,6 +972,9 @@ export class RecordingManager {
    * Handle click events
    * IMPORTANT: Using capture phase (useCapture: true) to catch events before React/Base UI stops propagation
    * This is critical for dropdown options that might have stopPropagation() called
+   * 
+   * CRITICAL FIX: Capture element SYNCHRONOUSLY before async processing
+   * This prevents race conditions where dropdowns close before element detection completes
    */
   private handleClick(event: MouseEvent): void {
     if (!this.isRecording) {
@@ -684,77 +984,92 @@ export class RecordingManager {
 
     console.log('GhostWriter: Click event received, processing...');
 
+    // CRITICAL: Capture element and all detection data SYNCHRONOUSLY before dropdown can close
+    // This fixes the race condition where dropdown options disappear before async processing
+    const actualElement = this.getActualElement(event);
+    if (!actualElement) {
+      console.warn('GhostWriter: No actual element found for click event');
+      return;
+    }
+    
+    console.log('GhostWriter: Processing click on element:', actualElement.tagName, 'Classes:', actualElement.className?.toString()?.substring(0, 50));
+    
+    // Pre-check if this is a list item/option (before async processing)
+    let isListItemOrOption = this.isListItemOrOption(actualElement);
+    
+    // CRITICAL: Check if the last step was a dropdown trigger - if so, this click is likely a dropdown item
+    const wasDropdownTrigger = (this.lastStep && isWorkflowStepPayload(this.lastStep.payload) && (
+      this.lastStep.payload.elementRole === 'combobox' ||
+      this.lastStep.payload.elementRole === 'listbox' ||
+      this.lastStep.payload.selector?.includes('[role="combobox"]') ||
+      this.lastStep.payload.selector?.includes('[role="listbox"]') ||
+      this.lastStep.payload.selector?.includes('[role="menu"]')
+    )) || false;
+    
+    // If last step was a dropdown trigger and this click is within 2 seconds, treat it as a dropdown item
+    const timeSinceLastStep = this.lastStep ? (Date.now() - this.lastStep.payload.timestamp) : Infinity;
+    if (wasDropdownTrigger && timeSinceLastStep < 2000) {
+      console.log('GhostWriter: Last step was dropdown trigger - treating this click as dropdown item');
+      isListItemOrOption = true; // Force treat as dropdown item
+    }
+    
+    // Capture all elements at click point NOW (before dropdown closes)
+    let elementsAtClickPoint: Element[] = [];
+    try {
+      elementsAtClickPoint = document.elementsFromPoint(event.clientX, event.clientY);
+      console.log('🔍 GhostWriter: Captured', elementsAtClickPoint.length, 'elements at click point synchronously');
+    } catch (error) {
+      console.warn('GhostWriter: Error capturing elements at click point:', error);
+    }
+    
+    // Find clickable element NOW (before dropdown closes)
+    let clickableElement: Element | null;
+    if (isListItemOrOption) {
+      // For list items/options, use the element directly (portals might not pass visibility checks)
+      // Only try overlay piercing if it's clearly an overlay
+      if (this.isOverlayElement(actualElement)) {
+        clickableElement = this.findActualClickableElementSync(actualElement, event, elementsAtClickPoint);
+      } else {
+        clickableElement = actualElement;
+      }
+    } else {
+      clickableElement = this.findActualClickableElementSync(actualElement, event, elementsAtClickPoint);
+    }
+    
+    if (!clickableElement) {
+      console.warn('GhostWriter: No clickable element found synchronously. Original element:', actualElement.tagName);
+      return;
+    }
+    
+    console.log('GhostWriter: Clickable element found synchronously:', clickableElement.tagName, 'Text:', (clickableElement as HTMLElement).textContent?.trim()?.substring(0, 50));
+
+    // CRITICAL: Capture visibility state SYNCHRONOUSLY (before modal/dropdown closes)
+    // If we successfully found the element synchronously, it WAS visible at click time
+    const wasVisibleAtClickTime = ElementStateCapture.isElementVisible(clickableElement);
+    console.log('GhostWriter: Element visibility at click time:', wasVisibleAtClickTime);
+
     // Process asynchronously to avoid blocking the click event
     // Use requestIdleCallback or setTimeout(0) to ensure event can propagate
     // Note: We're in capture phase, so we see the event before it reaches the target
     const processClick = async () => {
       try {
-        // Get actual element (handles Shadow DOM)
-        const actualElement = this.getActualElement(event);
-        if (!actualElement) {
-          console.warn('GhostWriter: No actual element found for click event');
-          return;
-        }
-        
-        console.log('GhostWriter: Processing click on element:', actualElement.tagName, 'Classes:', actualElement.className?.toString()?.substring(0, 50));
-
-        // Check if this is a list item/option FIRST (before filtering)
-        // This is critical for dropdown options in portals
-        let isListItemOrOption = this.isListItemOrOption(actualElement);
-        
-        // CRITICAL: Check if the last step was a dropdown trigger - if so, this click is likely a dropdown item
-        const wasDropdownTrigger = (this.lastStep && isWorkflowStepPayload(this.lastStep.payload) && (
-          this.lastStep.payload.elementRole === 'combobox' ||
-          this.lastStep.payload.elementRole === 'listbox' ||
-          this.lastStep.payload.selector?.includes('[role="combobox"]') ||
-          this.lastStep.payload.selector?.includes('[role="listbox"]') ||
-          this.lastStep.payload.selector?.includes('[role="menu"]')
-        )) || false;
-        
-        // If last step was a dropdown trigger and this click is within 2 seconds, treat it as a dropdown item
-        const timeSinceLastStep = this.lastStep ? (Date.now() - this.lastStep.payload.timestamp) : Infinity;
-        if (wasDropdownTrigger && timeSinceLastStep < 2000) {
-          console.log('GhostWriter: Last step was dropdown trigger - treating this click as dropdown item');
-          isListItemOrOption = true; // Force treat as dropdown item
-        }
-        
-        // Find the actual clickable element (handles overlay clicks)
-        // BUT: For list items/options, be more permissive - they might be in portals
-        let clickableElement: Element | null;
-        if (isListItemOrOption) {
-          // For list items/options, use the element directly (portals might not pass visibility checks)
-          // Only try overlay piercing if it's clearly an overlay
-          if (this.isOverlayElement(actualElement)) {
-            clickableElement = this.findActualClickableElement(actualElement, event);
-          } else {
-            clickableElement = actualElement;
-          }
-        } else {
-          clickableElement = this.findActualClickableElement(actualElement, event);
-        }
-        
-        // Final visibility check - but be permissive for list items/options
-        // Portal elements might have visibility quirks, but we still want to record them
-        if (!clickableElement) {
-          console.warn('GhostWriter: No clickable element found. Original element:', actualElement.tagName);
-          return;
-        }
-        
-        console.log('GhostWriter: Clickable element found:', clickableElement.tagName, 'Text:', (clickableElement as HTMLElement).textContent?.trim()?.substring(0, 50));
+        // Use the already-captured element and detection data
+        // This prevents race conditions where dropdown closes before we can detect it
+        // All element detection was done SYNCHRONOUSLY before dropdown could close
         
         // RE-CHECK: Verify the final clickable element is also a list item/option
-        // This is important because findActualClickableElement might have found a different element
+        // This is important because findActualClickableElementSync might have found a different element
         const finalIsListItemOrOption = isListItemOrOption || this.isListItemOrOption(clickableElement);
         
-        // For list items/options, be more lenient with visibility checks
-        // They might be in portals with different visibility contexts
-        const isVisible = ElementStateCapture.isElementVisible(clickableElement);
-        if (!isVisible && !finalIsListItemOrOption) {
-          console.warn('GhostWriter: Skipping click on invisible element. Original element:', actualElement.tagName, 'Clickable element:', clickableElement.tagName);
-          return; // Don't record invisible elements (unless it's a list item/option)
+        // CRITICAL FIX: Use the visibility state captured synchronously, not the current state
+        // By the time async processing happens, modals/dropdowns may have closed
+        // But if the element was visible at click time (wasVisibleAtClickTime), that's what matters
+        if (!wasVisibleAtClickTime && !finalIsListItemOrOption) {
+          console.warn('GhostWriter: Skipping click on element that was invisible at click time. Original element:', actualElement.tagName, 'Clickable element:', clickableElement.tagName);
+          return; // Don't record elements that were invisible at click time
         }
         
-        console.log('GhostWriter: Element is visible, proceeding with recording...');
+        console.log('GhostWriter: Element was visible at click time, proceeding with recording...');
         
         // Log if we're recording a list item/option (for debugging)
         if (finalIsListItemOrOption) {
@@ -775,10 +1090,41 @@ export class RecordingManager {
           const text = target.textContent?.trim()?.substring(0, 100) || '';
           console.log('GhostWriter: List item/option detected - Role:', role, 'Class:', className.substring(0, 50), 'Text:', text);
           
-          // Find parent container to log
-          const container = target.closest('[role="listbox"], [role="menu"], [role="list"], ul, ol, select');
+          // Find parent container to log and validate
+          const container = target.closest('[role="listbox"], [role="menu"], [role="list"], ul, ol, select, [data-baseui="listbox"], [data-baseui="menu"]');
           if (container) {
-            console.log('GhostWriter: Found container:', container.tagName, 'Role:', container.getAttribute('role'));
+            const containerInfo = {
+              tag: container.tagName,
+              role: container.getAttribute('role'),
+              id: container.id,
+              label: container.getAttribute('aria-label'),
+              labelledBy: container.getAttribute('aria-labelledby'),
+              expanded: container.getAttribute('aria-expanded'),
+            };
+            console.log('GhostWriter: Found container:', containerInfo);
+            
+            // VALIDATION: Check if multiple dropdown containers are visible
+            const allVisibleDropdowns = Array.from(
+              document.querySelectorAll('[role="listbox"], [role="menu"], [data-baseui="listbox"], [data-baseui="menu"]')
+            ).filter(el => {
+              const style = window.getComputedStyle(el as HTMLElement);
+              return style.display !== 'none' && style.visibility !== 'hidden';
+            });
+            
+            if (allVisibleDropdowns.length > 1) {
+              console.warn('⚠️ GhostWriter: Multiple visible dropdowns detected!', {
+                count: allVisibleDropdowns.length,
+                thisContainerIndex: allVisibleDropdowns.indexOf(container),
+                containers: allVisibleDropdowns.map(c => ({
+                  role: c.getAttribute('role'),
+                  label: c.getAttribute('aria-label'),
+                  id: c.id,
+                  text: (c as HTMLElement).textContent?.trim().substring(0, 30),
+                }))
+              });
+            }
+          } else {
+            console.warn('⚠️ GhostWriter: List item/option detected but no container found! This might indicate wrong element detection.');
           }
         }
 
@@ -806,6 +1152,48 @@ export class RecordingManager {
           similarElements = ElementSimilarity.findSimilarElements(target);
           uniquenessScore = ElementSimilarity.getUniquenessScore(target, similarElements);
           disambiguationAttrs = ElementSimilarity.getDisambiguationAttributes(target, similarElements);
+          
+          // ENHANCEMENT: For dropdown options, capture the dropdown container details
+          if (finalIsListItemOrOption && context) {
+            const dropdownContainer = target.closest('[role="listbox"], [role="menu"], [role="list"], select, [data-baseui="listbox"], [data-baseui="menu"]');
+            if (dropdownContainer) {
+              // Find the associated trigger (combobox) if available
+              const containerId = dropdownContainer.id;
+              const containerAriaLabel = dropdownContainer.getAttribute('aria-label');
+              let triggerElement: Element | null = null;
+              
+              // Try to find trigger by aria-controls
+              if (containerId) {
+                triggerElement = document.querySelector(`[aria-controls="${containerId}"]`);
+              }
+              
+              // Try to find trigger by labelledby relationship
+              if (!triggerElement && dropdownContainer.getAttribute('aria-labelledby')) {
+                const labelId = dropdownContainer.getAttribute('aria-labelledby');
+                const label = labelId ? document.getElementById(labelId) : null;
+                if (label) {
+                  // Trigger might be near the label
+                  triggerElement = label.querySelector('[role="combobox"], [role="button"]') || 
+                                   label.closest('[role="combobox"], [role="button"]') ||
+                                   label.parentElement?.querySelector('[role="combobox"], [role="button"]') || null;
+                }
+              }
+              
+              // Store dropdown container info in context
+              if (!context.dropdownContainer) {
+                context.dropdownContainer = {
+                  selector: SelectorEngine.generateSelectors(dropdownContainer).primary,
+                  role: dropdownContainer.getAttribute('role') || undefined,
+                  id: dropdownContainer.id || undefined,
+                  label: containerAriaLabel || undefined,
+                  triggerLabel: triggerElement?.getAttribute('aria-label') || 
+                                (triggerElement as HTMLElement)?.textContent?.trim() || undefined,
+                };
+                
+                console.log('✅ GhostWriter: Captured dropdown container info:', context.dropdownContainer);
+              }
+            }
+          }
         } catch (contextError) {
           console.warn('GhostWriter: Error capturing context, continuing with basic recording:', contextError);
         }
@@ -1102,84 +1490,108 @@ export class RecordingManager {
           const shouldTreatAsDropdownItem = finalIsListItemOrOption || 
             (wasDropdownTrigger && timeSinceLastStep < 2000);
           
+          // Capture click coordinates for annotation
+          const clickPoint = this.pendingClickPoint || { x: event.clientX, y: event.clientY };
+          
           if (shouldTreatAsDropdownItem) {
             // For dropdown items, capture a fresh snapshot to ensure we get the actual dropdown item
             try {
-              console.log('📸 GhostWriter: Capturing fresh snapshot for dropdown item');
+              console.log('📸 GhostWriter: Capturing fresh annotated snapshot for dropdown item');
               console.log('📸 GhostWriter: Dropdown detection - finalIsListItemOrOption:', finalIsListItemOrOption, 'wasDropdownTrigger:', wasDropdownTrigger);
               console.log('📸 GhostWriter: Target element:', target.tagName, 'Text:', target.textContent?.trim()?.substring(0, 50));
-              const visuals = await VisualSnapshotService.capture(target);
-              if (visuals) {
+              
+              // Use captureWithAnnotation for dropdown items
+              const annotatedResult = await VisualSnapshotService.captureWithAnnotation(
+                target,
+                clickPoint,
+                'select' // Dropdown selections use 'select' action type
+              );
+              
+              if (annotatedResult) {
                 visualSnapshot = {
-                  viewport: visuals.viewport,
-                  elementSnippet: visuals.elementSnippet,
-                  timestamp: Date.now(),
-                  viewportSize: {
-                    width: window.innerWidth,
-                    height: window.innerHeight
-                  },
-                  elementBounds: elementBounds
+                  viewport: annotatedResult.viewport,
+                  elementSnippet: annotatedResult.elementSnippet,
+                  timestamp: annotatedResult.timestamp,
+                  viewportSize: annotatedResult.viewportSize,
+                  elementBounds: annotatedResult.elementBounds,
+                  // Phase 7: Visual annotations for AI Visual Click
+                  annotated: annotatedResult.annotatedViewport,
+                  annotatedSnippet: annotatedResult.annotatedSnippet,
+                  clickPoint: annotatedResult.clickPoint,
+                  actionType: 'select',
                 };
-                console.log('📸 GhostWriter: Fresh snapshot captured for dropdown item, size:', visuals.elementSnippet?.length || 0, 'chars');
+                console.log('📸 GhostWriter: Fresh annotated snapshot captured for dropdown item');
+                console.log('📸 GhostWriter: Has annotated viewport:', !!annotatedResult.annotatedViewport);
               } else {
-                console.warn('📸 GhostWriter: Visual snapshot service returned null for dropdown item');
+                console.warn('📸 GhostWriter: Annotated snapshot service returned null for dropdown item');
               }
-              // Clear the pending snapshot since we're not using it
+              // Clear the pending snapshots
               this.pendingSnapshot = null;
+              this.pendingAnnotatedSnapshot = null;
+              this.pendingClickPoint = null;
             } catch (err) {
-              console.warn('📸 GhostWriter: Failed to capture fresh snapshot for dropdown item:', err);
+              console.warn('📸 GhostWriter: Failed to capture fresh annotated snapshot for dropdown item:', err);
               // Fallback to mousedown snapshot if available
-              if (this.pendingSnapshot) {
+              if (this.pendingAnnotatedSnapshot) {
                 try {
-                  const visuals = await this.pendingSnapshot;
-                  if (visuals) {
+                  const annotatedResult = await this.pendingAnnotatedSnapshot;
+                  if (annotatedResult) {
                     visualSnapshot = {
-                      viewport: visuals.viewport,
-                      elementSnippet: visuals.elementSnippet,
-                      timestamp: Date.now(),
-                      viewportSize: {
-                        width: window.innerWidth,
-                        height: window.innerHeight
-                      },
-                      elementBounds: elementBounds
+                      viewport: annotatedResult.viewport,
+                      elementSnippet: annotatedResult.elementSnippet,
+                      timestamp: annotatedResult.timestamp,
+                      viewportSize: annotatedResult.viewportSize,
+                      elementBounds: annotatedResult.elementBounds,
+                      annotated: annotatedResult.annotatedViewport,
+                      annotatedSnippet: annotatedResult.annotatedSnippet,
+                      clickPoint: annotatedResult.clickPoint,
+                      actionType: 'select',
                     };
-                    console.warn('📸 GhostWriter: Using fallback mousedown snapshot for dropdown item (may show wrong element)');
+                    console.warn('📸 GhostWriter: Using fallback mousedown annotated snapshot for dropdown item');
                   }
                 } catch (fallbackErr) {
-                  console.warn('📸 GhostWriter: Fallback to mousedown snapshot also failed:', fallbackErr);
+                  console.warn('📸 GhostWriter: Fallback to mousedown annotated snapshot also failed:', fallbackErr);
                 } finally {
                   this.pendingSnapshot = null;
+                  this.pendingAnnotatedSnapshot = null;
+                  this.pendingClickPoint = null;
                 }
               }
             }
-          } else if (this.pendingSnapshot) {
-            // For non-dropdown items, use the mousedown snapshot
+          } else if (this.pendingAnnotatedSnapshot) {
+            // For non-dropdown items, use the mousedown annotated snapshot
             try {
-              console.log('📸 GhostWriter: Awaiting snapshot from mousedown...');
-              const visuals = await this.pendingSnapshot;
-              if (visuals) {
+              console.log('📸 GhostWriter: Awaiting annotated snapshot from mousedown...');
+              const annotatedResult = await this.pendingAnnotatedSnapshot;
+              if (annotatedResult) {
                 visualSnapshot = {
-                  viewport: visuals.viewport,
-                  elementSnippet: visuals.elementSnippet,
-                  timestamp: Date.now(),
-                  viewportSize: {
-                    width: window.innerWidth,
-                    height: window.innerHeight
-                  },
-                  elementBounds: elementBounds
+                  viewport: annotatedResult.viewport,
+                  elementSnippet: annotatedResult.elementSnippet,
+                  timestamp: annotatedResult.timestamp,
+                  viewportSize: annotatedResult.viewportSize,
+                  elementBounds: annotatedResult.elementBounds,
+                  // Phase 7: Visual annotations for AI Visual Click
+                  annotated: annotatedResult.annotatedViewport,
+                  annotatedSnippet: annotatedResult.annotatedSnippet,
+                  clickPoint: annotatedResult.clickPoint,
+                  actionType: 'click',
                 };
-                console.log('📸 GhostWriter: Snapshot attached to click event');
+                console.log('📸 GhostWriter: Annotated snapshot attached to click event');
+                console.log('📸 GhostWriter: Has annotated viewport:', !!annotatedResult.annotatedViewport);
               } else {
-                console.warn('📸 GhostWriter: Snapshot promise resolved but returned null');
+                console.warn('📸 GhostWriter: Annotated snapshot promise resolved but returned null');
               }
             } catch (err) {
-              console.warn('📸 GhostWriter: Failed to get cached snapshot:', err);
+              console.warn('📸 GhostWriter: Failed to get cached annotated snapshot:', err);
             } finally {
               // Clear it after use
               this.pendingSnapshot = null;
+              this.pendingAnnotatedSnapshot = null;
+              this.pendingClickPoint = null;
             }
           } else {
-            console.log('📸 GhostWriter: No pending snapshot for click event');
+            console.log('📸 GhostWriter: No pending annotated snapshot for click event');
+            this.pendingClickPoint = null;
           }
 
           // Phase 6: Capture AI Evidence (context snapshot)
@@ -1432,11 +1844,34 @@ export class RecordingManager {
     const actualElement = this.getActualElement(event);
     if (!actualElement) return;
     
-    // Start capturing IMMEDIATELY. Do not await it here.
+    // Store click coordinates for annotation
+    this.pendingClickPoint = {
+      x: event.clientX,
+      y: event.clientY,
+    };
+    
+    // Start capturing IMMEDIATELY with annotation. Do not await it here.
     // Store the Promise so the Click handler can await it.
     // Users can't click two things at the exact same millisecond, so single Promise is sufficient
-    console.log('📸 GhostWriter: Starting snapshot capture on mousedown');
-    this.pendingSnapshot = VisualSnapshotService.capture(actualElement);
+    console.log('📸 GhostWriter: Starting annotated snapshot capture on mousedown at', this.pendingClickPoint);
+    
+    // Use captureWithAnnotation to get both original and annotated versions
+    this.pendingAnnotatedSnapshot = VisualSnapshotService.captureWithAnnotation(
+      actualElement,
+      this.pendingClickPoint,
+      'click' // Default action type, can be refined based on element type
+    );
+    
+    // Also keep legacy pendingSnapshot for backward compatibility
+    this.pendingSnapshot = this.pendingAnnotatedSnapshot.then(result => {
+      if (result) {
+        return {
+          viewport: result.viewport,
+          elementSnippet: result.elementSnippet,
+        };
+      }
+      return null;
+    });
   }
 
   /**

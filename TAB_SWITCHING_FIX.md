@@ -259,3 +259,6 @@ This fix ensures tab switching works on:
 **Status:** ✅ Fixed and tested  
 **Impact:** Multi-tab workflows now work on all websites including Salesforce
 
+
+
+

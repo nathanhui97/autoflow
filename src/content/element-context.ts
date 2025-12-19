@@ -40,6 +40,14 @@ export interface ElementContextData {
     fieldset?: string;
     section?: string;
   };
+  // Dropdown container context for dropdown options
+  dropdownContainer?: {
+    selector: string;
+    role?: string;
+    id?: string;
+    label?: string;
+    triggerLabel?: string;
+  };
 }
 
 export interface ContainerContext {

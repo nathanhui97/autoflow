@@ -129,16 +129,16 @@ export type {
   InstrumentationSummary 
 } from '../../lib/step-instrumentation';
 
-// Execution Engine
+// Execution Engine - now uses Universal Execution Engine
 export { 
-  VerifiedExecutionEngine, 
-  createVerifiedExecutionEngine 
-} from '../verified-execution-engine';
+  executeWorkflow,
+  convertLegacyStep,
+} from '../universal-execution';
 export type { 
-  StepExecutionResult, 
-  WorkflowExecutionResult, 
-  VerifiedExecutionConfig 
-} from '../verified-execution-engine';
+  WorkflowResult,
+  StepResult,
+  WorkflowOptions,
+} from '../../types/universal-types';
 
 // Builder Utilities
 export { buildLocatorBundle } from '../../lib/locator-builder';

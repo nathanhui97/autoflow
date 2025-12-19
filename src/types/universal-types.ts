@@ -168,6 +168,7 @@ export type ComponentPatternType =
   | 'DROPDOWN_SELECT'     // Single-select dropdown
   | 'MULTI_SELECT'        // Multi-select dropdown
   | 'AUTOCOMPLETE'        // Type-to-search + select
+  | 'TEXT_INPUT'          // Text input, textarea
   | 'DATE_PICKER'         // Date selection widget
   | 'TAB_SELECT'          // Tab panel switching
   | 'TOGGLE'              // Toggle/switch control
@@ -471,6 +472,26 @@ export interface ActionResult {
 }
 
 /**
+ * AI recovery information
+ */
+export interface AIRecoveryInfo {
+  /** Whether AI was used */
+  used: boolean;
+  /** Method that worked */
+  method?: 'ai-visual' | 'ai-semantic' | 'ai-structural' | 'learned-pattern' | 'coordinate-enhanced';
+  /** Confidence of AI match */
+  confidence?: number;
+  /** AI reasoning */
+  reasoning?: string;
+  /** Suggested fix for future runs */
+  suggestedFix?: {
+    type: 'selector' | 'coordinate' | 'wait' | 'scroll' | 'workflow';
+    description: string;
+    newValue?: string;
+  };
+}
+
+/**
  * Result of executing a workflow step
  */
 export interface StepResult {
@@ -488,6 +509,8 @@ export interface StepResult {
   elapsedMs: number;
   /** Error message if failed */
   error?: string;
+  /** AI recovery information */
+  aiRecovery?: AIRecoveryInfo;
 }
 
 /**
@@ -506,6 +529,26 @@ export interface WorkflowResult {
   totalElapsedMs: number;
   /** Failure summary if failed */
   failureSummary?: string;
+  /** AI-suggested workflow adjustments */
+  suggestedAdjustments?: WorkflowAdjustment[];
+}
+
+/**
+ * Suggested workflow adjustment from AI
+ */
+export interface WorkflowAdjustment {
+  /** Step index this adjustment applies to */
+  stepIndex: number;
+  /** Type of adjustment */
+  type: 'update-selector' | 'add-wait' | 'update-coordinates' | 'add-scroll';
+  /** Description of the adjustment */
+  description: string;
+  /** New value to apply */
+  newValue?: string;
+  /** Whether this was auto-applied */
+  autoApplied: boolean;
+  /** Confidence in this adjustment */
+  confidence: number;
 }
 
 // ============================================================================
@@ -531,6 +574,26 @@ export interface UniversalStep {
     timestamp: number;
     url: string;
     viewport?: { width: number; height: number };
+    /** Recorded click coordinates for fallback */
+    coordinates?: { x: number; y: number };
+    /** Element bounds for fallback */
+    elementBounds?: { x: number; y: number; width: number; height: number };
+    /** Visual snapshot with optional annotations for AI Visual Click */
+    visualSnapshot?: {
+      viewport?: string;
+      elementSnippet?: string;
+      timestamp: number;
+      viewportSize: { width: number; height: number };
+      elementBounds?: { x: number; y: number; width: number; height: number };
+      /** Annotated viewport with visual markers (red circle, crosshair) */
+      annotated?: string;
+      /** Annotated element snippet */
+      annotatedSnippet?: string;
+      /** Click point coordinates */
+      clickPoint?: { x: number; y: number };
+      /** Action type for marker styling */
+      actionType?: 'click' | 'double-click' | 'type' | 'select' | 'scroll';
+    };
   };
 }
 
@@ -580,5 +643,11 @@ export interface WorkflowOptions {
   onStepError?: (stepIndex: number, error: string) => void;
   /** Variable values for substitution */
   variableValues?: Record<string, string>;
+  /** Enable AI self-healing (auto-recovery when elements not found) */
+  enableAISelfHealing?: boolean;
+  /** Auto-apply AI-suggested adjustments to workflow */
+  autoApplyAdjustments?: boolean;
+  /** Callback for AI suggestions */
+  onAISuggestion?: (stepIndex: number, suggestion: WorkflowAdjustment) => void;
 }
 

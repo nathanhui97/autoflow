@@ -13,7 +13,6 @@ import type {
   ResolutionCandidate,
   ResolutionOptions,
 } from '../../types/universal-types';
-import { isSemanticInteractive } from './element-signature';
 
 // ============================================================================
 // Signal Weights for Scoring
@@ -71,8 +70,8 @@ export function resolveAcrossBoundaries(
         break;
         
       case 'shadow-host': {
-        const host = (context as Document | Element).querySelector(step.selector);
-        if (!host) {
+        const hostEl: Element | null = (context as Document | Element).querySelector(step.selector);
+        if (!hostEl) {
           return {
             status: 'not_found',
             triedMethods: ['shadow-host-lookup'],
@@ -80,27 +79,29 @@ export function resolveAcrossBoundaries(
           };
         }
         // Don't enter shadow root yet, just mark we found the host
-        context = host;
+        context = hostEl;
         break;
       }
         
       case 'shadow-root': {
-        if (!(context instanceof Element)) {
+        // Context should be an Element for shadow root access
+        const contextElement = context as Element;
+        if (!contextElement || typeof contextElement.shadowRoot === 'undefined') {
           return {
             status: 'not_found',
             triedMethods: ['shadow-root-access'],
             lastError: 'Expected element context for shadow root',
           };
         }
-        const shadowRoot = context.shadowRoot;
-        if (!shadowRoot) {
+        const sr = contextElement.shadowRoot;
+        if (!sr) {
           return {
             status: 'not_found',
             triedMethods: ['shadow-root-access'],
             lastError: 'Shadow root not accessible (closed mode?)',
           };
         }
-        context = shadowRoot;
+        context = sr;
         break;
       }
         

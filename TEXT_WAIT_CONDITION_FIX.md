@@ -144,3 +144,6 @@ Text-based wait conditions are fundamentally unreliable because:
 
 **The right approach:** Use selector-based element finding with semantic fallbacks, not text matching.
 
+
+
+

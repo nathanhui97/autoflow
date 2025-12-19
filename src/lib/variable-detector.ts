@@ -352,8 +352,18 @@ export class VariableDetector {
     const role = (payload.elementRole || '').toLowerCase();
     const selector = (payload.selector || '').toLowerCase();
     
+    // ENHANCED LOGGING: Show all detection criteria
+    const detectionInfo = {
+      elementText: elementText.substring(0, 50),
+      label: label.substring(0, 50),
+      role,
+      hasComboboxRole: role === 'combobox',
+      selectorHasCombobox: selector.includes('combobox'),
+    };
+    
     // Check for combobox role (strong indicator)
     if (role === 'combobox' || selector.includes('role="combobox"') || selector.includes("role='combobox'")) {
+      console.log('🔍 [VariableDetector] Identified as dropdown TRIGGER (combobox role):', detectionInfo);
       return true;
     }
     
@@ -368,7 +378,18 @@ export class VariableDetector {
                                  selector.includes('dropdown') ||
                                  (selector.includes('input') && selector.includes('listbox'));
     
-    return hasPlaceholderText || hasDropdownSelector;
+    const isTrigger = hasPlaceholderText || hasDropdownSelector;
+    
+    if (isTrigger) {
+      console.log('🔍 [VariableDetector] Identified as dropdown TRIGGER:', {
+        ...detectionInfo,
+        hasPlaceholderText,
+        hasDropdownSelector,
+        matchedPattern: placeholderPatterns.find(p => elementText.includes(p) || label.includes(p)),
+      });
+    }
+    
+    return isTrigger;
   }
   
   /**
@@ -381,28 +402,44 @@ export class VariableDetector {
   private static isDropdownOption(payload: WorkflowStepPayload): boolean {
     const role = (payload.elementRole || '').toLowerCase();
     const selector = (payload.selector || '').toLowerCase();
+    const elementText = (payload.elementText || '').substring(0, 50);
+    
+    // ENHANCED LOGGING: Show all detection criteria
+    const detectionInfo = {
+      elementText,
+      role,
+      hasOptionRole: role === 'option',
+      selectorHasOption: selector.includes('role="option"') || selector.includes("role='option'"),
+      selectorHasListbox: selector.includes('listbox'),
+      hasDecisionSpace: payload.context?.decisionSpace?.type === 'LIST_SELECTION',
+    };
     
     // Check for option role (strongest indicator)
     if (role === 'option') {
+      console.log('🔍 [VariableDetector] Identified as dropdown OPTION (option role):', detectionInfo);
       return true;
     }
     
     // Check selector for role='option' or role="option"
     if (selector.includes('role="option"') || selector.includes("role='option'") || 
         selector.includes('[role="option"]') || selector.includes("[role='option']")) {
+      console.log('🔍 [VariableDetector] Identified as dropdown OPTION (selector has option role):', detectionInfo);
       return true;
     }
     
     // Check for listbox context
     if (selector.includes('listbox')) {
+      console.log('🔍 [VariableDetector] Identified as dropdown OPTION (listbox in selector):', detectionInfo);
       return true;
     }
     
     // Check if decisionSpace indicates this is a list option
     if (payload.context?.decisionSpace?.type === 'LIST_SELECTION') {
+      console.log('🔍 [VariableDetector] Identified as dropdown OPTION (decisionSpace LIST_SELECTION):', detectionInfo);
       return true;
     }
     
+    console.log('🔍 [VariableDetector] NOT identified as dropdown option:', detectionInfo);
     return false;
   }
 

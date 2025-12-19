@@ -7,7 +7,6 @@
 
 import type {
   ActionResult,
-  TextInputPatternData,
   ActionOptions,
 } from '../../../types/universal-types';
 import { checkInteractability } from '../interactability-gate';
@@ -57,33 +56,31 @@ export async function executeTextInput(
       strategiesTried.push('clear');
     }
 
-    // Set value based on type
-    let success = false;
-    
+    // Set value based on type (result is verified later via getInputValue)
     switch (inputType) {
       case 'native-input':
       case 'native-textarea':
-        success = await setNativeInputValue(element as HTMLInputElement | HTMLTextAreaElement, value);
+        await setNativeInputValue(element as HTMLInputElement | HTMLTextAreaElement, value);
         strategiesTried.push('native-setter');
         break;
       
       case 'native-select':
-        success = await setSelectValue(element as HTMLSelectElement, value);
+        await setSelectValue(element as HTMLSelectElement, value);
         strategiesTried.push('select-setter');
         break;
       
       case 'contenteditable':
-        success = await setContentEditableValue(element as HTMLElement, value);
+        await setContentEditableValue(element as HTMLElement, value);
         strategiesTried.push('contenteditable');
         break;
       
       case 'react-controlled':
-        success = await setReactInputValue(element as HTMLInputElement, value);
+        await setReactInputValue(element as HTMLInputElement, value);
         strategiesTried.push('react-setter');
         break;
       
       default:
-        success = await setGenericInputValue(element, value);
+        await setGenericInputValue(element, value);
         strategiesTried.push('generic');
     }
 

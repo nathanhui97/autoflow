@@ -222,6 +222,46 @@ async function stopRecordingInAllTabs(): Promise<{ initialFullPageSnapshot?: str
   return { initialFullPageSnapshot: initialSnapshot };
 }
 
+/**
+ * Perform a click using Chrome Debugger API (sends real mouse events with isTrusted=true)
+ * Optimized: attach, click, detach immediately to avoid lag
+ */
+async function performDebuggerClick(tabId: number, x: number, y: number): Promise<void> {
+  try {
+    // Attach debugger
+    await chrome.debugger.attach({ tabId }, '1.3');
+    
+    try {
+      // Mouse down
+      await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+        type: 'mousePressed',
+        x,
+        y,
+        button: 'left',
+        clickCount: 1,
+      });
+
+      // Mouse up immediately (no delay needed)
+      await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+        type: 'mouseReleased',
+        x,
+        y,
+        button: 'left',
+        clickCount: 1,
+      });
+
+      console.log(`[Debugger] Click at (${x}, ${y})`);
+    } finally {
+      // Always detach immediately to prevent lag
+      await chrome.debugger.detach({ tabId }).catch(() => {});
+    }
+  } catch (error) {
+    // Detach on error too
+    await chrome.debugger.detach({ tabId }).catch(() => {});
+    throw error;
+  }
+}
+
 // Message routing: forward messages between sidepanel and content scripts
 chrome.runtime.onMessage.addListener(
   (
@@ -229,6 +269,32 @@ chrome.runtime.onMessage.addListener(
     sender: chrome.runtime.MessageSender,
     sendResponse: (response: MessageResponse) => void
   ) => {
+    // Handle DEBUGGER_CLICK request from content script
+    if (message.type === 'DEBUGGER_CLICK') {
+      const { x, y } = message as any;
+      const tabId = sender.tab?.id;
+      
+      if (!tabId) {
+        sendResponse({ success: false, error: 'No tab ID' });
+        return false;
+      }
+      
+      performDebuggerClick(tabId, x, y)
+        .then(() => sendResponse({ success: true }))
+        .catch((error) => sendResponse({ 
+          success: false, 
+          error: error instanceof Error ? error.message : 'Failed'
+        }));
+      
+      return true; // Keep channel open for async
+    }
+
+    // Handle DEBUGGER_DETACH - no-op (we detach immediately now)
+    if (message.type === 'DEBUGGER_DETACH') {
+      sendResponse({ success: true });
+      return false;
+    }
+
     // Handle CAPTURE_VIEWPORT request from content script
     if (message.type === 'CAPTURE_VIEWPORT') {
       if (!sender.tab) {

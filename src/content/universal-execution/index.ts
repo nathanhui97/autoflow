@@ -104,6 +104,7 @@ export {
 
 // Action Primitives
 export { executeClick } from './action-primitives/simple-click';
+export { executeHumanClick } from './action-primitives/human-click';
 export { executeDropdownSelect } from './action-primitives/dropdown-select';
 export { executeTextInput } from './action-primitives/text-input';
 export {

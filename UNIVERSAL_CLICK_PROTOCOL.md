@@ -231,3 +231,6 @@ Potential enhancements:
 
 By providing both, we achieve maximum compatibility with all frameworks and ensure clicks actually work like a human clicking would.
 
+
+
+

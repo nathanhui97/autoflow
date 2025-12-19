@@ -623,11 +623,12 @@ function buildXPath(element: Element): string {
   
   while (current && current !== document.body) {
     const tag = current.tagName.toLowerCase();
-    const parent = current.parentElement;
+    const parentEl: Element | null = current.parentElement;
     
-    if (parent) {
-      const sameTagSiblings = Array.from(parent.children)
-        .filter(child => child.tagName === current!.tagName);
+    if (parentEl) {
+      const currentTag = current.tagName;
+      const sameTagSiblings = Array.from(parentEl.children)
+        .filter(child => child.tagName === currentTag);
       
       if (sameTagSiblings.length > 1) {
         const index = sameTagSiblings.indexOf(current) + 1;
@@ -639,7 +640,7 @@ function buildXPath(element: Element): string {
       parts.unshift(tag);
     }
     
-    current = parent;
+    current = parentEl;
   }
   
   return '//' + parts.join('/');

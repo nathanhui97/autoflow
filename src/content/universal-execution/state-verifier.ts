@@ -83,7 +83,7 @@ function checkSingleOutcome(outcome: ExpectedOutcome): boolean {
     case 'attribute_contains': {
       const el = document.querySelector(outcome.selector);
       const attr = el?.getAttribute(outcome.attr);
-      return attr !== null && attr.includes(outcome.value);
+      return attr !== null && attr !== undefined && attr.includes(outcome.value);
     }
     
     case 'url_contains': {
@@ -203,8 +203,6 @@ function describeOutcome(outcome: ExpectedOutcome): string {
  * Capture the current state of an element
  */
 export function captureElementState(element: Element): CapturedElementState {
-  const htmlElement = element as HTMLElement;
-  
   return {
     className: element.className?.toString() || '',
     ariaExpanded: element.getAttribute('aria-expanded') || undefined,

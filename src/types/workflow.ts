@@ -183,6 +183,11 @@ export interface WorkflowStepPayload {
     timestamp: number; // When snapshot was taken
     viewportSize: { width: number; height: number }; // Viewport dimensions
     elementBounds?: ElementBounds; // Element position in viewport
+    // Phase 7: Visual annotations for AI Visual Click
+    annotated?: string; // Base64 data URL of viewport with visual markers (red circle, crosshair, etc.)
+    annotatedSnippet?: string; // Base64 data URL of element snippet with visual markers
+    clickPoint?: { x: number; y: number }; // Where user clicked (viewport coordinates)
+    actionType?: 'click' | 'double-click' | 'type' | 'select' | 'scroll'; // Type of action for marker styling
   };
   // Phase 4: Human-like visual understanding
   pageType?: PageType; // Page classification (form, dashboard, table, etc.)

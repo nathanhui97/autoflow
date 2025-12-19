@@ -14,14 +14,12 @@ import { resolveElement } from '../element-resolver';
 import { checkInteractability } from '../interactability-gate';
 import { 
   detectComponentLibrary, 
-  getLibraryMenuSelectors, 
   getLibraryOptionSelectors 
 } from '../component-detector';
 import {
   waitForDropdownMenu,
   verifyDropdownSelection,
   verifyDropdownClosed,
-  waitForDOMStable,
 } from '../state-verifier';
 
 // ============================================================================
@@ -92,6 +90,15 @@ export async function executeDropdownSelect(
   }
 
   const menu = openResult.menu;
+  if (!menu) {
+    return {
+      success: false,
+      actionType: 'dropdown-select',
+      elapsedMs: Date.now() - startTime,
+      strategiesTried,
+      error: 'Dropdown opened but menu element not found',
+    };
+  }
   console.log(`[DropdownSelect] Dropdown opened, menu found`);
 
   // Step 5: Find option in menu
@@ -171,7 +178,7 @@ interface OpenResult {
  */
 async function openDropdown(
   trigger: Element,
-  library: ComponentLibrary,
+  _library: ComponentLibrary,
   strategiesTried: string[]
 ): Promise<OpenResult> {
   // Check if already open
@@ -533,7 +540,7 @@ interface SelectResult {
  */
 async function selectOption(
   option: Element,
-  library: ComponentLibrary,
+  _library: ComponentLibrary,
   strategiesTried: string[]
 ): Promise<SelectResult> {
   const strategies = [
@@ -730,7 +737,7 @@ async function handleNativeSelect(
 /**
  * Try to close dropdown (for cleanup after errors)
  */
-async function closeDropdown(trigger: Element): Promise<void> {
+async function closeDropdown(_trigger: Element): Promise<void> {
   // Try escape key
   document.dispatchEvent(new KeyboardEvent('keydown', {
     bubbles: true,

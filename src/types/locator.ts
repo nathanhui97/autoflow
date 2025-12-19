@@ -304,3 +304,6 @@ export function isLikelyDynamicText(text: string): boolean {
   return dynamicPatterns.some(pattern => pattern.test(text));
 }
 
+
+
+

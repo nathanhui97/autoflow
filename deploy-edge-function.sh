@@ -59,6 +59,10 @@ npx supabase functions deploy generate_step_description
 echo "Deploying detect_variables function..."
 npx supabase functions deploy detect_variables
 
+# Deploy visual_click function (AI Visual Click for 95-99% accuracy)
+echo "Deploying visual_click function..."
+npx supabase functions deploy visual_click
+
 echo "✅ Deployment complete!"
 echo ""
 echo "Deployed functions:"
@@ -66,6 +70,7 @@ echo "  - recover_element"
 echo "  - validate_selector"
 echo "  - generate_step_description"
 echo "  - detect_variables"
+echo "  - visual_click (NEW - AI Visual Click)"
 echo ""
 echo "If deployment fails, make sure you're logged in:"
 echo "  npx supabase login"

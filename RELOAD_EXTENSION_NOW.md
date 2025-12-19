@@ -68,3 +68,6 @@ The duplicate detection now uses:
 This catches event bubbling duplicates while being tolerant of millisecond timing variations.
 
 
+
+
+

@@ -4,9 +4,14 @@
  * (html2canvas fails on Google Sheets canvas elements and cross-origin iframes)
  * 
  * Enhanced with full page capture and region extraction for human-like visual understanding
+ * 
+ * Now includes annotation capabilities for AI Visual Click:
+ * - Captures screenshots with visual markers showing where user clicked/typed
+ * - Provides both original and annotated versions for debugging and AI analysis
  */
 
 import type { PageRegions, BoundingBox } from '../types/visual';
+import { VisualAnnotationService, type ActionType } from '../lib/visual-annotation';
 
 export interface CaptureResult {
   viewport: string;
@@ -26,6 +31,42 @@ export interface RegionCapture {
   region: BoundingBox;
   screenshot: string; // Base64 cropped region
   name: string; // Region name (header, sidebar, etc.)
+}
+
+export interface MultiResolutionSnapshot {
+  /** Full viewport screenshot */
+  fullViewport: string;
+  /** 2x zoomed region around target area */
+  zoomedRegion?: string;
+  /** Tight crop around target area (for small elements) */
+  focusedCrop?: string;
+  /** Metadata about the snapshots */
+  metadata: {
+    viewportSize: { width: number; height: number };
+    zoomLevel?: number;
+    focusArea?: { x: number; y: number; width: number; height: number };
+  };
+}
+
+export interface AnnotatedCaptureResult {
+  /** Original viewport screenshot (unchanged) */
+  viewport: string;
+  /** Cropped element snippet (unchanged) */
+  elementSnippet: string;
+  /** Annotated viewport with visual markers */
+  annotatedViewport?: string;
+  /** Annotated element snippet with visual markers */
+  annotatedSnippet?: string;
+  /** Click point coordinates (in viewport space) */
+  clickPoint?: { x: number; y: number };
+  /** Action type that was annotated */
+  actionType?: ActionType;
+  /** Timestamp of capture */
+  timestamp: number;
+  /** Viewport dimensions */
+  viewportSize: { width: number; height: number };
+  /** Element bounds in viewport */
+  elementBounds?: BoundingBox;
 }
 
 export class VisualSnapshotService {
@@ -930,5 +971,363 @@ export class VisualSnapshotService {
    */
   static clearCache(): void {
     this.lastFullPageCapture = null;
+  }
+
+  /**
+   * Capture element with visual annotation showing where user clicked/typed
+   * 
+   * This is the main method for recording phase - captures both original
+   * and annotated screenshots for later use by AI Visual Click.
+   * 
+   * @param element - The element that was interacted with
+   * @param clickPoint - The exact coordinates where user clicked (in viewport space)
+   * @param actionType - Type of action ('click', 'type', 'select', etc.)
+   * @returns Promise with original and annotated screenshots
+   */
+  static async captureWithAnnotation(
+    element: Element,
+    clickPoint: { x: number; y: number },
+    actionType: ActionType = 'click'
+  ): Promise<AnnotatedCaptureResult | null> {
+    try {
+      // First, capture the standard screenshot
+      const standardCapture = await this.capture(element);
+      if (!standardCapture) {
+        console.warn('📸 GhostWriter: Failed to capture standard screenshot for annotation');
+        return null;
+      }
+
+      const rect = element.getBoundingClientRect();
+      const elementBounds: BoundingBox = {
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height,
+      };
+
+      // Create annotated viewport
+      let annotatedViewport: string | undefined;
+      try {
+        const viewportAnnotation = await VisualAnnotationService.annotate(
+          standardCapture.viewport,
+          {
+            actionType,
+            clickPoint,
+            elementBounds,
+            drawBoundingBox: true,
+            circleRadius: 20,
+            lineWidth: 3,
+          }
+        );
+        annotatedViewport = viewportAnnotation.annotated;
+        console.log('📸 GhostWriter: Created annotated viewport, size:', annotatedViewport.length, 'chars');
+      } catch (error) {
+        console.warn('📸 GhostWriter: Failed to annotate viewport:', error);
+      }
+
+      // Create annotated element snippet
+      let annotatedSnippet: string | undefined;
+      try {
+        // For the snippet, we need to adjust the click point relative to the cropped area
+        const padding = 200; // Same padding used in cropImage
+        const snippetClickPoint = {
+          x: clickPoint.x - Math.max(0, rect.left - padding),
+          y: clickPoint.y - Math.max(0, rect.top - padding),
+        };
+        const snippetBounds = {
+          x: Math.min(padding, rect.left),
+          y: Math.min(padding, rect.top),
+          width: rect.width,
+          height: rect.height,
+        };
+
+        const snippetAnnotation = await VisualAnnotationService.annotate(
+          standardCapture.elementSnippet,
+          {
+            actionType,
+            clickPoint: snippetClickPoint,
+            elementBounds: snippetBounds,
+            drawBoundingBox: true,
+            circleRadius: 15,
+            lineWidth: 2,
+          }
+        );
+        annotatedSnippet = snippetAnnotation.annotated;
+        console.log('📸 GhostWriter: Created annotated snippet, size:', annotatedSnippet.length, 'chars');
+      } catch (error) {
+        console.warn('📸 GhostWriter: Failed to annotate element snippet:', error);
+      }
+
+      return {
+        viewport: standardCapture.viewport,
+        elementSnippet: standardCapture.elementSnippet,
+        annotatedViewport,
+        annotatedSnippet,
+        clickPoint,
+        actionType,
+        timestamp: Date.now(),
+        viewportSize: {
+          width: window.innerWidth,
+          height: window.innerHeight,
+        },
+        elementBounds,
+      };
+    } catch (error) {
+      console.error('📸 GhostWriter: captureWithAnnotation failed:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Annotate an existing screenshot with a click marker
+   * 
+   * This is useful during execution when we have a fresh screenshot
+   * and want to show where we expect the element to be.
+   * 
+   * @param screenshot - Existing screenshot to annotate
+   * @param clickPoint - Click coordinates
+   * @param actionType - Action type
+   * @param elementBounds - Optional element bounds
+   * @returns Annotated screenshot
+   */
+  static async annotateScreenshot(
+    screenshot: string,
+    clickPoint: { x: number; y: number },
+    actionType: ActionType = 'click',
+    elementBounds?: BoundingBox
+  ): Promise<string> {
+    try {
+      const result = await VisualAnnotationService.annotate(screenshot, {
+        actionType,
+        clickPoint,
+        elementBounds,
+        drawBoundingBox: !!elementBounds,
+        circleRadius: 25, // Larger for AI visibility
+        lineWidth: 4,     // Thicker for AI
+      });
+      return result.annotated;
+    } catch (error) {
+      console.warn('📸 GhostWriter: Failed to annotate screenshot:', error);
+      return screenshot;
+    }
+  }
+
+  /**
+   * Capture multi-resolution snapshots for AI visual click
+   * Returns full viewport, zoomed region, and focused crop
+   * 
+   * @param focusPoint - Optional point to focus zoom on
+   * @param zoomLevel - Zoom multiplier (default 2x)
+   */
+  static async captureMultiResolution(
+    focusPoint?: { x: number; y: number },
+    zoomLevel: number = 2
+  ): Promise<MultiResolutionSnapshot> {
+    const result: MultiResolutionSnapshot = {
+      fullViewport: '',
+      metadata: {
+        viewportSize: {
+          width: window.innerWidth,
+          height: window.innerHeight,
+        },
+        zoomLevel,
+      },
+    };
+
+    try {
+      // 1. Capture full viewport
+      const fullPage = await this.captureFullPage(0.8);
+      if (fullPage) {
+        result.fullViewport = fullPage.screenshot;
+      } else {
+        console.warn('📸 GhostWriter: Failed to capture full viewport for multi-resolution');
+        return result;
+      }
+
+      // 2. If we have a focus point, capture zoomed region
+      if (focusPoint) {
+        const regionSize = 300; // 300x300px base region
+        const focusArea: BoundingBox = {
+          x: Math.max(0, focusPoint.x - regionSize / 2),
+          y: Math.max(0, focusPoint.y - regionSize / 2),
+          width: Math.min(regionSize, window.innerWidth - Math.max(0, focusPoint.x - regionSize / 2)),
+          height: Math.min(regionSize, window.innerHeight - Math.max(0, focusPoint.y - regionSize / 2)),
+        };
+
+        result.metadata.focusArea = focusArea;
+
+        // Capture and zoom the region
+        const regionCapture = await this.captureZoomedRegion(focusArea, zoomLevel);
+        if (regionCapture) {
+          result.zoomedRegion = regionCapture;
+        }
+
+        // Also capture a tighter crop (150x150) for small elements
+        const tightArea: BoundingBox = {
+          x: Math.max(0, focusPoint.x - 75),
+          y: Math.max(0, focusPoint.y - 75),
+          width: 150,
+          height: 150,
+        };
+        const tightCapture = await this.captureZoomedRegion(tightArea, 3); // 3x zoom for tiny elements
+        if (tightCapture) {
+          result.focusedCrop = tightCapture;
+        }
+      }
+
+      console.log('📸 GhostWriter: Multi-resolution capture complete:', {
+        hasFullViewport: !!result.fullViewport,
+        hasZoomedRegion: !!result.zoomedRegion,
+        hasFocusedCrop: !!result.focusedCrop,
+        focusArea: result.metadata.focusArea,
+      });
+    } catch (error) {
+      console.warn('📸 GhostWriter: Multi-resolution capture error:', error);
+    }
+
+    return result;
+  }
+
+  /**
+   * Capture a region and zoom it by the specified factor
+   * 
+   * @param region - Region to capture
+   * @param zoomLevel - Zoom multiplier (e.g., 2 = 2x zoom)
+   */
+  static async captureZoomedRegion(
+    region: BoundingBox,
+    zoomLevel: number = 2
+  ): Promise<string | null> {
+    try {
+      // First get the full page screenshot
+      const fullPage = await this.captureFullPage();
+      if (!fullPage) {
+        return null;
+      }
+
+      return new Promise((resolve) => {
+        const image = new Image();
+        image.onload = () => {
+          const canvas = document.createElement('canvas');
+          const ctx = canvas.getContext('2d');
+          
+          if (!ctx) {
+            resolve(null);
+            return;
+          }
+          
+          const dpr = window.devicePixelRatio || 1;
+
+          // Source dimensions (in screenshot pixels)
+          const sourceX = Math.max(0, region.x * dpr);
+          const sourceY = Math.max(0, region.y * dpr);
+          const sourceWidth = Math.min(
+            region.width * dpr,
+            image.width - sourceX
+          );
+          const sourceHeight = Math.min(
+            region.height * dpr,
+            image.height - sourceY
+          );
+
+          if (sourceWidth <= 0 || sourceHeight <= 0) {
+            resolve(null);
+            return;
+          }
+
+          // Output dimensions (zoomed)
+          const outputWidth = sourceWidth * zoomLevel;
+          const outputHeight = sourceHeight * zoomLevel;
+
+          canvas.width = outputWidth;
+          canvas.height = outputHeight;
+
+          // Use high-quality scaling
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+
+          // Draw zoomed region
+          ctx.drawImage(
+            image,
+            sourceX, sourceY, sourceWidth, sourceHeight,
+            0, 0, outputWidth, outputHeight
+          );
+
+          // Return as JPEG with higher quality for zoomed images
+          resolve(canvas.toDataURL('image/jpeg', 0.85));
+        };
+        image.onerror = () => resolve(null);
+        image.src = fullPage.screenshot;
+      });
+    } catch (error) {
+      console.warn('📸 GhostWriter: Zoomed region capture error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Capture element with surrounding context at multiple zoom levels
+   * Useful for small elements that are hard to identify
+   * 
+   * @param element - Element to capture
+   * @param contextPadding - Padding around element (default 50px)
+   */
+  static async captureElementWithContext(
+    element: Element,
+    contextPadding: number = 50
+  ): Promise<{
+    standard: string | null;
+    zoomed: string | null;
+    superZoomed: string | null;
+    bounds: BoundingBox;
+  }> {
+    const rect = element.getBoundingClientRect();
+    const bounds: BoundingBox = {
+      x: rect.left,
+      y: rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
+
+    // Region with context
+    const contextRegion: BoundingBox = {
+      x: Math.max(0, rect.left - contextPadding),
+      y: Math.max(0, rect.top - contextPadding),
+      width: rect.width + (contextPadding * 2),
+      height: rect.height + (contextPadding * 2),
+    };
+
+    const [standard, zoomed, superZoomed] = await Promise.all([
+      this.captureRegion(contextRegion, 0),              // 1x
+      this.captureZoomedRegion(contextRegion, 2),        // 2x
+      this.captureZoomedRegion(contextRegion, 3),        // 3x for tiny elements
+    ]);
+
+    return {
+      standard,
+      zoomed,
+      superZoomed,
+      bounds,
+    };
+  }
+
+  /**
+   * Compare current viewport to a reference screenshot
+   * Returns similarity score (0-1)
+   */
+  static async compareToReference(referenceScreenshot: string): Promise<{
+    similarity: number;
+    currentScreenshot: string | null;
+  }> {
+    const current = await this.captureFullPage();
+    if (!current) {
+      return { similarity: 0, currentScreenshot: null };
+    }
+
+    const similarity = await this.compareScreenshots(current.screenshot, referenceScreenshot);
+    return {
+      similarity,
+      currentScreenshot: current.screenshot,
+    };
   }
 }

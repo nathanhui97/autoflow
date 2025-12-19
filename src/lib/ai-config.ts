@@ -13,6 +13,8 @@ export interface AIConfig {
   validateSelectorTimeout: number;
   // Step description generation
   generateDescriptionEdgeFunctionName: string;
+  // Debug/self-healing functions
+  debugStepFailureEdgeFunctionName: string;
   // Visual analysis functions
   classifyPageTypeEdgeFunctionName: string;
   visualSimilarityEdgeFunctionName: string;
@@ -20,10 +22,14 @@ export interface AIConfig {
   analyzeIntentEdgeFunctionName: string;
   detectVariablesEdgeFunctionName: string;
   visualAnalysisTimeout: number;
+  // Visual AI Click function (95-99% accuracy fallback)
+  visualClickEdgeFunctionName: string;
+  visualClickEnabled: boolean;
   // Feature flags
   enabled: boolean;
   visualAnalysisEnabled: boolean;
   correctionLearningEnabled: boolean;
+  aiSelfHealingEnabled: boolean;
   // Timeouts
   timeout: number;
   localCacheTTL: number;
@@ -49,6 +55,9 @@ class AIConfigManager {
       // Step description generation
       generateDescriptionEdgeFunctionName: 'generate_step_description',
       
+      // Debug/self-healing functions
+      debugStepFailureEdgeFunctionName: 'debug_step_failure',
+      
       // Visual analysis functions (human-like understanding)
       classifyPageTypeEdgeFunctionName: 'classify_page_type',
       visualSimilarityEdgeFunctionName: 'visual_similarity',
@@ -57,10 +66,15 @@ class AIConfigManager {
       detectVariablesEdgeFunctionName: 'detect_variables',
       visualAnalysisTimeout: 20000, // 20 seconds for visual analysis (images are larger)
       
+      // Visual AI Click (95-99% accuracy final fallback)
+      visualClickEdgeFunctionName: 'visual_click',
+      visualClickEnabled: true, // Enable visual AI click fallback
+      
       // Feature flags
       enabled: true, // Master feature flag for AI
       visualAnalysisEnabled: true, // Enable visual analysis features
       correctionLearningEnabled: true, // Enable learning from user corrections
+      aiSelfHealingEnabled: true, // Enable AI-powered self-healing during replay
       
       // Timeouts
       timeout: 10000, // 10 seconds for standard Edge Function calls
@@ -101,6 +115,13 @@ class AIConfigManager {
    */
   isCorrectionLearningEnabled(): boolean {
     return this.config.enabled && this.config.correctionLearningEnabled;
+  }
+
+  /**
+   * Check if AI self-healing is enabled
+   */
+  isAISelfHealingEnabled(): boolean {
+    return this.config.enabled && this.config.aiSelfHealingEnabled;
   }
 
   /**

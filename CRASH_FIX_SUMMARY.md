@@ -119,3 +119,6 @@ If you still experience crashes:
 
 The zoom-to-33% feature is specifically designed for spreadsheets to capture more column headers in a single screenshot. This helps the AI understand the full context when analyzing workflows. However, the aggressive zoom manipulation was causing stability issues. The fixes maintain this functionality while making it much safer and more stable.
 
+
+
+

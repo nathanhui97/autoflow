@@ -6,7 +6,6 @@
  */
 
 import type {
-  ComponentPatternType,
   ComponentLibrary,
   ComponentPattern,
   DropdownPatternData,

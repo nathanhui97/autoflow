@@ -18,6 +18,10 @@ export type MessageType =
   | 'EXECUTE_WORKFLOW_ADAPTIVE'  // @deprecated - alias for EXECUTE_WORKFLOW
   | 'EXECUTE_WORKFLOW_VERIFIED'  // @deprecated - alias for EXECUTE_WORKFLOW
   | 'EXECUTE_WORKFLOW_UNIVERSAL' // New Universal Execution Engine (v2)
+  | 'EXECUTE_WORKFLOW_AGENT' // AI Agent execution mode (observe-act loop)
+  // AI Agent progress messages
+  | 'AGENT_PROGRESS'
+  | 'AGENT_EXECUTION_COMPLETED'
   // Execution progress and control messages
   | 'VERIFIED_EXECUTION_CANCEL'
   | 'VERIFIED_EXECUTION_STARTED'
@@ -39,7 +43,9 @@ export type MessageType =
   | 'START_RECORDING_IN_TAB'
   | 'STOP_RECORDING_IN_TAB'
   | 'ADD_TAB'
-  | 'RESUME_RECORDING';
+  | 'RESUME_RECORDING'
+  | 'DEBUGGER_CLICK'
+  | 'DEBUGGER_DETACH';
 
 /**
  * Base message interface for all extension messages

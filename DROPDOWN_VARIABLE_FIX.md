@@ -148,3 +148,6 @@ For dropdown CLICK steps:
 - Improves user experience by showing correct default values in variable input form
 - No breaking changes to existing workflows (only affects new recordings)
 
+
+
+

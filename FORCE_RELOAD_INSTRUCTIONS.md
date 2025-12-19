@@ -74,3 +74,6 @@ If nothing works, rename the extension folder and load it as a completely new ex
 This forces Chrome to treat it as a completely different extension.
 
 
+
+
+

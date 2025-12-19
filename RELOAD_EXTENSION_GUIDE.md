@@ -76,3 +76,6 @@ console.log('Extension check:', typeof chrome !== 'undefined' && chrome.runtime)
 // Look for: GhostWriter: Content script loaded and ready
 ```
 
+
+
+

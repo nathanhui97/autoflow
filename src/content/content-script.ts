@@ -40,8 +40,49 @@ import { PatternDetector } from './pattern-detector';
 import { AIDataBuilder } from './ai-data-builder';
 import { VisualSnapshotService } from './visual-snapshot';
 import type { WorkflowStep } from '../types/workflow';
+import { isWorkflowStepPayload } from '../types/workflow';
 // Universal Execution Engine - the new reliable execution engine
 import { executeWorkflow as executeUniversalWorkflow, convertLegacyStep } from './universal-execution';
+
+// Check for saved agent state after navigation and resume if needed
+(async () => {
+  try {
+    const result = await chrome.storage.local.get(['agentState']);
+    const savedState = result.agentState as any;
+    if (savedState && savedState.status === 'running') {
+      console.log('[Content] Resuming agent after navigation');
+      
+      // Small delay to ensure page is ready
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // Dynamically import and resume
+      const { AIAgent } = await import('../lib/ai-agent');
+      const agent = new AIAgent({
+        maxSteps: 50,
+        stepTimeout: 30000,
+        onProgress: (stepNumber, action, status) => {
+          console.log(`[Content] Agent step ${stepNumber} - ${status}:`, action.type);
+        },
+      });
+      
+      // Resume from saved state
+      const agentResult = await agent.resume(savedState);
+      
+      // Clear saved state
+      await chrome.storage.local.remove(['agentState']);
+      
+      // Notify completion
+      chrome.runtime.sendMessage({
+        type: 'AGENT_EXECUTION_COMPLETED',
+        payload: agentResult,
+      });
+      
+      console.log('[Content] Agent resumption complete:', agentResult);
+    }
+  } catch (error) {
+    console.error('[Content] Error resuming agent:', error);
+  }
+})();
 
 // Full message handler with all message types
 function handleFullMessage(
@@ -298,13 +339,43 @@ function handleFullMessage(
           return false;
         }
 
-        // Execute workflow with new Universal Engine
+        const steps = message.payload.steps as WorkflowStep[];
+        const workflowId = message.payload.workflowId as string || 'unknown';
+        const variableValues = message.payload.variableValues as Record<string, string> || {};
+        
+        // Get starting URL from first step
+        const startingUrl = steps.length > 0 && isWorkflowStepPayload(steps[0].payload)
+          ? steps[0].payload.url
+          : undefined;
+        
+        // Check if we need to navigate to the starting URL
+        const currentUrl = window.location.href;
+        if (startingUrl && currentUrl !== startingUrl) {
+          console.log(`GhostWriter: Current URL (${currentUrl}) differs from workflow starting URL (${startingUrl}), navigating...`);
+          
+          // Store execution state in sessionStorage to resume after navigation
+          sessionStorage.setItem('ghostwriter_pending_execution', JSON.stringify({
+            steps,
+            workflowId,
+            variableValues,
+            timestamp: Date.now(),
+          }));
+          
+          // Send response before navigation (page will reload)
+          sendResponse({
+            success: true,
+            data: { message: 'Navigating to workflow URL, execution will start automatically' },
+          });
+          
+          // Navigate to the starting URL (this will reload the page)
+          window.location.href = startingUrl;
+          
+          return false; // Don't execute here, will resume after navigation
+        }
+
+        // Execute workflow with new Universal Engine (already on correct page)
         (async () => {
           try {
-            const steps = message.payload.steps as WorkflowStep[];
-            const workflowId = message.payload.workflowId as string || 'unknown';
-            const variableValues = message.payload.variableValues as Record<string, string> || {};
-            
             console.log('GhostWriter: Starting UNIVERSAL execution for workflow:', workflowId);
             
             // Notify execution started
@@ -368,6 +439,69 @@ function handleFullMessage(
         // TODO: Add proper cancellation support in universal engine
         console.log('GhostWriter: Execution cancellation requested');
         sendResponse({ success: true });
+        return false;
+      }
+
+      case 'EXECUTE_WORKFLOW_AGENT': {
+        // AI Agent execution - observe-act loop
+        if (!message.payload?.workflow) {
+          sendResponse({
+            success: false,
+            error: 'EXECUTE_WORKFLOW_AGENT requires workflow in payload',
+          });
+          return false;
+        }
+
+        const workflow = message.payload.workflow;
+        const variableValues = message.payload.variableValues as Record<string, string> || {};
+        
+        // Execute workflow with AI Agent
+        // IMPORTANT: We send immediate response, then agent runs in background
+        // This prevents navigation from closing the message channel
+        (async () => {
+          try {
+            console.log('GhostWriter: Starting AI Agent execution for workflow:', workflow.id);
+            
+            // Dynamically import the AI Agent to avoid loading it when not needed
+            const { AIAgent } = await import('../lib/ai-agent');
+            
+            // Create agent instance with progress callback
+            const agent = new AIAgent({
+              maxSteps: 50,
+              stepTimeout: 30000,
+              onProgress: (stepNumber, action, status) => {
+                console.log(`GhostWriter: Agent step ${stepNumber} - ${status}:`, action.type);
+              },
+            });
+            
+            // Run the agent
+            const result = await agent.run(workflow, variableValues);
+            
+            console.log('GhostWriter: Agent execution completed:', result);
+            
+            // Send final result via runtime message (not via sendResponse which would be closed)
+            chrome.runtime.sendMessage({
+              type: 'AGENT_EXECUTION_COMPLETED',
+              payload: result,
+            });
+            
+          } catch (error) {
+            console.error('GhostWriter: Error in AI Agent execution:', error);
+            chrome.runtime.sendMessage({
+              type: 'AGENT_EXECUTION_COMPLETED',
+              payload: {
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              },
+            });
+          }
+        })();
+
+        // Send immediate response - agent will run in background
+        sendResponse({
+          success: true,
+          data: { message: 'AI Agent started in background' },
+        });
         return false;
       }
 
@@ -492,6 +626,177 @@ try {
       console.error('📸 GhostWriter: Failed to auto-start recording after refresh:', error);
     });
   }
+  
+  // Check if there's a pending workflow execution to resume after navigation
+  const pendingExecutionStr = sessionStorage.getItem('ghostwriter_pending_execution');
+  if (pendingExecutionStr) {
+    console.log('🚀 GhostWriter: Found pending workflow execution, resuming...');
+    sessionStorage.removeItem('ghostwriter_pending_execution');
+    
+    try {
+      const pendingExecution = JSON.parse(pendingExecutionStr);
+      const { steps, workflowId, variableValues } = pendingExecution;
+      
+      // Wait for page to be fully loaded before starting execution
+      const startExecution = async () => {
+        // Wait for page to be fully loaded
+        if (document.readyState !== 'complete') {
+          await new Promise(resolve => {
+            if (document.readyState === 'complete') {
+              resolve(undefined);
+            } else {
+              window.addEventListener('load', () => resolve(undefined), { once: true });
+            }
+          });
+        }
+        
+        // Additional wait for page to stabilize
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // CRITICAL: For Salesforce Lightning apps, wait for body to have proper dimensions
+        // Lightning apps load dynamically and body might have zero height initially
+        const isSalesforce = window.location.hostname.includes('force.com') || 
+                            window.location.hostname.includes('salesforce.com');
+        
+        if (isSalesforce) {
+          console.log('🚀 GhostWriter: Detected Salesforce Lightning, waiting for full render...');
+          
+          // CRITICAL: Salesforce Lightning uses a special layout where containers may have height: 0
+          // Instead, wait for actual visible interactive elements to appear
+          const maxWait = 20000; // Increased to 20 seconds for slow Lightning pages
+          const startWait = Date.now();
+          let appReady = false;
+          
+          // Helper to check if element is actually visible and has dimensions
+          const isElementVisible = (el: Element): boolean => {
+            if (!(el instanceof HTMLElement)) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && 
+                   rect.height > 0 && 
+                   style.display !== 'none' && 
+                   style.visibility !== 'hidden' && 
+                   style.opacity !== '0';
+          };
+          
+          while (Date.now() - startWait < maxWait) {
+            // Strategy 1: Check for visible interactive elements anywhere on the page
+            const allButtons = Array.from(document.querySelectorAll('button, a[role="button"], [role="button"], a[href]'));
+            const visibleButtons = allButtons.filter(isElementVisible);
+            
+            // Strategy 2: Check for Lightning spinners disappearing
+            const spinners = document.querySelectorAll('lightning-spinner, .slds-spinner, [class*="spinner"]');
+            const visibleSpinners = Array.from(spinners).filter(isElementVisible);
+            
+            // Strategy 3: Check for main content areas
+            const mainContent = document.querySelector('main, [role="main"], .slds-scope, [class*="oneOne"]');
+            const hasMainContent = mainContent && isElementVisible(mainContent);
+            
+            console.log('🚀 GhostWriter: Lightning check - Visible buttons:', visibleButtons.length, 
+                       'Visible spinners:', visibleSpinners.length,
+                       'Has main content:', hasMainContent);
+            
+            // Page is ready if:
+            // 1. We have visible interactive elements, AND
+            // 2. No visible spinners (or very few), AND
+            // 3. Main content exists (optional - some pages might not have it)
+            if (visibleButtons.length >= 3 && visibleSpinners.length === 0) {
+              console.log('🚀 GhostWriter: Salesforce Lightning app fully loaded!');
+              console.log('🚀 GhostWriter: Found', visibleButtons.length, 'visible interactive elements');
+              appReady = true;
+              break;
+            }
+            
+            // Also check if we have at least some buttons even if spinners are present
+            // (some pages have persistent spinners)
+            if (visibleButtons.length >= 5) {
+              console.log('🚀 GhostWriter: Found enough interactive elements, proceeding despite spinners');
+              appReady = true;
+              break;
+            }
+            
+            await new Promise(resolve => setTimeout(resolve, 300));
+          }
+          
+          if (!appReady) {
+            console.warn('🚀 GhostWriter: Lightning app not fully ready after', (Date.now() - startWait) / 1000, 's wait');
+            console.warn('🚀 GhostWriter: Proceeding anyway - page may still be loading');
+          }
+          
+          // Additional wait for dynamic content to stabilize
+          console.log('🚀 GhostWriter: Waiting additional 2s for dynamic content to stabilize...');
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          // Final check: Ensure we have at least some visible elements
+          const finalCheck = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+            .filter(isElementVisible);
+          
+          if (finalCheck.length === 0) {
+            console.warn('🚀 GhostWriter: ⚠️ No visible interactive elements found after wait!');
+            console.warn('🚀 GhostWriter: Page may not be fully loaded, execution may fail');
+          } else {
+            console.log('🚀 GhostWriter: ✅ Found', finalCheck.length, 'visible interactive elements - ready for execution');
+          }
+          
+          console.log('🚀 GhostWriter: Salesforce Lightning ready for execution');
+        }
+        
+        console.log('🚀 GhostWriter: Starting pending workflow execution:', workflowId);
+        
+        // Notify execution started
+        chrome.runtime.sendMessage({
+          type: 'VERIFIED_EXECUTION_STARTED',
+          payload: { workflowId },
+        }).catch(err => console.error('Failed to send execution started message:', err));
+        
+        // Convert legacy steps to universal format
+        const universalSteps = steps.map((step: WorkflowStep) => convertLegacyStep(step));
+        
+        // Execute with universal engine
+        const result = await executeUniversalWorkflow(universalSteps, {
+          stopOnFailure: true,
+          stepTimeout: 10000,
+          variableValues: variableValues || {},
+          onStepProgress: (stepIndex, status) => {
+            chrome.runtime.sendMessage({
+              type: status === 'starting' ? 'VERIFIED_STEP_STARTED' :
+                    status === 'completed' ? 'VERIFIED_STEP_COMPLETED' : 'VERIFIED_STEP_FAILED',
+              payload: { stepIndex },
+            }).catch(err => console.error('Failed to send step progress:', err));
+          },
+          onStepError: (stepIndex, error) => {
+            console.error(`GhostWriter: Universal step ${stepIndex} error:`, error);
+          },
+        });
+        
+        // Notify execution completed
+        chrome.runtime.sendMessage({
+          type: 'VERIFIED_EXECUTION_COMPLETED',
+          payload: {
+            success: result.success,
+            stepsExecuted: result.stepsCompleted,
+            totalSteps: result.totalSteps,
+            totalTimeMs: result.totalElapsedMs,
+            error: result.success ? undefined : result.failureSummary,
+          },
+        }).catch(err => console.error('Failed to send execution completed message:', err));
+      };
+      
+      startExecution().catch((error) => {
+        console.error('🚀 GhostWriter: Failed to start pending execution:', error);
+        chrome.runtime.sendMessage({
+          type: 'VERIFIED_EXECUTION_COMPLETED',
+          payload: {
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          },
+        }).catch(err => console.error('Failed to send error message:', err));
+      });
+    } catch (error) {
+      console.error('🚀 GhostWriter: Failed to parse pending execution:', error);
+      sessionStorage.removeItem('ghostwriter_pending_execution');
+    }
+  }
 } catch (error) {
   console.error('GhostWriter: Failed to initialize RecordingManager:', error);
   if (error instanceof Error) {
@@ -557,6 +862,94 @@ function initialize() {
       }
     };
     console.log('GhostWriter: Snapshot test function available: window.testSnapshot(selector?)');
+    
+    // Expose diagnostic function for dropdown debugging (dev only)
+    (window as any).debugDropdowns = () => {
+      console.log('🔍 GhostWriter: Dropdown Diagnostic Tool');
+      console.log('====================================');
+      
+      // Find all dropdown containers
+      const dropdownContainers = document.querySelectorAll('[role="listbox"], [role="menu"], [role="combobox"], select, [data-baseui="listbox"]');
+      console.log(`Found ${dropdownContainers.length} dropdown container(s):`);
+      
+      dropdownContainers.forEach((container, idx) => {
+        const containerInfo = {
+          index: idx + 1,
+          tag: container.tagName,
+          role: container.getAttribute('role'),
+          id: container.id,
+          label: container.getAttribute('aria-label'),
+          labelledBy: container.getAttribute('aria-labelledby'),
+          expanded: container.getAttribute('aria-expanded'),
+          visible: window.getComputedStyle(container as HTMLElement).display !== 'none',
+          bounds: container.getBoundingClientRect(),
+        };
+        
+        console.log(`\n📦 Dropdown ${idx + 1}:`, containerInfo);
+        
+        // Find all options within this container
+        const options = container.querySelectorAll('[role="option"], option, li');
+        console.log(`   Found ${options.length} option(s):`);
+        
+        options.forEach((option, optIdx) => {
+          const optionInfo = {
+            index: optIdx + 1,
+            tag: option.tagName,
+            role: option.getAttribute('role'),
+            text: (option as HTMLElement).textContent?.trim().substring(0, 50),
+            value: (option as HTMLOptionElement).value || option.getAttribute('data-value'),
+            selected: option.getAttribute('aria-selected') || (option as HTMLOptionElement).selected,
+            visible: window.getComputedStyle(option as HTMLElement).display !== 'none',
+          };
+          console.log(`   ${optIdx + 1}.`, optionInfo);
+        });
+      });
+      
+      // Find all combobox triggers
+      const triggers = document.querySelectorAll('[role="combobox"], [aria-haspopup="listbox"], [aria-haspopup="menu"]');
+      console.log(`\n\n🎯 Found ${triggers.length} dropdown trigger(s):`);
+      
+      triggers.forEach((trigger, idx) => {
+        const triggerInfo = {
+          index: idx + 1,
+          tag: trigger.tagName,
+          role: trigger.getAttribute('role'),
+          text: (trigger as HTMLElement).textContent?.trim().substring(0, 50),
+          controls: trigger.getAttribute('aria-controls'),
+          expanded: trigger.getAttribute('aria-expanded'),
+          hasPopup: trigger.getAttribute('aria-haspopup'),
+          visible: window.getComputedStyle(trigger as HTMLElement).display !== 'none',
+        };
+        console.log(`${idx + 1}.`, triggerInfo);
+      });
+      
+      console.log('\n====================================');
+      console.log('💡 Tip: Click on a dropdown and run this again to see what changes');
+    };
+    console.log('GhostWriter: Dropdown diagnostic function available: window.debugDropdowns()');
+    
+    // Expose cache clearing utility for AI Visual Click debugging
+    (window as any).clearAICache = async () => {
+      try {
+        const all = await chrome.storage.local.get(null);
+        const aiKeys = Object.keys(all).filter(key => key.startsWith('ai_cache_'));
+        console.log('🧹 GhostWriter: Found', aiKeys.length, 'AI cache entries');
+        
+        if (aiKeys.length > 0) {
+          await chrome.storage.local.remove(aiKeys);
+          console.log('✅ GhostWriter: Cleared', aiKeys.length, 'AI cache entries');
+        } else {
+          console.log('ℹ️ GhostWriter: No AI cache entries found');
+        }
+        
+        console.log('✅ GhostWriter: Cache cleared! Reload the page to test with fresh AI calls.');
+        return { success: true, cleared: aiKeys.length };
+      } catch (error) {
+        console.error('❌ GhostWriter: Error clearing cache:', error);
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+      }
+    };
+    console.log('GhostWriter: Cache clearing function available: window.clearAICache()');
   } catch (error) {
     console.error('GhostWriter: Error initializing content script:', error);
     if (error instanceof Error) {
